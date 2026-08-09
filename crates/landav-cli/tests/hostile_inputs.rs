@@ -245,6 +245,33 @@ fn a_non_utf8_source_file_is_a_tool_error() -> io::Result<()> {
     Ok(())
 }
 
+/// A UTF-8 byte-order mark at the start of a clean file.
+///
+/// Python's own tokeniser accepts a leading BOM, and every source written by a
+/// Windows editor that defaults to "UTF-8 with signature" carries one. The
+/// M0 line scanner did not, so the first statement of such a file was reported
+/// as unrecognised and the file exited `1`: a false positive on correct input,
+/// affecting a whole platform's worth of it. That is the failure mode a gate
+/// does not survive, so it is pinned at the process boundary rather than left
+/// to the frontend's unit tests.
+#[test]
+fn a_utf8_bom_does_not_make_a_clean_file_inconclusive() -> io::Result<()> {
+    let project = Project::new()?;
+    let target = project.write("bom.py", &format!("\u{feff}{CLEAN_PY}"))?;
+
+    let run = project.check(&target, &[])?;
+
+    run.assert_did_not_crash();
+    assert_eq!(
+        run.code,
+        EXIT_CLEAN,
+        "a byte-order mark is legal Python and must not change the verdict \
+         about the code after it.\n{}",
+        run.describe()
+    );
+    Ok(())
+}
+
 /// `--config` pointing at a directory rather than a file.
 #[test]
 fn a_config_flag_pointing_at_a_directory_is_a_tool_error() -> io::Result<()> {

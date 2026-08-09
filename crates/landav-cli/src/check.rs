@@ -17,11 +17,38 @@
 //! * otherwise a finding or an unaccounted term wins over a clean unit;
 //! * a run with nothing to analyse is [`Outcome::NothingAnalysed`], never
 //!   clean.
+//!
+//! # Where the analysis happens, and where it does not
+//!
+//! Nowhere in this crate. `CONTRIBUTING.md` non-negotiable 4 puts every
+//! language fact behind a frontend, and [`landav_python`] is the frontend: it
+//! owns the parser, the ten `LAV0xx` rules, their false-positive budget and
+//! their fixture corpus. This module walks paths, hands each file's text to
+//! [`landav_python::analyze_module`], and turns what comes back into one
+//! [`Outcome`]. There is no Python keyword, no quoting rule and no version
+//! heuristic below this line, and there must never be one again: the crate
+//! shipped a second, line-oriented Python scanner for one milestone and the
+//! two rule sets immediately disagreed — the private one advised replacing a
+//! `frozenset` with a set, and called an integer counter a rebuilt list.
+//!
+//! # A file the frontend could not parse is inconclusive, not clean
+//!
+//! [`landav_python::PythonError::Parse`] means the bytes were read and were
+//! not Python the frontend can read: a Python 2 module, a template, a
+//! generated `.py` that is really JSON, a 3.12 file using PEP 701 f-strings
+//! the pinned parser predates. None of that supports "analysis ran and every
+//! bound held", so it maps to [`Outcome::Inconclusive`] — exit `1`, with the
+//! position named — and never to [`Outcome::Clean`].
+//!
+//! It maps to `Inconclusive` rather than to a tool error on purpose. The tool
+//! completed; what it has to report is a fact about the file, and the person
+//! who can act on it is the person who owns the file.
 
 use std::io::Write as _;
 use std::path::Path;
 
-use crate::analysis::{self, Kind};
+use landav_python::{ModuleAnalysis, PythonError};
+
 use crate::config::{self, Config};
 use crate::diagnostic::ToolError;
 use crate::outcome::Outcome;
@@ -46,7 +73,7 @@ fn analyse(target: &Path, explicit_config: Option<&Path>) -> Result<Outcome, Too
     let mut findings = 0usize;
     let mut inconclusive = 0usize;
     let mut statements = 0usize;
-    let mut out = std::io::stdout().lock();
+    let mut report = Report::new(std::io::stdout().lock());
 
     for path in &walk.sources {
         // A file that could not be read is recorded and the walk continues, so
@@ -59,26 +86,49 @@ fn analyse(target: &Path, explicit_config: Option<&Path>) -> Result<Outcome, Too
                 continue;
             }
         };
-        let scan = analysis::scan(&text);
-        statements += scan.statements;
-
-        for observation in &scan.observations {
-            match observation.kind {
-                Kind::Finding => findings += 1,
-                Kind::Inconclusive => inconclusive += 1,
+        match landav_python::analyze_module(path, &text) {
+            Ok(module) => {
+                statements += module.statements();
+                findings += module.findings().len();
+                publish(&mut report, &module);
             }
-            // Written per observation rather than buffered to the end so that
-            // the blame survives even if a later file kills the run.
-            let _ = writeln!(
-                out,
-                "{}:{}: {}: {}: {}",
-                path.display(),
-                observation.line,
-                observation.kind,
-                observation.rule,
-                observation.message
-            );
+            Err(PythonError::Parse {
+                line,
+                column,
+                detail,
+                ..
+            }) => {
+                inconclusive += 1;
+                report.line(format_args!(
+                    "{}:{line}:{column}: inconclusive: unreadable-source: the frontend \
+                     could not read this file as Python ({detail}), so no bound was \
+                     derived from it and it is not covered by this run's verdict",
+                    path.display()
+                ));
+            }
+            // `PythonError` is `#[non_exhaustive]`, so this arm is required.
+            // Everything that is not a parse failure is the frontend saying it
+            // could not complete, which is a tool error and never a verdict.
+            // Failing towards blame is the only safe direction for a variant
+            // this build has not seen.
+            Err(problem) => walk.problems.push(ToolError::at_path(path, problem)),
         }
+    }
+
+    summarise(
+        &mut report,
+        target,
+        &config,
+        &walk.sources,
+        findings,
+        inconclusive,
+    );
+    // A report that never reached the operator is not a report, so a stream
+    // that could not be written is a reason the run did not complete — and
+    // therefore a `2` with blame, not a silent verdict about findings nobody
+    // saw. `landav check src/ | head -1` takes this path.
+    if let Some(problem) = report.finish() {
+        walk.problems.push(problem);
     }
 
     let outcome = if walk.problems.is_empty() {
@@ -86,15 +136,6 @@ fn analyse(target: &Path, explicit_config: Option<&Path>) -> Result<Outcome, Too
     } else {
         Outcome::Failed
     };
-    summarise(
-        &mut out,
-        target,
-        &config,
-        &walk.sources,
-        findings,
-        inconclusive,
-    );
-    let _ = out.flush();
 
     // Sorted, so that identical input produces identical stderr whatever order
     // the filesystem handed the entries back in.
@@ -108,11 +149,83 @@ fn analyse(target: &Path, explicit_config: Option<&Path>) -> Result<Outcome, Too
     Ok(outcome)
 }
 
+/// Write one line per finding, in the frontend's own order.
+///
+/// The rule code and the wording both come from [`landav_python`]; this crate
+/// contributes the file position layout and nothing else.
+fn publish<W: std::io::Write>(report: &mut Report<W>, module: &ModuleAnalysis) {
+    for finding in module.findings() {
+        let at = finding.location();
+        report.line(format_args!(
+            "{}:{}:{}: finding: {}: {}",
+            at.file().display(),
+            at.line(),
+            at.column(),
+            finding.rule(),
+            finding.explanation()
+        ));
+    }
+}
+
+/// The run's report stream, and the first failure to write to it.
+///
+/// Every line is written as it is decided rather than buffered to the end, so
+/// that blame survives a later file killing the run. What is *not* silent is
+/// a write that fails: the first error is kept and surfaces as a [`ToolError`]
+/// from [`Report::finish`], because an exit code describing findings the
+/// operator never saw is a code that describes nothing they can act on.
+struct Report<W: std::io::Write> {
+    /// Where the report goes.
+    out: W,
+    /// The first write failure, if any. Later writes are skipped: a stream
+    /// that has failed once will not start working again mid-run, and
+    /// retrying only multiplies the diagnostics.
+    failure: Option<std::io::Error>,
+}
+
+impl<W: std::io::Write> Report<W> {
+    /// A report over `out`, with nothing written and nothing failed.
+    const fn new(out: W) -> Self {
+        Self { out, failure: None }
+    }
+
+    /// Write one record, terminated by a newline.
+    fn line(&mut self, args: std::fmt::Arguments<'_>) {
+        if self.failure.is_some() {
+            return;
+        }
+        if let Err(error) = writeln!(self.out, "{args}") {
+            self.failure = Some(error);
+        }
+    }
+
+    /// Flush, and hand back blame if any part of the report was lost.
+    fn finish(mut self) -> Option<ToolError> {
+        if self.failure.is_none()
+            && let Err(error) = self.out.flush()
+        {
+            self.failure = Some(error);
+        }
+        self.failure.map(|error| {
+            ToolError::new(
+                "standard output",
+                format!(
+                    "could not be written ({error}), so the report is incomplete; the \
+                     exit code would describe findings that never reached the operator"
+                ),
+            )
+        })
+    }
+}
+
 /// Turn the counts into exactly one outcome.
 ///
-/// Order matters, and it is the order of how much a claim would be worth:
-/// nothing analysed is not a verdict at all, a finding outranks an unaccounted
-/// term only in what gets *reported* (they share a code), and clean is what is
+/// Order matters, and it is the order of how much a claim would be worth. A
+/// finding or an unaccounted term is something the run *established*, so it
+/// outranks the emptiness check: a file that failed to parse holds no
+/// statements this crate can count, and letting that read as "nothing to
+/// analyse" would turn the strongest thing the run learned into the weakest.
+/// Below those, nothing analysed is not a verdict at all, and clean is what is
 /// left when the run actually proved something.
 ///
 /// # Why "nothing analysed" depends on how the target was named
@@ -138,17 +251,17 @@ const fn classify(
     findings: usize,
     inconclusive: usize,
 ) -> Outcome {
-    if files == 0 || statements == 0 {
-        return match target {
-            Target::Directory => Outcome::NothingAnalysed,
-            Target::File => Outcome::Clean,
-        };
-    }
     if findings > 0 {
         return Outcome::Findings;
     }
     if inconclusive > 0 {
         return Outcome::Inconclusive;
+    }
+    if files == 0 || statements == 0 {
+        return match target {
+            Target::Directory => Outcome::NothingAnalysed,
+            Target::File => Outcome::Clean,
+        };
     }
     Outcome::Clean
 }
@@ -170,23 +283,22 @@ fn nothing_to_analyse(target: &Path, files: usize) -> ToolError {
 }
 
 /// The one-line summary every run ends with.
-fn summarise(
-    out: &mut impl std::io::Write,
+fn summarise<W: std::io::Write>(
+    report: &mut Report<W>,
     target: &Path,
     config: &Config,
     sources: &[std::path::PathBuf],
     findings: usize,
     inconclusive: usize,
 ) {
-    let _ = writeln!(
-        out,
+    report.line(format_args!(
         "landav: {} analysed under {} — {} finding(s), {} inconclusive; configuration: {}",
         plural(sources.len(), "file"),
         target.display(),
         findings,
         inconclusive,
         config.source()
-    );
+    ));
 }
 
 /// `1 file` / `2 files`, so the summary reads as English.
@@ -229,9 +341,59 @@ fn report_failure(error: &ToolError) {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, plural};
+    use super::{Report, classify, plural};
     use crate::outcome::Outcome;
     use crate::sources::Target;
+
+    /// A writer that fails the way a closed pipe does.
+    struct BrokenPipe;
+
+    impl std::io::Write for BrokenPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `landav check src/ | head -1`. The findings after the first were never
+    /// delivered, so the run did not do what it was asked and says so, rather
+    /// than handing back a code that describes output nobody received.
+    #[test]
+    fn a_report_that_could_not_be_written_carries_blame() {
+        let mut report = Report::new(BrokenPipe);
+        report.line(format_args!("a finding nobody will see"));
+        let blame = report.finish().map(|error| error.to_string());
+        assert!(
+            blame
+                .as_deref()
+                .is_some_and(|text| text.contains("standard output")),
+            "{blame:?}"
+        );
+    }
+
+    /// A report that was delivered in full is not a failure.
+    #[test]
+    fn a_report_that_was_written_reports_no_problem() {
+        let mut report = Report::new(Vec::new());
+        report.line(format_args!("delivered"));
+        assert!(report.finish().is_none());
+    }
+
+    /// A file the frontend could not parse contributes no statements this
+    /// crate can count. The emptiness rule must not outrank it, or the
+    /// strongest thing the run learned would read as the weakest.
+    #[test]
+    fn an_unparsable_file_is_inconclusive_rather_than_nothing_analysed() {
+        assert_eq!(classify(Target::File, 1, 0, 0, 1), Outcome::Inconclusive);
+        assert_eq!(
+            classify(Target::Directory, 1, 0, 0, 1),
+            Outcome::Inconclusive
+        );
+        assert_ne!(classify(Target::File, 1, 0, 0, 1), Outcome::Clean);
+    }
 
     #[test]
     fn a_directory_with_no_files_is_never_clean() {

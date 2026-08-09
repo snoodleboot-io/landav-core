@@ -12,7 +12,60 @@ use crate::{
     syntax::{LineIndex, MAX_EXPRESSION_DEPTH, MAX_NESTING_DEPTH, nesting_overflow},
 };
 
+/// One module, analysed: what the rules found and how much code they ran over.
+///
+/// The second half is not decoration. A caller that turns findings into a
+/// verdict has to be able to tell "analysed, nothing to report" from "there
+/// was nothing to analyse" — a `.py` holding only a licence header supports
+/// neither a clean bill of health nor a finding — and counting Python
+/// statements is a question only the frontend can answer. Publishing it here
+/// is what lets a driver stay ignorant of Python.
+#[derive(Debug, Clone)]
+pub struct ModuleAnalysis {
+    findings: Vec<Finding>,
+    statements: usize,
+}
+
+impl ModuleAnalysis {
+    /// Every rule that fired, in `(line, column, rule code)` order.
+    #[must_use]
+    pub fn findings(&self) -> &[Finding] {
+        &self.findings
+    }
+
+    /// The findings, by value.
+    #[must_use]
+    pub fn into_findings(self) -> Vec<Finding> {
+        self.findings
+    }
+
+    /// How many Python statements the module contains, at any nesting depth.
+    ///
+    /// Zero means the file parsed and held no code at all: empty, or nothing
+    /// but comments and blank lines. It is a count of *statements*, not of
+    /// lines, so a docstring-only module counts one and a hundred-line
+    /// comment block counts none.
+    #[must_use]
+    pub const fn statements(&self) -> usize {
+        self.statements
+    }
+}
+
 /// Runs every rule in [`crate::registry()`] over one Python source file.
+///
+/// Equivalent to [`analyze_module`] followed by
+/// [`ModuleAnalysis::into_findings`]; this is the spelling for callers that
+/// only want the findings.
+///
+/// # Errors
+///
+/// As [`analyze_module`].
+pub fn analyze_source(path: &Path, source: &str) -> Result<Vec<Finding>, PythonError> {
+    analyze_module(path, source).map(ModuleAnalysis::into_findings)
+}
+
+/// Runs every rule in [`crate::registry()`] over one Python source file, and
+/// reports how much code it ran over.
 ///
 /// `path` is not read; it is the label stamped into every
 /// [`crate::Location`]. Callers that already have the source in memory — the
@@ -37,7 +90,7 @@ use crate::{
 /// this crate reads untrusted Python: a stack overflow aborts the process and
 /// takes the blame path with it, whereas a `Parse` error naming the offset
 /// leaves the caller something to act on.
-pub fn analyze_source(path: &Path, source: &str) -> Result<Vec<Finding>, PythonError> {
+pub fn analyze_module(path: &Path, source: &str) -> Result<ModuleAnalysis, PythonError> {
     let index = LineIndex::new(source);
 
     if let Some(offset) = nesting_overflow(source) {
@@ -70,14 +123,51 @@ pub fn analyze_source(path: &Path, source: &str) -> Result<Vec<Finding>, PythonE
         program: analyse_program(&module, source),
     };
 
-    Ok(analysis.run())
+    let statements = analysis.program.statements.len();
+    Ok(ModuleAnalysis {
+        findings: analysis.run(),
+        statements,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::analyze_source;
+    use super::{analyze_module, analyze_source};
+
+    /// A driver decides "nothing to analyse" from this number, so a file that
+    /// parsed and held no code has to be distinguishable from one that held
+    /// some. Comments and blank lines are not statements.
+    #[test]
+    fn statements_separate_an_empty_module_from_a_quiet_one() {
+        let count = |source: &str| {
+            analyze_module(Path::new("counted.py"), source)
+                .ok()
+                .map(|module| module.statements())
+        };
+        assert_eq!(count(""), Some(0));
+        assert_eq!(count("\n\n# just a comment\n\n"), Some(0));
+        assert_eq!(count("x = 1\n"), Some(1));
+        // Nested statements count: the body is code the rules ran over.
+        assert!(count("def f():\n    return 1\n").is_some_and(|n| n >= 2));
+    }
+
+    /// A UTF-8 byte-order mark is legal at the start of a Python file, and
+    /// every Windows-authored source carries one. Rejecting it would make a
+    /// whole platform's correct code unanalysable.
+    #[test]
+    fn a_byte_order_mark_does_not_stop_the_file_being_read() {
+        let source = "\u{feff}def total(items):\n    return sum(items)\n";
+        let module = analyze_module(Path::new("bom.py"), source);
+        assert!(
+            module
+                .as_ref()
+                .is_ok_and(|module| module.statements() > 0 && module.findings().is_empty()),
+            "{:?}",
+            module.err().map(|error| error.to_string())
+        );
+    }
 
     #[test]
     fn a_syntax_error_names_the_position() {

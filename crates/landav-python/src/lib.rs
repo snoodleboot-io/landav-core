@@ -91,7 +91,7 @@ mod patterns;
 mod syntax;
 
 pub use crate::{
-    analysis::analyze_source,
+    analysis::{ModuleAnalysis, analyze_module, analyze_source},
     finding::Finding,
     location::Location,
     python_error::PythonError,
