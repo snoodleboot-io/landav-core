@@ -91,7 +91,7 @@ impl Config {
 pub fn load(target: &Path, explicit: Option<&Path>) -> Result<Config, ToolError> {
     match explicit {
         Some(path) => load_explicit(path),
-        None => match discover(target) {
+        None => match discover(target)? {
             Some(path) => load_pyproject(&path),
             None => Ok(Config {
                 source: Source::Defaults,
@@ -108,12 +108,7 @@ pub fn load(target: &Path, explicit: Option<&Path>) -> Result<Config, ToolError>
 fn load_explicit(path: &Path) -> Result<Config, ToolError> {
     let meta = std::fs::metadata(path)
         .map_err(|err| ToolError::at_path(path, format!("cannot read the --config file: {err}")))?;
-    if meta.is_dir() {
-        return Err(ToolError::at_path(
-            path,
-            "--config expects a configuration file, but this is a directory",
-        ));
-    }
+    require_regular_file(path, &meta, "--config")?;
 
     let document = read_toml(path)?;
 
@@ -134,7 +129,25 @@ fn load_explicit(path: &Path) -> Result<Config, ToolError> {
 }
 
 /// Load `[tool.landav]` from a discovered `pyproject.toml`.
+///
+/// Discovery has already established that the *name* exists. Everything from
+/// here is a hard failure, because a `pyproject.toml` that is sitting right
+/// there and cannot be read is not the same as no configuration at all — and
+/// reporting "defaults (no configuration file)" for it would be a false
+/// statement about the run.
 fn load_pyproject(path: &Path) -> Result<Config, ToolError> {
+    let meta = std::fs::metadata(path).map_err(|err| {
+        ToolError::at_path(
+            path,
+            format!(
+                "is present but cannot be read: {err}; landav will not fall back to \
+                 defaults, because that would report a verdict under configuration \
+                 nobody chose"
+            ),
+        )
+    })?;
+    require_regular_file(path, &meta, "configuration discovery")?;
+
     let document = read_toml(path)?;
     let section = section_of(path, &document)?;
     reject_unknown_keys(path, &section)?;
@@ -142,6 +155,39 @@ fn load_pyproject(path: &Path) -> Result<Config, ToolError> {
     Ok(Config {
         source: Source::PyProject(path.to_path_buf()),
     })
+}
+
+/// Refuse anything that is not a regular file.
+///
+/// This is what keeps a configuration read from *blocking*. `read_to_string`
+/// on a FIFO waits for a writer that may never come, and `/dev/zero` never
+/// reaches end of file at all; either way the process produces no exit code,
+/// which is strictly worse than producing the wrong one. A hung job is killed
+/// by the runner's timeout and triaged as infrastructure flake rather than as
+/// a landav error. `metadata` answers the question without opening anything.
+fn require_regular_file(path: &Path, meta: &std::fs::Metadata, who: &str) -> Result<(), ToolError> {
+    if meta.is_file() {
+        return Ok(());
+    }
+    Err(ToolError::at_path(
+        path,
+        format!(
+            "{who} expects a regular file, but this is {}",
+            describe(meta)
+        ),
+    ))
+}
+
+/// A human name for a file type, for a diagnostic.
+fn describe(meta: &std::fs::Metadata) -> &'static str {
+    if meta.is_dir() {
+        "a directory"
+    } else if meta.is_symlink() {
+        "a symbolic link that does not resolve to one"
+    } else {
+        "not a regular file (a device, socket or named pipe); reading it could \
+         block forever, and a process that never exits has no exit code at all"
+    }
 }
 
 /// Read and parse a TOML document, blaming the file for anything that fails.
@@ -219,16 +265,45 @@ const fn type_name(value: &Value) -> &'static str {
 
 /// Find the nearest `pyproject.toml` at or above `target`.
 ///
-/// Ascends to the filesystem root. Returns `None` rather than an error: no
+/// Ascends to the filesystem root. A genuine absence returns `Ok(None)` — no
 /// configuration is the supported default, not a degraded mode.
-fn discover(target: &Path) -> Option<PathBuf> {
+///
+/// # Why this asks `symlink_metadata` rather than `is_file`
+///
+/// `Path::is_file` folds *every* `stat` failure into `false`. A
+/// `pyproject.toml` that is a dangling symlink, a symlink loop, a directory,
+/// or a file in an unreadable directory would therefore not exist as far as
+/// discovery is concerned, and the ascent would carry on and bind a *farther*
+/// configuration — or none — with nothing in the output saying so. That is the
+/// precise failure this module says it exists to prevent.
+///
+/// The question discovery has to answer is "is there a name here", which
+/// `symlink_metadata` answers without resolving it. Whether the thing behind
+/// the name is usable is [`load_pyproject`]'s problem, and it is a hard
+/// failure there.
+fn discover(target: &Path) -> Result<Option<PathBuf>, ToolError> {
     let mut dir = discovery_root(target);
     loop {
         let candidate = dir.join(PYPROJECT);
-        if candidate.is_file() {
-            return Some(candidate);
+        match std::fs::symlink_metadata(&candidate) {
+            // The name exists. Whether it is usable is decided by the loader,
+            // so that an unusable one stops the run instead of being skipped.
+            Ok(_) => return Ok(Some(candidate)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(ToolError::at_path(
+                    &candidate,
+                    format!(
+                        "cannot be inspected during configuration discovery: {err}; \
+                         landav will not treat an unreadable path as an absent one"
+                    ),
+                ));
+            }
         }
-        dir = dir.parent()?.to_path_buf();
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return Ok(None),
+        }
     }
 }
 

@@ -331,7 +331,6 @@ fn a_path_containing_a_newline_still_produces_a_sanctioned_code() -> io::Result<
 /// file that does not tokenise as Python is enough. Reporting `Inconclusive`
 /// for it would be exactly right: analysed, no conclusion, exit `1`.
 #[test]
-#[ignore = "BLOCKER: a .py file that is not Python exits 0; remove this ignore with the fix"]
 fn a_file_that_is_not_python_must_not_report_clean() -> io::Result<()> {
     let project = Project::new()?;
     let cases: [(&str, &str); 3] = [
@@ -374,7 +373,6 @@ fn a_file_that_is_not_python_must_not_report_clean() -> io::Result<()> {
 /// error, while a `.py` symlink to `/dev/null` is dropped without a word.
 #[cfg(unix)]
 #[test]
-#[ignore = "BLOCKER: a FIFO or device named *.py is silently skipped and the tree exits 0"]
 fn a_python_path_that_is_not_a_regular_file_must_not_be_silently_skipped() -> io::Result<()> {
     let project = Project::new()?;
     let src = project.mkdir("src")?;
@@ -412,7 +410,6 @@ fn a_python_path_that_is_not_a_regular_file_must_not_be_silently_skipped() -> io
 /// path can be `stat`ed: one exits `2`, the other exits `0`.
 #[cfg(unix)]
 #[test]
-#[ignore = "BLOCKER: an unstatable pyproject.toml is silently ignored and the run exits 0"]
 fn a_pyproject_that_cannot_be_stated_must_not_be_silently_discarded() -> io::Result<()> {
     use std::os::unix::fs::symlink;
 
@@ -476,7 +473,6 @@ fn a_pyproject_that_cannot_be_stated_must_not_be_silently_discarded() -> io::Res
 /// recursion path rather than a set of every directory ever entered.
 #[cfg(unix)]
 #[test]
-#[ignore = "BLOCKER: a symlink DAG is misreported as a symlink loop and exits 2"]
 fn two_paths_to_one_directory_are_not_a_symlink_loop() -> io::Result<()> {
     use std::os::unix::fs::symlink;
 
@@ -516,7 +512,6 @@ fn two_paths_to_one_directory_are_not_a_symlink_loop() -> io::Result<()> {
 /// never ends, so the process grows until the OOM killer takes it.
 #[cfg(unix)]
 #[test]
-#[ignore = "RISK: --config on a FIFO blocks forever and never produces an exit code"]
 fn a_config_that_cannot_be_read_promptly_must_not_hang() -> io::Result<()> {
     let project = Project::new()?;
     project.write("clean.py", CLEAN_PY)?;
@@ -555,7 +550,6 @@ fn a_config_that_cannot_be_read_promptly_must_not_hang() -> io::Result<()> {
 /// `(device, inode)` pair from the metadata already being read, not a
 /// canonical path.
 #[test]
-#[ignore = "RISK: the walk is O(depth^3); a deep tree times the gate out"]
 fn the_directory_walk_is_not_cubic_in_depth() -> io::Result<()> {
     let project = Project::new()?;
     let mut nested = String::from("src");
@@ -591,7 +585,6 @@ fn the_directory_walk_is_not_cubic_in_depth() -> io::Result<()> {
 ///
 /// Joining continued lines before scanning is a small change and closes it.
 #[test]
-#[ignore = "RISK: a backslash continuation hides both PERF findings and the file exits 0"]
 fn a_line_continuation_must_not_hide_a_finding() -> io::Result<()> {
     let project = Project::new()?;
     let target = project.write(
