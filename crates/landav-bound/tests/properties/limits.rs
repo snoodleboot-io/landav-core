@@ -254,3 +254,50 @@ fn the_wire_version_guard_is_exact() {
         "the supported version must round-trip"
     );
 }
+
+/// The node budget on **ingest**, at its boundary.
+///
+/// `try_from_wire` refuses a document declaring more than `MAX_NODES` entries,
+/// and that guard is the outermost thing standing between an untrusted
+/// document and this crate's allocator: it runs before a single node is
+/// rebuilt. Both sides of it are user-visible - one step early and the hosted
+/// platform silently cannot send what the constant says it may, one step late
+/// and the limit does not exist.
+///
+/// This is the one test in the suite that pays real time (about two seconds)
+/// for its boundary, because `MAX_NODES` counts entries in a `Vec` and there
+/// is no arithmetic trick that reaches `2^20` of them with fewer. The nodes
+/// are `Const`s rather than `Var`s so that rebuilding them allocates no
+/// strings, which is most of the difference between two seconds and four.
+#[test]
+fn the_ingest_node_budget_is_exact() {
+    let limit = landav_bound::MAX_NODES;
+    let document = |count: u32| BoundWire {
+        version: landav_bound::WIRE_VERSION,
+        // Distinct literals, so nothing about the outcome can come from the
+        // table being uniform.
+        nodes: (0..count)
+            .map(|i| landav_bound::WireNode::Const {
+                fin: Some(u64::from(i)),
+            })
+            .collect(),
+        root: count.saturating_sub(1),
+    };
+
+    // Exactly at the budget: accepted, and the root really is the node the
+    // document pointed at.
+    let accepted = Bound::try_from_wire(&document(limit));
+    assert_eq!(
+        accepted.ok(),
+        Some(Bound::constant(u64::from(limit) - 1)),
+        "a document of exactly MAX_NODES ({limit}) entries must be accepted"
+    );
+
+    // One past it: refused, before anything is rebuilt.
+    let refused = Bound::try_from_wire(&document(limit + 1));
+    assert!(
+        matches!(&refused, Err(BoundError::NodeBudgetExceeded { limit: named }) if *named == limit),
+        "a document of {} entries must be refused as NodeBudgetExceeded({limit}), not {refused:?}",
+        u64::from(limit) + 1
+    );
+}
