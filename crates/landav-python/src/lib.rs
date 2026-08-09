@@ -44,9 +44,11 @@
 //! the acceptance criteria are encoded by someone other than the implementer
 //! and are not edited to make an implementation pass.
 //!
-//! [`registry::registry`] is empty and `analyze_source` returns nothing. Every
-//! positive fixture therefore fails, and that red state is the deliverable of
-//! the test lane.
+//! The implementation lane fills them: [`registry::registry`] declares the
+//! eleven `LAV0xx` rules and [`analysis::analyze_source`] parses the source and
+//! runs them. The contract itself is unchanged — no fixture and no assertion
+//! was edited to make a rule pass, which is the only reading of the corpus that
+//! means anything.
 
 #![doc(html_root_url = "https://docs.rs/landav-python")]
 #![forbid(unsafe_code)]
@@ -62,6 +64,14 @@ pub mod python_error;
 pub mod registry;
 pub mod rule;
 pub mod rule_code;
+
+// Internal, and deliberately not `pub`. Everything below is a detail of *how*
+// the rules are decided; publishing it would make the parser choice part of the
+// crate's contract, and F-043 has to be able to swap it at R3 without a
+// breaking change.
+mod context;
+mod patterns;
+mod syntax;
 
 pub use crate::{
     analysis::analyze_source,
