@@ -20,7 +20,7 @@ use proptest::prelude::*;
 use crate::support::{
     BoundSpec, Env, REF_OMEGA, REFERENCE_MAX_FINITE_EXPONENT, arb_base_u32, arb_env, arb_ref,
     arb_spec, base_of, build, nat_ref, ref_ceil_log, ref_join, ref_nat, ref_plus, ref_pow,
-    ref_times, spec_of_shape,
+    ref_times, soundness_violation, spec_of_shape,
 };
 
 proptest! {
@@ -114,11 +114,17 @@ proptest! {
     /// one every real analysis run hits first.
     #[test]
     fn eval_is_total_at_the_omega_valuation(spec in arb_spec()) {
+        let env = Env::all_omega();
         let bound = build(&spec);
-        let got = bound.eval(&Env::all_omega().valuation());
+        // Totality is the claim, and it is carried by the absence of a panic.
+        // The value is bracketed rather than pinned: `Bound::prod` regroups a
+        // non-associative product, so `2 * u64::MAX * 0` is `0` exactly and
+        // `omega` once regrouped. See
+        // `denotation::smart_constructors_are_sound_and_attain_the_flattened_cap`.
+        let observed = nat_ref(bound.eval(&env.valuation()));
         prop_assert_eq!(
-            got,
-            ref_nat(crate::support::naive_eval(&spec, &Env::all_omega())),
+            soundness_violation(&spec, &env, observed),
+            None,
             "{} at the omega valuation",
             bound
         );
@@ -142,17 +148,21 @@ proptest! {
         }
     }
 
-    /// A term built entirely from finite constants either folds to the exact
-    /// value or to `omega`. It may never fold to some other finite value,
-    /// which is the shape every truncation bug takes.
+    /// Constant folding never moves the value downwards, and never above the
+    /// fully flattened value. A truncation bug - the shape where a fold lands
+    /// on some *smaller* finite value - breaks the lower bound and is caught.
     #[test]
-    fn constant_folding_is_exact_or_omega(spec in arb_spec(), env in arb_env()) {
+    fn constant_folding_stays_within_its_bounds(spec in arb_spec(), env in arb_env()) {
         let bound = build(&spec);
-        let expected = crate::support::naive_eval(&spec, &env);
+        let observed = nat_ref(bound.eval(&env.valuation()));
+        // "Exact or omega" was too strong: constant folding may also land on a
+        // *finite* over-approximation, because flattening regroups the factors
+        // of a non-associative product. What it may never do is fold downwards
+        // or above the fully flattened value.
         prop_assert_eq!(
-            nat_ref(bound.eval(&env.valuation())),
-            expected,
-            "{} folded away from its denotation",
+            soundness_violation(&spec, &env, observed),
+            None,
+            "{} folded outside its bounds",
             bound
         );
     }

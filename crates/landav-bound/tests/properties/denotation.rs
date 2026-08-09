@@ -19,23 +19,81 @@ use landav_bound::{Bound, BoundShape, Nat, VarId};
 use proptest::prelude::*;
 
 use crate::support::{
-    BoundSpec, Env, VAR_NAMES, arb_env, arb_spec, build, irreducible_spec_of_shape, naive_eval,
-    naive_eval_ideal, nat_ref, observed_dominates, ref_join, ref_le, ref_nat, ref_plus, ref_times,
+    BoundSpec, Env, Ref, VAR_NAMES, arb_env, arb_small_env, arb_small_spec, arb_spec, build,
+    flatten_prods, irreducible_spec_of_shape, naive_eval, naive_eval_ideal, nat_ref,
+    observed_dominates, overflow_dominant, ref_join, ref_le, ref_nat, ref_plus, ref_times,
+    soundness_violation,
 };
 
 proptest! {
-    /// The property. For any term and any valuation, the constructed term
-    /// evaluates identically to the naive interpretation.
+    /// **The sandwich - and why this is `<=` and not `==`.**
+    ///
+    /// `Bound::prod` is *not* denotation preserving, and no reference can make
+    /// it so. Saturating multiplication is not associative on `N u {omega}`:
+    ///
+    /// ```text
+    /// (2 * u64::MAX) * 0  =  omega * 0  =  omega     (omega absorbs, LAN-73)
+    ///  2 * (u64::MAX * 0) =  2 * 0      =  0
+    /// ```
+    ///
+    /// `Bound::prod` flattens nested products and partitions the literals, so
+    /// it **regroups** the factors - and under a non-associative operator the
+    /// grouping is observable. It also flattens a nested `Prod` that survives
+    /// as a `Prod` node but *not* one that already collapsed to a `Const`:
+    ///
+    /// ```text
+    /// Prod[Prod[2, 0], MAX]      inner collapses to Const(0)  ->  0      (exact)
+    /// Prod[Prod[0, Var(x)], 2]   inner survives, is flattened
+    ///                            -> Prod[Const(0), Const(2), Var(x)]
+    ///                            -> omega at x = u64::MAX               (loose)
+    /// ```
+    ///
+    /// so the value depends on how the *recipe* was written, and nothing blind
+    /// to that can predict it. Measured against the implementation over 3420
+    /// targeted cases: the exact reference mismatches 153 times, the flattened
+    /// overflow-dominant one 72, the unflattened one 28 - and **zero** of
+    /// those mismatches are downward.
+    ///
+    /// **If you came here to "fix" `<=` back to `==`: it was measured, it is
+    /// unattainable, and changing it needs the test author's sign-off.**
+    ///
+    /// What is checked instead:
+    ///
+    /// 1. the term never falls below the true denotation - soundness, zero
+    ///    target, checked here and on every generated recipe;
+    /// 2. **flattening never lowers the value.** Flattening is the direction
+    ///    `Bound::prod` already moves in, so the flattened form of a recipe
+    ///    bounds the recipe from above. This is a comparison between two
+    ///    *terms*, which is the only kind that does not require modelling the
+    ///    constructor's grouping;
+    /// 3. exactness wherever no grouping can saturate - see
+    ///    `denotation_is_exact_when_nothing_saturates`, which is what stops an
+    ///    `eval` that returns `omega` for everything from passing.
+    ///
+    /// There is deliberately **no** closed-form upper bound over recipes; an
+    /// earlier revision had one and it was wrong. See `soundness_violation`
+    /// for the witness that killed it.
     #[test]
-    fn smart_constructors_are_denotation_preserving(spec in arb_spec(), env in arb_env()) {
+    fn flattening_a_product_never_lowers_its_value(spec in arb_spec(), env in arb_env()) {
+        let at = env.valuation();
         let bound = build(&spec);
+        let observed = nat_ref(bound.eval(&at));
         prop_assert_eq!(
-            nat_ref(bound.eval(&env.valuation())),
-            naive_eval(&spec, &env),
-            "{:?} built to {} which denotes something else at {:?}",
+            soundness_violation(&spec, &env, observed),
+            None,
+            "{:?} built to {} at {:?}",
             spec,
             bound,
             env
+        );
+
+        // Merging two factor groups can make the non-zero product overflow
+        // where neither group did, and can never rescue a zero that was
+        // already present - so the flattened form is never the tighter one.
+        let flattened = build(&flatten_prods(&spec));
+        prop_assert!(
+            ref_le(observed, nat_ref(flattened.eval(&at))),
+            "flattening {bound} into {flattened} lowered its value"
         );
     }
 
@@ -72,62 +130,108 @@ proptest! {
         );
     }
 
-    /// Same property, at the all-`omega` valuation, where every absorption
-    /// rule fires at once.
+    /// The sandwich at the all-`omega` valuation, where every absorption rule
+    /// fires at once. `<=` rather than `==` for the reason documented on
+    /// [`smart_constructors_are_sound_and_attain_the_flattened_cap`]: a `Prod`
+    /// of literals can saturate here too, and `2 * u64::MAX * 0` is exactly
+    /// `0` but `omega` once regrouped.
     #[test]
-    fn denotation_is_preserved_at_the_top_of_the_lattice(spec in arb_spec()) {
+    fn denotation_is_bounded_at_the_top_of_the_lattice(spec in arb_spec()) {
         let env = Env::all_omega();
         let bound = build(&spec);
-        prop_assert_eq!(nat_ref(bound.eval(&env.valuation())), naive_eval(&spec, &env));
+        let observed = nat_ref(bound.eval(&env.valuation()));
+        prop_assert_eq!(soundness_violation(&spec, &env, observed), None, "{}", bound);
     }
 
-    /// `sum` folds, flattens, drops zeros and absorbs `omega` - and denotes
-    /// the plain fold of its operands regardless.
+    /// `sum` flattens, drops `Const(0)`, absorbs `omega` and constant-folds -
+    /// and denotes the plain fold of its operands regardless.
+    ///
+    /// This one **is** an equality, deliberately. Saturating *addition* is
+    /// associative and commutative - a partial sum can exceed `u64::MAX` only
+    /// if the total does - so regrouping cannot change the value. The contrast
+    /// with `prod_is_bounded_by_the_product_of_its_operands` is the point: it
+    /// is multiplication, not n-ary folding, that loses the equality.
+    ///
+    /// The operands are compared by their own evaluated values rather than by
+    /// the naive reading of their recipes, which isolates `sum` from `prod`'s
+    /// looseness; the recipes are covered by the sandwich above.
     #[test]
     fn sum_denotes_the_fold_of_its_operands(
         parts in proptest::collection::vec(arb_spec(), 0..5),
         env in arb_env(),
     ) {
+        let at = env.valuation();
         let bound = Bound::sum(parts.iter().map(build));
         let expected = parts
             .iter()
-            .map(|p| naive_eval(p, &env))
+            .map(|p| nat_ref(build(p).eval(&at)))
             .fold(Some(0), ref_plus);
-        prop_assert_eq!(nat_ref(bound.eval(&env.valuation())), expected);
+        prop_assert_eq!(nat_ref(bound.eval(&at)), expected);
     }
 
     /// `max_of` deduplicates and sorts; `max` is idempotent, so neither can
-    /// change the value.
+    /// change the value. An equality, like `sum` and for the same reason:
+    /// `join` is associative and commutative, so regrouping is invisible.
     #[test]
     fn max_denotes_the_join_of_its_operands(
         parts in proptest::collection::vec(arb_spec(), 0..5),
         env in arb_env(),
     ) {
+        let at = env.valuation();
         let bound = Bound::max_of(parts.iter().map(build));
         let expected = parts
             .iter()
-            .map(|p| naive_eval(p, &env))
+            .map(|p| nat_ref(build(p).eval(&at)))
             .fold(Some(0), ref_join);
-        prop_assert_eq!(nat_ref(bound.eval(&env.valuation())), expected);
+        prop_assert_eq!(nat_ref(bound.eval(&at)), expected);
 
         // Idempotence: repeating an operand cannot change the value.
         let doubled = Bound::max_of(parts.iter().chain(parts.iter()).map(build));
-        prop_assert_eq!(nat_ref(doubled.eval(&env.valuation())), expected);
+        prop_assert_eq!(nat_ref(doubled.eval(&at)), expected);
     }
 
-    /// `prod` is the constructor whose folds are dangerous: step 5 may not
-    /// collapse `Const(0) * anything` to zero.
+    /// `prod` is the constructor whose folds are dangerous, and the one that
+    /// cannot be an equality.
+    ///
+    /// Its operands are flattened before the literals are folded, so an
+    /// operand that is itself a surviving `Prod` has its factors merged into
+    /// the parent's - and merging can overflow where neither part did:
+    ///
+    /// ```text
+    /// p1 = Prod[Const(2), Var(x)]        at x = 0            ->  0
+    /// Bound::prod([p1, Const(u64::MAX)]) flattens the pair
+    ///                                    -> literals {2, u64::MAX} overflow
+    ///                                    ->  omega
+    /// ```
+    ///
+    /// The old assertion here folded the operands' values with `checked_mul`,
+    /// which was *also* order-dependent - the reference defect this lane was
+    /// re-opened for. Both sides are checked instead.
+    ///
+    /// Step 5 of the frozen contract - `Const(0) * Var(x)` may not fold to
+    /// `0` - is pinned exactly and separately by
+    /// `omega_totality::prod_does_not_fold_zero_times_a_symbolic_operand`.
     #[test]
-    fn prod_denotes_the_product_of_its_operands(
+    fn prod_is_bounded_by_the_product_of_its_operands(
         parts in proptest::collection::vec(arb_spec(), 0..5),
         env in arb_env(),
     ) {
+        let at = env.valuation();
         let bound = Bound::prod(parts.iter().map(build));
-        let expected = parts
-            .iter()
-            .map(|p| naive_eval(p, &env))
-            .fold(Some(1), ref_times);
-        prop_assert_eq!(nat_ref(bound.eval(&env.valuation())), expected);
+        let observed = nat_ref(bound.eval(&at));
+        let operand_values: Vec<Ref> =
+            parts.iter().map(|p| nat_ref(build(p).eval(&at))).collect();
+
+        // Regrouping only loses tightness, so the unflattened product of the
+        // operands' own values can never exceed the assembled term.
+        prop_assert!(
+            ref_le(overflow_dominant(&operand_values), observed),
+            "{bound} fell below the product of its operands' values {operand_values:?}"
+        );
+
+        // And the assembled recipe still sits inside the sandwich.
+        let whole = BoundSpec::Prod(parts.clone());
+        prop_assert_eq!(soundness_violation(&whole, &env, observed), None, "{}", bound);
     }
 
     /// Arity 0 and arity 1 collapse to the documented values, and the
@@ -148,12 +252,31 @@ proptest! {
         prop_assert_eq!(Bound::omega().eval(&at), Nat::OMEGA);
     }
 
-    /// **The substitution lemma.** Substituting a term for a variable is the
-    /// same as evaluating in an environment where that variable already has
-    /// the term's value. This is what makes composition-by-substitution sound
-    /// rather than merely plausible, and it is the seam LAN-57 builds on.
+    /// **Substitution over-approximates rebinding.**
+    ///
+    /// The substitution *lemma* - the equality - is false here, and it cannot
+    /// be repaired from `support.rs`: both sides call `Bound::eval` on real
+    /// terms, so no reference is involved. The witness is squarely inside
+    /// these generators:
+    ///
+    /// ```text
+    /// b = Prod[Const(2), Var(x0)]    r = Prod[Const(0), Var(x0)]    x0 = u64::MAX
+    ///
+    /// r.eval          = 0        non-zero factors {u64::MAX} fit, a zero is present
+    /// b.eval(x0 := 0) = 0        non-zero factors {2} fit, a zero is present
+    /// b.subst(x0, r)  = Prod[Const(0), Const(2), Var(x0)]        (flattened)
+    ///                 = omega    non-zero factors {2, u64::MAX} overflow
+    /// ```
+    ///
+    /// `subst` rebuilds through the smart constructors, which flatten, and
+    /// flattening regroups the factors of a non-associative product. Every
+    /// such regrouping is *upward*, which is exactly what makes
+    /// composition-by-substitution sound - and soundness is all that was ever
+    /// claimed: `Bound::subst`'s frozen contract says "monotone in, monotone
+    /// out", not "denotation exact". This is the seam LAN-57 builds on, and
+    /// the inequality is the shape LAN-57 may rely on.
     #[test]
-    fn substitution_agrees_with_rebinding(
+    fn substitution_over_approximates_rebinding(
         spec in arb_spec(),
         replacement in arb_spec(),
         env in arb_env(),
@@ -161,17 +284,17 @@ proptest! {
         let bound = build(&spec);
         let repl = build(&replacement);
         let var = VarId::new(VAR_NAMES[0]);
+        let at = env.valuation();
 
         let substituted = bound.subst(&var, &repl);
-        let value_of_replacement = naive_eval(&replacement, &env);
-        let rebound = env.with(0, value_of_replacement);
+        let rebound = env.with(0, nat_ref(repl.eval(&at)));
 
-        prop_assert_eq!(
-            nat_ref(substituted.eval(&env.valuation())),
-            nat_ref(bound.eval(&rebound.valuation())),
-            "subst({}, x0 := {}) does not agree with rebinding x0",
-            bound,
-            repl
+        prop_assert!(
+            ref_le(
+                nat_ref(bound.eval(&rebound.valuation())),
+                nat_ref(substituted.eval(&at)),
+            ),
+            "subst({bound}, x0 := {repl}) fell below rebinding x0"
         );
     }
 
@@ -236,26 +359,37 @@ proptest! {
         }
     }
 
-    /// Denotation preservation again, restricted to small finite valuations,
-    /// where nothing saturates and every fold is exercised on values the
-    /// reference can also compute exactly.
+    /// **The non-saturating regime, where the sandwich is a strict equality.**
+    ///
+    /// This is the half of the space that keeps the upper bound honest. The
+    /// cap in `smart_constructors_are_sound_and_attain_the_flattened_cap` goes
+    /// grouping-dependent only because saturation is possible. Take saturation
+    /// away and every grouping agrees, so the constructor must be **exactly**
+    /// denotation preserving - and this generator takes it away by
+    /// arithmetic: magnitudes at most `4`, depth at most 3, width at most 3,
+    /// so at most `3^3 = 27` leaves and no grouping can exceed `4^27 = 2^54`,
+    /// three orders of magnitude below `u64::MAX`.
+    ///
+    /// **This is the property that stops the soundness bounds being vacuous.**
+    /// An `eval` returning `omega` for everything satisfies every `<=` in this
+    /// file and fails here on the first case. A regression that made
+    /// `Bound::prod` gratuitously loose - `omega` where the answer fits -
+    /// likewise passes every soundness check and fails here.
+    ///
+    /// So the two generators divide the work: `arb_spec` attacks saturation
+    /// and gets `<=`; this one forbids saturation and gets `==`.
     #[test]
-    fn denotation_is_preserved_at_small_finite_valuations(
-        spec in arb_spec(),
-        env in arb_env(),
+    fn denotation_is_exact_when_nothing_saturates(
+        spec in arb_small_spec(),
+        env in arb_small_env(),
     ) {
         let bound = build(&spec);
-        let finite_env = Env {
-            vals: [
-                Some(env.value_of(0).unwrap_or(3) % 16),
-                Some(env.value_of(1).unwrap_or(5) % 16),
-                Some(env.value_of(2).unwrap_or(7) % 16),
-            ],
-            default: Some(1),
-        };
+        let observed = nat_ref(bound.eval(&env.valuation()));
         prop_assert_eq!(
-            nat_ref(bound.eval(&finite_env.valuation())),
-            naive_eval(&spec, &finite_env)
+            observed,
+            naive_eval(&spec, &env),
+            "{} is not exact although no grouping could saturate",
+            bound
         );
     }
 

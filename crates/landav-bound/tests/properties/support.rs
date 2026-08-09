@@ -273,6 +273,107 @@ pub fn ideal_ceil_log(base: u32, argument: Ideal) -> Ideal {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the upper bound - the cap on how loose the constructor may be
+// ---------------------------------------------------------------------------
+
+/// The n-ary product on a multiset of observed magnitudes, **overflow
+/// dominant**: `omega` if any factor is `omega`, `omega` if the product of the
+/// *non-zero* factors leaves `u64`, otherwise the exact product (which is `0`
+/// if any factor is zero).
+///
+/// Order-independent: the non-zero factors are all `>= 1`, so their running
+/// product is non-decreasing and whether it leaves `u64` does not depend on
+/// the order they are multiplied in.
+#[must_use]
+pub fn overflow_dominant(factors: &[Ref]) -> Ref {
+    if factors.iter().any(Option::is_none) {
+        return REF_OMEGA;
+    }
+    let mut product: u64 = 1;
+    for factor in factors.iter().flatten().filter(|value| **value != 0) {
+        product = product.checked_mul(*factor)?;
+    }
+    if factors.iter().flatten().any(|value| *value == 0) {
+        return Some(0);
+    }
+    Some(product)
+}
+
+/// Rewrites `spec` so that no `Prod` has a `Prod` child.
+///
+/// Flattening is the direction `Bound::prod` already moves in, and it only
+/// ever *loses* tightness: merging two factor groups can make the non-zero
+/// product overflow where neither group did, and it can never rescue a zero
+/// that was already there. So the flattened form of a recipe is an upper
+/// bound on the recipe itself - which is the one comparison between two
+/// *terms* that does not need to model the constructor's grouping.
+#[must_use]
+pub fn flatten_prods(spec: &BoundSpec) -> BoundSpec {
+    match spec {
+        BoundSpec::Const(_) | BoundSpec::Var(_) => spec.clone(),
+        BoundSpec::Sum(xs) => BoundSpec::Sum(xs.iter().map(flatten_prods).collect()),
+        BoundSpec::Max(xs) => BoundSpec::Max(xs.iter().map(flatten_prods).collect()),
+        BoundSpec::Prod(_) => {
+            let mut flat = Vec::new();
+            gather_flat_prod(spec, &mut flat);
+            BoundSpec::Prod(flat)
+        }
+        BoundSpec::Trans { log, base, arg } => BoundSpec::Trans {
+            log: *log,
+            base: *base,
+            arg: Box::new(flatten_prods(arg)),
+        },
+    }
+}
+
+fn gather_flat_prod(spec: &BoundSpec, out: &mut Vec<BoundSpec>) {
+    match spec {
+        BoundSpec::Prod(xs) => {
+            for x in xs {
+                gather_flat_prod(x, out);
+            }
+        }
+        other => out.push(flatten_prods(other)),
+    }
+}
+
+/// Checks the lower bound - soundness - at one point.
+///
+/// # Why there is no closed-form upper bound here
+///
+/// An earlier revision paired this with a cap: the value the recipe would have
+/// if every `Prod` chain were flattened. **That cap is wrong**, and a 20 000
+/// case run produced the witness:
+///
+/// ```text
+/// Prod[ Sum[3, 0], Max[0, Prod[Var(x2), 6148914691236517206]] ]   at x2 = 0
+/// ```
+///
+/// `Max[Const(0), P]` drops the zero, collapses to arity one, and *becomes*
+/// `P` - so the parent `Prod` flattens `P`'s factors into its own and
+/// `3 * 6148914691236517206` overflows to `omega`, while a model that
+/// flattens only through `Prod` children predicts `0`.
+///
+/// Any arity-1 collapse can turn a `Sum` or `Max` into a `Prod`, so predicting
+/// which factors end up multiplied together means reimplementing the
+/// constructor - at which point the reference stops being independent and the
+/// property stops being a test. The sound cap is therefore
+/// `omega` in the saturating regime, and *exactness* outside it, which is
+/// pinned by `denotation::denotation_is_exact_when_nothing_saturates` on a
+/// generator where no grouping can overflow at all. That is a tighter
+/// constraint than the flattened cap ever was, and unlike it, it is correct.
+#[must_use]
+pub fn soundness_violation(spec: &BoundSpec, env: &Env, observed: Ref) -> Option<String> {
+    let exact = naive_eval_ideal(spec, env);
+    if observed_dominates(observed, exact) {
+        return None;
+    }
+    Some(format!(
+        "UNDER-APPROXIMATION: evaluated to {observed:?}, below the true denotation {exact:?}"
+    ))
+}
+
 /// `true` iff an observed magnitude soundly over-approximates an ideal one.
 ///
 /// `omega` dominates everything. A finite observation must be at least the
@@ -673,6 +774,63 @@ pub fn arb_spec() -> impl Strategy<Value = BoundSpec> {
             }),
         ]
     })
+}
+
+/// Magnitudes small enough that products of a few of them stay inside `u64`.
+///
+/// [`arb_ref`] deliberately carries a heavy tail - `u64::MAX`, `1 << 63`,
+/// uniform `u64` - because saturation is where the interesting bugs live. The
+/// cost is that a `Prod` drawn from it almost always overflows, so its value
+/// is grouping dependent and only the soundness direction can be asserted.
+/// Measured, a `Prod`-bearing recipe from [`arb_spec`] avoided overflow only
+/// 15% of the time.
+///
+/// This generator covers the other regime, where saturation is impossible and
+/// the constructor must therefore be **exactly** denotation preserving.
+///
+/// Impossible by arithmetic, not by hope: magnitudes are at most `4`, the
+/// recursion is at most 3 deep and at most 3 wide, so a term has at most
+/// `3^3 = 27` leaves and the largest value any grouping can reach is
+/// `4^27 = 2^54`, three orders of magnitude below `u64::MAX`. No regrouping
+/// can overflow, so every grouping agrees and the answer is grouping
+/// independent. `Pow` is excluded for the same reason - it reaches `2^64`
+/// from a single small operand.
+///
+/// Both generators are needed; neither replaces the other.
+pub fn arb_small_ref() -> impl Strategy<Value = Ref> {
+    prop_oneof![
+        8 => (0u64..5).prop_map(Some),
+        3 => prop_oneof![Just(Some(0u64)), Just(Some(1u64)), Just(Some(2u64))],
+        1 => Just(REF_OMEGA),
+    ]
+}
+
+/// Terms whose literals and bases are small enough that nothing saturates.
+pub fn arb_small_spec() -> impl Strategy<Value = BoundSpec> {
+    let leaf = prop_oneof![
+        3 => arb_small_ref().prop_map(BoundSpec::Const),
+        3 => (0usize..VAR_NAMES.len()).prop_map(BoundSpec::Var),
+    ];
+    leaf.prop_recursive(3, 16, 3, |inner| {
+        prop_oneof![
+            proptest::collection::vec(inner.clone(), 2..4).prop_map(BoundSpec::Sum),
+            proptest::collection::vec(inner.clone(), 2..4).prop_map(BoundSpec::Max),
+            proptest::collection::vec(inner.clone(), 2..4).prop_map(BoundSpec::Prod),
+            // `Log` only: `Pow` re-introduces saturation immediately, and a
+            // saturating `Pow` is already covered by `arb_spec`.
+            inner.prop_map(|arg| BoundSpec::Trans {
+                log: true,
+                base: 2,
+                arg: Box::new(arg),
+            }),
+        ]
+    })
+}
+
+/// A valuation whose magnitudes are small enough not to saturate.
+pub fn arb_small_env() -> impl Strategy<Value = Env> {
+    (proptest::array::uniform3(arb_small_ref()), arb_small_ref())
+        .prop_map(|(vals, default)| Env { vals, default })
 }
 
 /// An arbitrary valuation.
