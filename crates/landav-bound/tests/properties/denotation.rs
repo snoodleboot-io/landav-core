@@ -19,10 +19,10 @@ use landav_bound::{Bound, BoundShape, Nat, VarId};
 use proptest::prelude::*;
 
 use crate::support::{
-    BoundSpec, Env, Ref, VAR_NAMES, arb_env, arb_small_env, arb_small_spec, arb_spec, build,
-    flatten_prods, irreducible_spec_of_shape, naive_eval, naive_eval_ideal, nat_ref,
-    observed_dominates, overflow_dominant, ref_join, ref_le, ref_nat, ref_plus, ref_times,
-    soundness_violation,
+    BoundSpec, Env, VAR_NAMES, arb_env, arb_small_env, arb_small_spec, arb_spec, build,
+    flatten_prods, ideal_le, ideal_of, irreducible_spec_of_shape, naive_eval, naive_eval_ideal,
+    nat_ref, observed_dominates, ref_join, ref_le, ref_nat, ref_plus, ref_times,
+    soundness_violation, subst_spec,
 };
 
 proptest! {
@@ -74,7 +74,7 @@ proptest! {
     /// earlier revision had one and it was wrong. See `soundness_violation`
     /// for the witness that killed it.
     #[test]
-    fn flattening_a_product_never_lowers_its_value(spec in arb_spec(), env in arb_env()) {
+    fn flattening_a_product_preserves_soundness(spec in arb_spec(), env in arb_env()) {
         let at = env.valuation();
         let bound = build(&spec);
         let observed = nat_ref(bound.eval(&at));
@@ -87,13 +87,19 @@ proptest! {
             env
         );
 
-        // Merging two factor groups can make the non-zero product overflow
-        // where neither group did, and can never rescue a zero that was
-        // already present - so the flattened form is never the tighter one.
-        let flattened = build(&flatten_prods(&spec));
-        prop_assert!(
-            ref_le(observed, nat_ref(flattened.eval(&at))),
-            "flattening {bound} into {flattened} lowered its value"
+        // The fully flattened recipe is a different term with the same
+        // denotation - the ideal product is associative even though the
+        // saturating one is not - so it must be evaluated soundly too. This
+        // is extra structural coverage (wide, flat `Prod` nodes), *not* a
+        // claim about which of the two is tighter: that direction is a
+        // property of overflow dominance, not of the algebra.
+        let flattened_spec = flatten_prods(&spec);
+        let flattened = build(&flattened_spec);
+        prop_assert_eq!(
+            soundness_violation(&flattened_spec, &env, nat_ref(flattened.eval(&at))),
+            None,
+            "{}",
+            flattened
         );
     }
 
@@ -212,24 +218,13 @@ proptest! {
     /// `0` - is pinned exactly and separately by
     /// `omega_totality::prod_does_not_fold_zero_times_a_symbolic_operand`.
     #[test]
-    fn prod_is_bounded_by_the_product_of_its_operands(
+    fn prod_over_approximates_the_denotation_of_its_operands(
         parts in proptest::collection::vec(arb_spec(), 0..5),
         env in arb_env(),
     ) {
         let at = env.valuation();
         let bound = Bound::prod(parts.iter().map(build));
         let observed = nat_ref(bound.eval(&at));
-        let operand_values: Vec<Ref> =
-            parts.iter().map(|p| nat_ref(build(p).eval(&at))).collect();
-
-        // Regrouping only loses tightness, so the unflattened product of the
-        // operands' own values can never exceed the assembled term.
-        prop_assert!(
-            ref_le(overflow_dominant(&operand_values), observed),
-            "{bound} fell below the product of its operands' values {operand_values:?}"
-        );
-
-        // And the assembled recipe still sits inside the sandwich.
         let whole = BoundSpec::Prod(parts.clone());
         prop_assert_eq!(soundness_violation(&whole, &env, observed), None, "{}", bound);
     }
@@ -276,7 +271,7 @@ proptest! {
     /// out", not "denotation exact". This is the seam LAN-57 builds on, and
     /// the inequality is the shape LAN-57 may rely on.
     #[test]
-    fn substitution_over_approximates_rebinding(
+    fn substitution_over_approximates_the_composed_denotation(
         spec in arb_spec(),
         replacement in arb_spec(),
         env in arb_env(),
@@ -287,14 +282,18 @@ proptest! {
         let at = env.valuation();
 
         let substituted = bound.subst(&var, &repl);
-        let rebound = env.with(0, nat_ref(repl.eval(&at)));
-
-        prop_assert!(
-            ref_le(
-                nat_ref(bound.eval(&rebound.valuation())),
-                nat_ref(substituted.eval(&at)),
-            ),
-            "subst({bound}, x0 := {repl}) fell below rebinding x0"
+        // The floor is the composed *recipe's* exact denotation, computed in
+        // the ideal domain. Rebinding through a saturating `Ref` would inflate
+        // it: a replacement whose true value merely leaves `u64` would read
+        // `omega`, and `omega * 0` is `omega` by LAN-73, so the floor would
+        // demand `omega` where the composed term is exactly `0`.
+        let composed = subst_spec(&spec, 0, &replacement);
+        prop_assert_eq!(
+            soundness_violation(&composed, &env, nat_ref(substituted.eval(&at))),
+            None,
+            "subst({}, x0 := {}) is unsound for the composed term",
+            bound,
+            repl
         );
     }
 
@@ -441,16 +440,20 @@ proptest! {
         let repl = build(&replacement);
         let var = VarId::new(VAR_NAMES[0]);
 
-        let replaced_value = naive_eval(&replacement, &env);
-        prop_assume!(ref_le(env.value_of(0), replaced_value));
+        // Domination is tested in the **ideal** domain, where `Beyond` is
+        // strictly below `Omega`. A replacement whose true value merely leaves
+        // `u64` does not dominate a genuinely unbounded variable, and reading
+        // both through a saturating `Ref` would wrongly say it does.
+        let replaced_value = naive_eval_ideal(&replacement, &env);
+        prop_assume!(ideal_le(ideal_of(env.value_of(0)), replaced_value));
 
         let substituted = bound.subst(&var, &repl);
         prop_assert!(
-            ref_le(
-                nat_ref(bound.eval(&env.valuation())),
+            observed_dominates(
                 nat_ref(substituted.eval(&env.valuation())),
+                naive_eval_ideal(&spec, &env),
             ),
-            "{substituted} under-approximates {bound}"
+            "{substituted} under-approximates the denotation of {bound}"
         );
     }
 }

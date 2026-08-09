@@ -21,8 +21,8 @@
 use std::collections::BTreeMap;
 
 use landav_bound::{
-    Base, Bound, BoundKind, BoundWire, Canonical, Lifted, Nat, Origin, TotalValuation, VarId,
-    Verdict, WireNode,
+    Base, Bound, BoundKind, BoundWire, Lifted, Nat, Origin, TotalValuation, VarId, Verdict,
+    WireNode,
 };
 use proptest::prelude::*;
 
@@ -44,66 +44,28 @@ fn arity_of(bound: &Bound) -> usize {
     }
 }
 
-/// **BLOCKER (abort).** `Bound::sum` and `Bound::prod` flatten a nested node of
-/// the same operator into the parent's operand list. `b = op([b, b])`
-/// therefore *doubles* the operand vector on every call while leaving the
-/// depth at 2 and the DAG at 2 distinct nodes.
-///
-/// Neither budget sees it:
-///
-/// * [`landav_bound::MAX_DEPTH`] is 512 and the depth never leaves 2;
-/// * [`landav_bound::MAX_NODES`] is `1 << 20` and is only consulted by
-///   `to_wire`/`try_from_wire`, never by `assemble`;
-/// * the `_checked` constructors have no variant for it and return `Ok`.
-///
-/// 40 lines of straight-line public API therefore ask for a `Vec` of `2^40`
-/// handles - 8 TB - and the failure mode of a `Vec` that cannot grow is
-/// `handle_alloc_error`, an **abort**. `#![forbid(unsafe_code)]`,
-/// `unwrap_used` and `panic` cannot see it.
-///
-/// This test pins the growth law at a safe size. It fails the moment an arity
-/// budget exists, which is the intent.
-#[test]
-fn nary_arity_doubles_per_call_and_no_budget_stops_it() {
-    let mut summed = Bound::var("x");
-    let mut multiplied = Bound::var("x");
-    for level in 1u32..=20 {
-        summed = Bound::sum([summed.clone(), summed.clone()]);
-        multiplied = Bound::prod([multiplied.clone(), multiplied.clone()]);
-
-        let expected = 1usize << level;
-        assert_eq!(
-            arity_of(&summed),
-            expected,
-            "sum arity at level {level} is not 2^{level}"
-        );
-        assert_eq!(
-            arity_of(&multiplied),
-            expected,
-            "prod arity at level {level} is not 2^{level}"
-        );
-        assert_eq!(summed.depth(), 2, "the depth guard never engages");
-        assert_eq!(multiplied.depth(), 2, "the depth guard never engages");
-    }
-
-    // 2^20 operands - exactly `MAX_NODES` - and every budget still says yes.
-    assert_eq!(arity_of(&summed), 1 << 20);
-    assert!(
-        Bound::sum_checked([summed.clone(), summed.clone()]).is_ok(),
-        "sum_checked has no error variant for an unbounded operand list"
-    );
-    assert!(
-        Bound::prod_checked([multiplied.clone(), multiplied.clone()]).is_ok(),
-        "prod_checked has no error variant for an unbounded operand list"
-    );
-}
-
-/// **BLOCKER 1, as the property that should hold.** Un-ignore this once an
-/// arity or total-size budget exists; it is the statement of the fix.
-///
-/// The bound is deliberately generous: an n-ary node may not carry more
+/// **BLOCKER 1, fixed in `0b22c60`.** An n-ary node may not carry more
 /// operands than [`landav_bound::MAX_NODES`] allows nodes, because a term with
 /// more operands than that has no wire form and no observer that terminates.
+///
+/// # What this replaced
+///
+/// `Bound::sum` and `Bound::prod` flatten a nested node of the same operator
+/// into the parent's operand list, so `b = op([b, b])` *doubled* the operand
+/// vector on every call while leaving the depth at 2 and the DAG at 2 distinct
+/// nodes. No budget saw it: `MAX_DEPTH` watches a depth that never left 2,
+/// `MAX_NODES` was consulted only by `to_wire`/`try_from_wire`, and the
+/// `_checked` constructors had no variant for it. Forty lines of public API
+/// asked for a `Vec` of `2^40` handles - 8 TB - and a `Vec` that cannot grow
+/// aborts through `handle_alloc_error`, which `#![forbid(unsafe_code)]`,
+/// `unwrap_used` and `panic` cannot see.
+///
+/// A companion test pinned that doubling law as characterisation. It was
+/// **deleted** rather than ignored when the budget landed: its central
+/// assertion was that `sum_checked` returns `Ok` at arity `2^21`, which is now
+/// the exact negation of the contract this test states, and an ignored test
+/// asserting the negation of a live contract is an invitation to "fix" the
+/// budget away.
 #[test]
 fn nary_arity_must_be_budgeted() {
     let limit = usize::try_from(landav_bound::MAX_NODES).unwrap_or(usize::MAX);
@@ -146,71 +108,37 @@ fn shared_ladder(levels: u32) -> Bound {
     bound
 }
 
-/// **BLOCKER (abort / non-termination).** The wire form preserves sharing;
-/// nothing else does.
+/// **BLOCKER 2, fixed in `0b22c60`.** The canonical encoding of a term must be
+/// bounded by its DAG size, not by its tree size: a 42-node DAG must not
+/// produce 40 MB of bytes.
 ///
-/// `Bound::eval`, `Bound::canonical_bytes`, `Bound::to_wire`,
-/// `Bound::wire_node_count`, `Hash`, `PartialEq`, `Canonical::canonical_cmp`
-/// and `Display` all traverse the *tree*, with no memoisation over the shared
-/// `Arc`s. On [`shared_ladder`] each costs `2^levels`:
+/// # What this replaced
+///
+/// The wire form preserved sharing; nothing else did. `eval`,
+/// `canonical_bytes`, `to_wire`, `wire_node_count`, `Hash`, `PartialEq`,
+/// `canonical_cmp` and `Display` all walked the *tree* with no memoisation
+/// over the shared `Arc`s, so on [`shared_ladder`] each cost `2^levels`:
 ///
 /// ```text
-/// level  depth  distinct DAG nodes  canonical_bytes  wire_node_count time
-///    12     25                  26         155 624 B          50 ms
-///    16     33                  34       2 490 344 B        1 055 ms
-///    20     41                  42      39 845 864 B       17 460 ms
+/// level  depth  DAG nodes  canonical_bytes  wire_node_count   after 0b22c60
+///    12     25         26        155 624 B            50 ms
+///    16     33         34      2 490 344 B         1 055 ms
+///    20     41         42     39 845 864 B        17 460 ms   1 040 B / 0.01 ms
 /// ```
 ///
-/// `MAX_DEPTH` is 512, so 255 levels are constructible in-budget and every one
-/// of those observers needs `2^255` steps. `canonical_bytes` additionally
-/// *allocates* its output, so it OOM-aborts around level 30 (≈40 GB) long
-/// before it hangs.
+/// `MAX_DEPTH` is 512, so 255 levels were constructible in budget and every
+/// observer needed `2^255` steps; `canonical_bytes` allocates its output, so
+/// it OOM-aborted around level 30. `wire_node_count` was the sharpest
+/// instance - offered by its own doc as the cheap pre-check "so a caller can
+/// check the serialised size *before* serialising", it returned 34 after doing
+/// `2^16` work.
 ///
-/// `wire_node_count` is the sharpest instance: its doc comment offers it as
-/// the cheap pre-check "so a caller can check the serialised size *before*
-/// serialising", and it is exponential in the thing it is meant to guard - it
-/// returns 34 after doing 2^16 work.
-///
-/// Pinned here as the exact doubling law, at a size that runs in milliseconds.
-#[test]
-fn every_observer_is_exponential_in_a_shared_dag() {
-    let mut previous: Option<usize> = None;
-    for levels in 8u32..=16 {
-        let bound = shared_ladder(levels);
-        let bytes = bound.canonical_bytes().as_bytes().len();
-
-        // The DAG is tiny and the depth is tiny; only the tree is huge.
-        assert_eq!(
-            bound.depth(),
-            u16::try_from(2 * levels + 1).unwrap_or(u16::MAX)
-        );
-        assert_eq!(bound.wire_node_count(), 2 * levels + 2);
-        assert!(bound.wire_node_count() < landav_bound::MAX_NODES);
-
-        if let Some(before) = previous {
-            assert!(
-                bytes > before * 2 - 64,
-                "canonical_bytes grew from {before} to {bytes}: the doubling has been fixed"
-            );
-        }
-        previous = Some(bytes);
-    }
-
-    // The observers agree with each other; it is the cost, not the answer,
-    // that is wrong. Two independently built ladders compare equal - after
-    // 2^16 comparisons, because `PartialEq` short-circuits only on pointer
-    // identity of the *roots*.
-    let left = shared_ladder(16);
-    let right = shared_ladder(16);
-    assert!(left == right);
-    assert_eq!(left.canonical_cmp(&right), core::cmp::Ordering::Equal);
-}
-
-/// **BLOCKER 2, as the property that should hold.** Un-ignore once the
-/// observers memoise over the shared DAG.
-///
-/// The statement: the canonical encoding of a term must be bounded by its DAG
-/// size, not by its tree size. A 42-node DAG must not produce 40 MB of bytes.
+/// The companion test pinned that doubling law. It was **deleted** rather than
+/// ignored: it required `canonical_bytes` to keep doubling to ~2.5 MB at level
+/// 16, this one requires ~1 KB at level 20, and the encoding is monotone in
+/// term size - so the two cannot both hold, and keeping the losing one around
+/// as documentation of a fixed bug is not worth a contradictory assertion in
+/// the tree.
 #[test]
 fn observers_must_be_polynomial_in_the_dag() {
     let bound = shared_ladder(20);
@@ -222,71 +150,111 @@ fn observers_must_be_polynomial_in_the_dag() {
     );
 }
 
-/// **BLOCKER 2, delivered by untrusted input.**
+/// **BLOCKER 2, delivered by untrusted input - fixed in `0b22c60`, kept live.**
 ///
 /// [`Bound::try_from_wire`] is the documented ingest for "a hand-edited or
-/// platform-supplied document". This builds one by hand: 50 nodes against a
-/// budget of 1 048 576, root depth 49 against a limit of 512, every child
-/// index strictly below its parent, every operator in-vocabulary. It is
-/// accepted in about 100 microseconds - and the term it returns costs `2^24`
-/// steps to evaluate, print, hash or serialise.
+/// platform-supplied document". This builds one by hand: every child index
+/// strictly below its parent, every operator in-vocabulary, node count far
+/// inside [`landav_bound::MAX_NODES`] and root depth inside
+/// [`landav_bound::MAX_DEPTH`]. `try_from_wire`'s three guards - version, node
+/// budget, depth - are all satisfied, because none of them measures the tree.
 ///
-/// Scaled to the depth limit the same document is under 15 KB of JSON and the
-/// resulting term is unobservable forever. `try_from_wire`'s three guards -
-/// version, node budget, depth - are all satisfied, because none of them
-/// measures the tree.
+/// Before the fix the term that came back cost `2^levels` steps to evaluate,
+/// print, hash or serialise, so a document under 15 KB of JSON produced a term
+/// that was unobservable forever. This test was originally a
+/// *characterisation* that asserted the blow-up was still present, and stopped
+/// at 12 levels so the suite would finish.
 ///
-/// This test stops at 12 levels so that the suite stays fast; the acceptance
-/// is the finding, the cost is measured by
-/// [`every_observer_is_exponential_in_a_shared_dag`].
+/// It is kept - rather than deleted with the other two - because the ingest
+/// path is attack surface that no other test covers: [`shared_ladder`] reaches
+/// the same shape through the public constructors, which a hostile party does
+/// not have to use. So it is inverted into the regression it should always
+/// have been.
+///
+/// The contract asserted is **not** "the document is accepted". Refusing it
+/// with `TreeSizeExceeded` is an equally sound answer, and pinning acceptance
+/// would pin one of two valid choices - the mistake this suite has now made
+/// four times. What must hold is narrower and is the actual security
+/// property: *ingest may never accept a term no observer can finish.* A small
+/// document must still round-trip, and a large one must be either refused or
+/// cheap to observe - never accepted and unobservable.
 #[test]
-fn a_wire_document_inside_every_budget_rebuilds_an_unobservable_term() {
-    let levels = 12u32;
-    let mut nodes = vec![
-        WireNode::Var {
-            name: "x".to_owned(),
-        },
-        WireNode::Const { fin: Some(1) },
-    ];
-    let mut previous: u32 = 0;
-    for _ in 0..levels {
-        let at = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
-        nodes.push(WireNode::Prod {
-            args: vec![previous, previous],
-        });
-        nodes.push(WireNode::Sum { args: vec![at, 1] });
-        previous = at + 1;
+fn a_hand_built_wire_document_cannot_smuggle_in_an_unobservable_term() {
+    // 12 levels is a legitimate small document and must still round-trip; 200
+    // is depth 401 against a limit of 512 and is the size the old doc called
+    // "unobservable forever".
+    for (levels, must_be_accepted) in [(12u32, true), (200u32, false)] {
+        let mut nodes = vec![
+            WireNode::Var {
+                name: "x".to_owned(),
+            },
+            WireNode::Const { fin: Some(1) },
+        ];
+        let mut previous: u32 = 0;
+        for _ in 0..levels {
+            let at = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+            nodes.push(WireNode::Prod {
+                args: vec![previous, previous],
+            });
+            nodes.push(WireNode::Sum { args: vec![at, 1] });
+            previous = at + 1;
+        }
+        let wire = BoundWire {
+            version: landav_bound::WIRE_VERSION,
+            nodes,
+            root: previous,
+        };
+        let declared = wire.nodes.len();
+        assert!(u32::try_from(declared).unwrap_or(u32::MAX) < landav_bound::MAX_NODES);
+
+        match Bound::try_from_wire(&wire) {
+            Ok(term) => {
+                assert!(term.depth() <= landav_bound::MAX_DEPTH);
+                // Accepted, so every observer must be polynomial in the DAG
+                // the document declared, not exponential in the tree it
+                // unfolds to. Reaching this line at all is half the assertion:
+                // before `0b22c60` `canonical_bytes` allocated its output and
+                // OOM-aborted here.
+                let dag = usize::try_from(term.wire_node_count()).unwrap_or(usize::MAX);
+                let bytes = term.canonical_bytes().as_bytes().len();
+                assert!(
+                    bytes <= dag * 4096,
+                    "a {declared}-node document at {levels} levels rebuilt to a term \
+                     encoding to {bytes} bytes over {dag} DAG nodes"
+                );
+            }
+            Err(refusal) => {
+                assert!(
+                    !must_be_accepted,
+                    "a {declared}-node document at {levels} levels was refused: {refusal:?}"
+                );
+            }
+        }
     }
-    let wire = BoundWire {
-        version: landav_bound::WIRE_VERSION,
-        nodes,
-        root: previous,
-    };
-
-    assert!(u32::try_from(wire.nodes.len()).unwrap_or(u32::MAX) < landav_bound::MAX_NODES);
-    let rebuilt = Bound::try_from_wire(&wire);
-    assert!(
-        rebuilt.is_ok(),
-        "the document was refused - a budget now exists: {rebuilt:?}"
-    );
-
-    // Accepted, in budget, and the encoding of what came back is 2^levels big.
-    let bytes = rebuilt
-        .map(|term| {
-            assert!(term.depth() <= landav_bound::MAX_DEPTH);
-            term.canonical_bytes().as_bytes().len()
-        })
-        .unwrap_or_default();
-    assert!(
-        bytes > (1usize << levels),
-        "{} wire nodes rebuilt to only {bytes} bytes: the blow-up is fixed",
-        wire.nodes.len()
-    );
 }
 
 // ---------------------------------------------------------------------------
 // TIGHTNESS - the saturating-with-a-zero regime
 // ---------------------------------------------------------------------------
+//
+// THESE THREE ARE CHARACTERISATION TESTS AND THE FINDINGS ARE STILL OPEN.
+//
+//   a_closed_product_denoting_zero_becomes_an_unblamed_omega
+//   prod_keeps_a_redundant_literal_beside_the_zero_and_pays_for_it
+//   closed_terms_denoting_zero_do_not_all_fold_to_const_zero
+//
+// Each pins the *current* behaviour and each says so in its assertion
+// messages ("the tightness gap is closed", "the deviation has been fixed").
+// They are green today because the gaps are real and unfixed. **Whoever lands
+// the tightness fix must invert all three in the same commit** - they are not
+// contracts, and a red suite there means the fix worked.
+//
+// Nothing in `denotation.rs` blocks the fix any more. It used to: an
+// overflow-dominant floor under `Bound::prod`, a flattening-direction claim
+// and two substitution floors all required `omega` in exactly the cases the
+// fix makes exact. All four now take their floor from `naive_eval_ideal` of a
+// recipe, which no sound implementation can violate. See `soundness_violation`
+// in `support.rs` for why that is the only admissible kind of floor.
 
 /// A valuation binding `x` and defaulting everything else to `default`.
 fn at_x(value: Nat, default: Nat) -> TotalValuation {

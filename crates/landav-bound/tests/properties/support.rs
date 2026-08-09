@@ -199,6 +199,23 @@ pub fn ideal_ref(i: Ideal) -> Ref {
     }
 }
 
+/// The ideal magnitude order: `Fin(_) < Beyond < Omega`.
+///
+/// `Beyond` is strictly below `Omega`, which is the distinction that makes a
+/// domination antecedent mean what it says: a replacement whose true value is
+/// merely *too large for `u64`* does not dominate a variable that is genuinely
+/// unbounded.
+#[must_use]
+pub fn ideal_le(a: Ideal, b: Ideal) -> bool {
+    match (a, b) {
+        (_, Ideal::Omega) => true,
+        (Ideal::Omega, _) => false,
+        (_, Ideal::Beyond) => true,
+        (Ideal::Beyond, _) => false,
+        (Ideal::Fin(x), Ideal::Fin(y)) => x <= y,
+    }
+}
+
 /// Ideal addition. Associative and commutative.
 #[must_use]
 pub fn ideal_plus(a: Ideal, b: Ideal) -> Ideal {
@@ -277,27 +294,45 @@ pub fn ideal_ceil_log(base: u32, argument: Ideal) -> Ideal {
 // the upper bound - the cap on how loose the constructor may be
 // ---------------------------------------------------------------------------
 
-/// The n-ary product on a multiset of observed magnitudes, **overflow
-/// dominant**: `omega` if any factor is `omega`, `omega` if the product of the
-/// *non-zero* factors leaves `u64`, otherwise the exact product (which is `0`
-/// if any factor is zero).
+/// Substitutes `replacement` for every occurrence of the `index`th variable.
 ///
-/// Order-independent: the non-zero factors are all `>= 1`, so their running
-/// product is non-decreasing and whether it leaves `u64` does not depend on
-/// the order they are multiplied in.
+/// Recipe-level substitution, so that the *composed* denotation can be
+/// computed in the ideal domain without routing an intermediate value through
+/// a saturating `Ref`. That routing is what makes a rebinding floor wrong: at
+/// `x := Beyond` a `Prod` carrying a zero would read `omega` and inflate.
 #[must_use]
-pub fn overflow_dominant(factors: &[Ref]) -> Ref {
-    if factors.iter().any(Option::is_none) {
-        return REF_OMEGA;
+pub fn subst_spec(spec: &BoundSpec, index: usize, replacement: &BoundSpec) -> BoundSpec {
+    let slot = index % VAR_NAMES.len();
+    match spec {
+        BoundSpec::Const(_) => spec.clone(),
+        BoundSpec::Var(i) => {
+            if i % VAR_NAMES.len() == slot {
+                replacement.clone()
+            } else {
+                spec.clone()
+            }
+        }
+        BoundSpec::Sum(xs) => BoundSpec::Sum(
+            xs.iter()
+                .map(|x| subst_spec(x, index, replacement))
+                .collect(),
+        ),
+        BoundSpec::Max(xs) => BoundSpec::Max(
+            xs.iter()
+                .map(|x| subst_spec(x, index, replacement))
+                .collect(),
+        ),
+        BoundSpec::Prod(xs) => BoundSpec::Prod(
+            xs.iter()
+                .map(|x| subst_spec(x, index, replacement))
+                .collect(),
+        ),
+        BoundSpec::Trans { log, base, arg } => BoundSpec::Trans {
+            log: *log,
+            base: *base,
+            arg: Box::new(subst_spec(arg, index, replacement)),
+        },
     }
-    let mut product: u64 = 1;
-    for factor in factors.iter().flatten().filter(|value| **value != 0) {
-        product = product.checked_mul(*factor)?;
-    }
-    if factors.iter().flatten().any(|value| *value == 0) {
-        return Some(0);
-    }
-    Some(product)
 }
 
 /// Rewrites `spec` so that no `Prod` has a `Prod` child.
@@ -339,6 +374,28 @@ fn gather_flat_prod(spec: &BoundSpec, out: &mut Vec<BoundSpec>) {
 }
 
 /// Checks the lower bound - soundness - at one point.
+///
+/// # The only valid floor is the exact denotation
+///
+/// **Never use one term's evaluated value as a lower bound for another
+/// term's.** `Bound::eval` is not compositional: `Bound::prod` flattens and
+/// regroups, saturating multiplication is not associative, so every term's
+/// value carries whatever over-approximation its own grouping accumulated.
+/// Using that as a floor pins the implementation's *looseness* as a contract
+/// and forbids it from ever becoming more precise - the opposite of what a
+/// soundness suite is for.
+///
+/// This suite made that mistake three times before it was named: a flattened
+/// upper bound over recipes (wrong - arity-1 collapse), an
+/// overflow-dominant floor under `Bound::prod` (blocked two correct tightness
+/// fixes), and two substitution floors that read an intermediate `omega` as a
+/// requirement. All three were *descriptions of the implementation* promoted
+/// to *requirements on it*.
+///
+/// `exact_ideal <= observed` is necessary **and sufficient** for soundness.
+/// Anything stronger over-constrains; anything weaker is unsound. Floors are
+/// computed from [`naive_eval_ideal`] of a *recipe*, never from `eval` of a
+/// term.
 ///
 /// # Why there is no closed-form upper bound here
 ///
@@ -615,14 +672,6 @@ impl Env {
     #[must_use]
     pub fn value_of(&self, i: usize) -> Ref {
         self.vals[i % VAR_NAMES.len()]
-    }
-
-    /// This env with the `i`th variable rebound.
-    #[must_use]
-    pub fn with(&self, i: usize, v: Ref) -> Self {
-        let mut next = self.clone();
-        next.vals[i % VAR_NAMES.len()] = v;
-        next
     }
 
     /// Pointwise order, over the generated variables **and** the default that
