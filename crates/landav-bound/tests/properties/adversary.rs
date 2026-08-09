@@ -257,7 +257,7 @@ fn a_hand_built_wire_document_cannot_smuggle_in_an_unobservable_term() {
 // overflow-dominant floor under `Bound::prod`, a flattening-direction claim
 // and two substitution floors all required `omega` in exactly the cases the
 // fix makes exact. All four now take their floor from `naive_eval_ideal` of a
-// recipe, which no sound implementation can violate. See `soundness_violation`
+// recipe, which no sound implementation can violate. See `precision_violation`
 // in `support.rs` for why that is the only admissible kind of floor.
 
 /// A valuation binding `x` and defaulting everything else to `default`.

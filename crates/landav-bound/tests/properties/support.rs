@@ -373,7 +373,39 @@ fn gather_flat_prod(spec: &BoundSpec, out: &mut Vec<BoundSpec>) {
     }
 }
 
-/// Checks the lower bound - soundness - at one point.
+/// Characterises the implementation at one point, with **no vacuous arm**.
+///
+/// An earlier revision checked only `exact <= observed`, whose `omega` case
+/// (`observed_dominates` returns `true` for any `(None, _)`) discharged 71.6%
+/// of generated cases without ever comparing two numbers - and on the 28.4%
+/// that did compare, the implementation was exact every single time. A
+/// headline soundness property that is three-quarters tautology is not a
+/// soundness property, so both halves are now real assertions:
+///
+/// * a **finite** observation must equal the true denotation exactly;
+/// * an **`omega`** observation must be arithmetically justified - some
+///   grouping of the term has to be able to leave `u64`.
+///
+/// Measured over 30 000 draws from [`arb_spec`] and [`arb_env`]:
+///
+/// ```text
+/// finite observation  -> strict equality asserted   28.5%
+/// omega observation   -> justification asserted     71.5%
+/// vacuous                                            0.0%
+/// of which: envelope finite -> omega forbidden      27.0%
+///           omega with a finite true value           3.0%   <- the open region
+/// ```
+///
+/// # The 3% that is deliberately not pinned
+///
+/// That last row is `Bound::prod` reporting `omega` for a term whose true
+/// value is finite, in the regime where saturation really was reachable -
+/// a product that overflows while carrying a zero factor. **Both answers are
+/// admissible there and they differ by `omega` versus `0`, the full width of
+/// the lattice**, so no upper bound can permit the current implementation
+/// without permitting anything at all. It is an accepted risk with a precise
+/// trigger: the moment the tightness question is decided one way or the
+/// other, this region becomes pinnable and should be pinned.
 ///
 /// # The only valid floor is the exact denotation
 ///
@@ -421,14 +453,71 @@ fn gather_flat_prod(spec: &BoundSpec, out: &mut Vec<BoundSpec>) {
 /// generator where no grouping can overflow at all. That is a tighter
 /// constraint than the flattened cap ever was, and unlike it, it is correct.
 #[must_use]
-pub fn soundness_violation(spec: &BoundSpec, env: &Env, observed: Ref) -> Option<String> {
+pub fn precision_violation(spec: &BoundSpec, env: &Env, observed: Ref) -> Option<String> {
     let exact = naive_eval_ideal(spec, env);
-    if observed_dominates(observed, exact) {
-        return None;
+    match observed {
+        // A finite observation must be exactly right. Saturation is the only
+        // imprecision the algebra sanctions, and saturation lands on `omega` -
+        // so there is no route to a *loose but finite* answer, and anything
+        // that produced one would be a truncation bug.
+        Some(got) => match exact {
+            Ideal::Fin(want) if want == got => None,
+            Ideal::Fin(want) => Some(format!(
+                "LOOSE BUT FINITE: evaluated to {got}, true denotation {want}"
+            )),
+            Ideal::Beyond | Ideal::Omega => Some(format!(
+                "UNDER-APPROXIMATION: evaluated to a finite {got}, \
+                 below the true denotation {exact:?}"
+            )),
+        },
+        // `omega` must be *arithmetically justified*: some grouping of this
+        // term has to be able to leave `u64`. If none can, `omega` is
+        // gratuitous looseness rather than saturation.
+        None => saturation_free_envelope(spec, env).map(|ceiling| {
+            format!(
+                "GRATUITOUS OMEGA: no grouping of this term can leave u64 - the largest \
+                 magnitude any of them reaches is {ceiling} - so omega is not saturation; \
+                 the true denotation is {exact:?}"
+            )
+        }),
     }
-    Some(format!(
-        "UNDER-APPROXIMATION: evaluated to {observed:?}, below the true denotation {exact:?}"
-    ))
+}
+
+/// The largest magnitude **any** grouping of `spec` could reach at `env`, or
+/// `None` if some subterm could leave `u64`.
+///
+/// A zero factor counts as one: a zero cannot rescue an overflow that a
+/// different grouping would have hit first, which is exactly the asymmetry
+/// that makes `Bound::prod` grouping dependent.
+///
+/// `None` therefore means "saturation is reachable here", and it is the only
+/// circumstance under which an implementation may answer `omega` for a term
+/// whose true denotation is finite.
+#[must_use]
+pub fn saturation_free_envelope(spec: &BoundSpec, env: &Env) -> Option<u64> {
+    match spec {
+        BoundSpec::Const(r) => *r,
+        BoundSpec::Var(i) => env.value_of(*i),
+        BoundSpec::Sum(xs) => xs.iter().try_fold(0u64, |acc, x| {
+            acc.checked_add(saturation_free_envelope(x, env)?)
+        }),
+        BoundSpec::Max(xs) => xs.iter().try_fold(0u64, |acc, x| {
+            Some(acc.max(saturation_free_envelope(x, env)?))
+        }),
+        BoundSpec::Prod(xs) => xs.iter().try_fold(1u64, |acc, x| {
+            acc.checked_mul(saturation_free_envelope(x, env)?.max(1))
+        }),
+        BoundSpec::Trans { log, base, arg } => {
+            let inner = saturation_free_envelope(arg, env)?;
+            if *log {
+                Some(ceil_log_u64(*base, inner))
+            } else if inner >= REFERENCE_MAX_FINITE_EXPONENT {
+                None
+            } else {
+                u64::from(*base).checked_pow(u32::try_from(inner).ok()?)
+            }
+        }
+    }
 }
 
 /// `true` iff an observed magnitude soundly over-approximates an ideal one.
@@ -597,7 +686,26 @@ pub fn naive_eval_ideal(spec: &BoundSpec, env: &Env) -> Ideal {
     }
 }
 
+/// `true` for the shapes that actually take sub-bounds as operands.
+///
+/// `Const` and `Sum`'s nullary siblings are not a stylistic distinction: a
+/// property about behaviour "in its operands" is vacuous for a constructor
+/// that has none, and iterating all six shapes to check it silently compares
+/// two identical terms twice. Exhaustive, so a seventh constructor is a
+/// compile error here as well.
+#[must_use]
+pub const fn shape_takes_operands(shape: BoundShape) -> bool {
+    match shape {
+        BoundShape::Const | BoundShape::Var => false,
+        BoundShape::Sum | BoundShape::Max | BoundShape::Prod | BoundShape::Trans => true,
+    }
+}
+
 /// Builds a recipe of the requested shape.
+///
+/// **`Const` and `Var` ignore `a` and `b`** - they are nullary constructors
+/// and there is nowhere for an operand to go. Callers asserting anything
+/// *about the operands* must filter with [`shape_takes_operands`] first.
 ///
 /// The `match` is exhaustive over [`BoundShape::ALL`] on purpose: a seventh
 /// constructor is then a **compile error in this test suite**, not a review

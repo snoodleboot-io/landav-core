@@ -21,8 +21,8 @@ use proptest::prelude::*;
 use crate::support::{
     BoundSpec, Env, VAR_NAMES, arb_env, arb_small_env, arb_small_spec, arb_spec, build,
     flatten_prods, ideal_le, ideal_of, irreducible_spec_of_shape, naive_eval, naive_eval_ideal,
-    nat_ref, observed_dominates, ref_join, ref_le, ref_nat, ref_plus, ref_times,
-    soundness_violation, subst_spec,
+    nat_ref, observed_dominates, precision_violation, ref_join, ref_le, ref_nat, ref_plus,
+    ref_times, subst_spec,
 };
 
 proptest! {
@@ -71,7 +71,7 @@ proptest! {
     ///    `eval` that returns `omega` for everything from passing.
     ///
     /// There is deliberately **no** closed-form upper bound over recipes; an
-    /// earlier revision had one and it was wrong. See `soundness_violation`
+    /// earlier revision had one and it was wrong. See `precision_violation`
     /// for the witness that killed it.
     #[test]
     fn flattening_a_product_preserves_soundness(spec in arb_spec(), env in arb_env()) {
@@ -79,7 +79,7 @@ proptest! {
         let bound = build(&spec);
         let observed = nat_ref(bound.eval(&at));
         prop_assert_eq!(
-            soundness_violation(&spec, &env, observed),
+            precision_violation(&spec, &env, observed),
             None,
             "{:?} built to {} at {:?}",
             spec,
@@ -96,7 +96,7 @@ proptest! {
         let flattened_spec = flatten_prods(&spec);
         let flattened = build(&flattened_spec);
         prop_assert_eq!(
-            soundness_violation(&flattened_spec, &env, nat_ref(flattened.eval(&at))),
+            precision_violation(&flattened_spec, &env, nat_ref(flattened.eval(&at))),
             None,
             "{}",
             flattened
@@ -146,7 +146,7 @@ proptest! {
         let env = Env::all_omega();
         let bound = build(&spec);
         let observed = nat_ref(bound.eval(&env.valuation()));
-        prop_assert_eq!(soundness_violation(&spec, &env, observed), None, "{}", bound);
+        prop_assert_eq!(precision_violation(&spec, &env, observed), None, "{}", bound);
     }
 
     /// `sum` flattens, drops `Const(0)`, absorbs `omega` and constant-folds -
@@ -226,7 +226,7 @@ proptest! {
         let bound = Bound::prod(parts.iter().map(build));
         let observed = nat_ref(bound.eval(&at));
         let whole = BoundSpec::Prod(parts.clone());
-        prop_assert_eq!(soundness_violation(&whole, &env, observed), None, "{}", bound);
+        prop_assert_eq!(precision_violation(&whole, &env, observed), None, "{}", bound);
     }
 
     /// Arity 0 and arity 1 collapse to the documented values, and the
@@ -289,7 +289,7 @@ proptest! {
         // demand `omega` where the composed term is exactly `0`.
         let composed = subst_spec(&spec, 0, &replacement);
         prop_assert_eq!(
-            soundness_violation(&composed, &env, nat_ref(substituted.eval(&at))),
+            precision_violation(&composed, &env, nat_ref(substituted.eval(&at))),
             None,
             "subst({}, x0 := {}) is unsound for the composed term",
             bound,

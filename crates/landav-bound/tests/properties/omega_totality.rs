@@ -19,8 +19,8 @@ use proptest::prelude::*;
 
 use crate::support::{
     BoundSpec, Env, REF_OMEGA, REFERENCE_MAX_FINITE_EXPONENT, arb_base_u32, arb_env, arb_ref,
-    arb_spec, base_of, build, nat_ref, ref_ceil_log, ref_join, ref_nat, ref_plus, ref_pow,
-    ref_times, soundness_violation, spec_of_shape,
+    arb_spec, base_of, build, nat_ref, precision_violation, ref_ceil_log, ref_join, ref_nat,
+    ref_plus, ref_pow, ref_times, spec_of_shape,
 };
 
 proptest! {
@@ -123,7 +123,7 @@ proptest! {
         // `denotation::smart_constructors_are_sound_and_attain_the_flattened_cap`.
         let observed = nat_ref(bound.eval(&env.valuation()));
         prop_assert_eq!(
-            soundness_violation(&spec, &env, observed),
+            precision_violation(&spec, &env, observed),
             None,
             "{} at the omega valuation",
             bound
@@ -160,7 +160,7 @@ proptest! {
         // of a non-associative product. What it may never do is fold downwards
         // or above the fully flattened value.
         prop_assert_eq!(
-            soundness_violation(&spec, &env, observed),
+            precision_violation(&spec, &env, observed),
             None,
             "{} folded outside its bounds",
             bound

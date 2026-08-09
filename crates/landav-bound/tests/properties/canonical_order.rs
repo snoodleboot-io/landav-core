@@ -67,11 +67,28 @@ proptest! {
         second in arb_spec(),
         third in arb_spec(),
     ) {
-        let mut all = [build(&first), build(&second), build(&third)];
-        all.sort_by(Canonical::canonical_cmp);
-        prop_assert!(all[0].canonical_cmp(&all[1]) != Ordering::Greater);
-        prop_assert!(all[1].canonical_cmp(&all[2]) != Ordering::Greater);
-        prop_assert!(all[0].canonical_cmp(&all[2]) != Ordering::Greater);
+        // Sorting a triple and then asserting it is sorted tests `sort_by`,
+        // not the comparator. Transitivity is checked directly, over every
+        // ordered triple drawn from the three terms - which includes the
+        // repeats, so reflexivity and antisymmetry are exercised too.
+        let terms = [build(&first), build(&second), build(&third)];
+        for x in &terms {
+            for y in &terms {
+                for z in &terms {
+                    let (xy, yz, xz) =
+                        (x.canonical_cmp(y), y.canonical_cmp(z), x.canonical_cmp(z));
+                    if xy != Ordering::Greater && yz != Ordering::Greater {
+                        prop_assert!(
+                            xz != Ordering::Greater,
+                            "{x} <= {y} <= {z} but {x} > {z}"
+                        );
+                    }
+                    if xy == Ordering::Less && yz == Ordering::Less {
+                        prop_assert!(xz == Ordering::Less, "{x} < {y} < {z} but not {x} < {z}");
+                    }
+                }
+            }
+        }
     }
 
     /// **Content derived, not address derived.** A clone shares the `Arc`; a
