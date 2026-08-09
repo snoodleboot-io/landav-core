@@ -1,0 +1,40 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Coverage
+/coverage/
+*.profraw
+*.profdata
+lcov.info
+
+# Session and agent state — never committed
+.prompticorn/
+
+# Calibration profiles are machine-specific and are produced, not authored
+/profiles/*.json
+!/profiles/example.json
+
+# Solver binaries, if discovered locally rather than on PATH
+/vendor/koat
+/vendor/loat
+
+# Editors
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Planning artifacts live in the parent workspace and are NOT public.
+# Belt and braces in case one is ever copied in by accident.
+landav-strategy.pdf
+landav-delivery-plan.xlsx
+landav-build-plan.pdf
+landav-research.md
+landav-mathematical-foundations.pdf

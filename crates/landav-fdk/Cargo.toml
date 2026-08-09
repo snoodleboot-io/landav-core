@@ -1,0 +1,17 @@
+[package]
+name = "landav-fdk"
+description = "The Landav Frontend Development Kit: the published plugin boundary for language frontends and for landav-ee extensions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+landav-bound = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

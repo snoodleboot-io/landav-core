@@ -1,0 +1,17 @@
+[package]
+name = "landav-solvers"
+description = "External solver bridge: invokes KoAT for upper bounds and LoAT for lower bounds, parsing results back into the bound algebra."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+landav-bound = { workspace = true }
+landav-its = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

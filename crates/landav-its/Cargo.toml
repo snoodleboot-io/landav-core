@@ -1,0 +1,16 @@
+[package]
+name = "landav-its"
+description = "Integer transition system exporter: lowers the numeric fragment of a frontend IR into KoAT's ITS format."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+landav-bound = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

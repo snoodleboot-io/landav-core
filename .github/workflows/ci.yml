@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the version; this action honours it.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Docs
+        run: cargo doc --workspace --no-deps
+
+  edition-boundary:
+    name: no entitlement logic in core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # landav-core is Apache-2.0 and must contain no licence or entitlement
+      # checks — not stubbed, not feature-gated, absent. See docs/EDITIONS.md.
+      # This guard is deliberately crude; it is a tripwire, not an analysis.
+      - name: Reject licence and entitlement logic
+        run: |
+          # Comment lines are skipped: docs/EDITIONS.md and the FDK crate docs
+          # discuss this rule, and describing it must not trip it.
+          matches=$(grep -rniE \
+            '\b(licen[cs]e_key|entitlement|is_licensed|check_licen[cs]e|activation_key|subscription_tier)\b' \
+            --include='*.rs' crates/ \
+            | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|/\*|\*)' || true)
+          if [ -n "$matches" ]; then
+            echo "$matches"
+            echo "::error::landav-core must not contain entitlement logic. See docs/EDITIONS.md."
+            exit 1
+          fi
+          echo "No entitlement logic found in crates/."

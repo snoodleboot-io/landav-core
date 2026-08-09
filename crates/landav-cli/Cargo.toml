@@ -1,0 +1,24 @@
+[package]
+name = "landav-cli"
+description = "The landav command-line interface: check, explain, calibrate. Free forever."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "landav"
+path = "src/main.rs"
+
+[dependencies]
+landav-bound = { workspace = true }
+landav-calibrate = { workspace = true }
+landav-python = { workspace = true }
+landav-solvers = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

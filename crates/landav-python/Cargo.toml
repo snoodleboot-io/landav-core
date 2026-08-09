@@ -1,0 +1,18 @@
+[package]
+name = "landav-python"
+description = "The Python frontend: parser, type resolution, lowering and pattern rules. The reference FDK implementation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+landav-bound = { workspace = true }
+landav-fdk = { workspace = true }
+landav-its = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

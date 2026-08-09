@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned to the version installed on the development machine so builds are
+# reproducible today. The project conventions target 1.97 — raise this once
+# that toolchain is actually installed and CI is updated to match.
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "default"

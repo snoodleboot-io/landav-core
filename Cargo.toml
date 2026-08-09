@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/landav-bound",
+    "crates/landav-calibrate",
+    "crates/landav-its",
+    "crates/landav-solvers",
+    "crates/landav-fdk",
+    "crates/landav-python",
+    "crates/landav-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/snoodleboot-io/landav-core"
+homepage = "https://github.com/snoodleboot-io/landav-core"
+authors = ["Landav contributors"]
+
+[workspace.dependencies]
+landav-bound = { path = "crates/landav-bound", version = "0.0.0" }
+landav-calibrate = { path = "crates/landav-calibrate", version = "0.0.0" }
+landav-fdk = { path = "crates/landav-fdk", version = "0.0.0" }
+landav-its = { path = "crates/landav-its", version = "0.0.0" }
+landav-solvers = { path = "crates/landav-solvers", version = "0.0.0" }
+landav-python = { path = "crates/landav-python", version = "0.0.0" }
+
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Library code must never panic — a panicking analyser is worse than one that
+# reports a partial bound, because F-015 blame output is the recovery path.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
