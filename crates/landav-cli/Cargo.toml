@@ -20,5 +20,11 @@ landav-solvers = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# Test-only. The acceptance tests build throwaway project trees (config files,
+# symlink loops, unreadable files) and must not leave them behind when a test
+# fails, so the scratch directory owns its own cleanup.
+tempfile = "3.27"
+
 [lints]
 workspace = true
