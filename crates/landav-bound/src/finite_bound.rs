@@ -22,12 +22,16 @@ impl FiniteBound {
     ///
     /// Returns the original bound unchanged if it mentions `omega`.
     pub fn try_new(bound: Bound) -> Result<Self, Bound> {
-        todo!()
+        if bound.is_finite() {
+            Ok(Self(bound))
+        } else {
+            Err(bound)
+        }
     }
 
     /// The underlying bound.
     #[must_use]
     pub fn get(&self) -> &Bound {
-        todo!()
+        &self.0
     }
 }

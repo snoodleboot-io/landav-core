@@ -42,10 +42,10 @@ impl TransKind {
 
 impl Canonical for TransKind {
     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
-        todo!()
+        self.canonical_tag().cmp(&other.canonical_tag())
     }
 
     fn write_canonical(&self, out: &mut Vec<u8>) {
-        todo!()
+        out.push(self.canonical_tag());
     }
 }

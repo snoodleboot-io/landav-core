@@ -15,18 +15,18 @@ impl Origin {
     /// Wraps a frontend-supplied location.
     #[must_use]
     pub fn new(location: impl Into<Symbol>) -> Self {
-        todo!()
+        Self(location.into())
     }
 
     /// The location, as the frontend spelled it.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        todo!()
+        self.0.as_str()
     }
 }
 
 impl core::fmt::Display for Origin {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        todo!()
+        f.write_str(self.as_str())
     }
 }

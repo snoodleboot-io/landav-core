@@ -49,7 +49,14 @@ impl VarSet {
     /// The set containing exactly `var`.
     #[must_use]
     pub fn singleton(var: &VarId) -> Self {
-        todo!()
+        // FNV-1a with the hardcoded constants above: identical at insert time
+        // and at query time, in every process and on every toolchain.
+        let mut hash = Self::FNV_OFFSET_BASIS;
+        for byte in var.symbol().as_str().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(Self::FNV_PRIME);
+        }
+        Self(1u64 << (hash % 64))
     }
 
     /// The union of two sets. Monotone: a union never clears a bit, which is
@@ -57,18 +64,18 @@ impl VarSet {
     /// given a stable hash.
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
-        todo!()
+        Self(self.0 | other.0)
     }
 
     /// `false` guarantees `var` does **not** occur. `true` means it may.
     #[must_use]
     pub fn may_contain(self, var: &VarId) -> bool {
-        todo!()
+        self.0 & Self::singleton(var).0 != 0
     }
 
     /// `true` iff no variable can occur.
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        todo!()
+        self.0 == 0
     }
 }

@@ -57,23 +57,39 @@ impl<T> Lifted<T> {
     /// `true` iff this is [`Lifted::Bottom`].
     #[must_use]
     pub const fn is_bottom(&self) -> bool {
-        todo!()
+        matches!(self, Self::Bottom)
     }
 
     /// The element, if reachable.
     #[must_use]
     pub const fn as_elem(&self) -> Option<&T> {
-        todo!()
+        match self {
+            Self::Bottom => None,
+            Self::Elem(value) => Some(value),
+        }
     }
 }
 
 impl<T: Canonical> Canonical for Lifted<T> {
     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
-        todo!()
+        use core::cmp::Ordering;
+
+        match (self, other) {
+            (Self::Bottom, Self::Bottom) => Ordering::Equal,
+            (Self::Bottom, Self::Elem(_)) => Ordering::Less,
+            (Self::Elem(_), Self::Bottom) => Ordering::Greater,
+            (Self::Elem(left), Self::Elem(right)) => left.canonical_cmp(right),
+        }
     }
 
     fn write_canonical(&self, out: &mut Vec<u8>) {
-        todo!()
+        match self {
+            Self::Bottom => out.push(0),
+            Self::Elem(value) => {
+                out.push(1);
+                value.write_canonical(out);
+            }
+        }
     }
 }
 
