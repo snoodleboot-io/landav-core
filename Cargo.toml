@@ -53,6 +53,13 @@ unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
 
+# A silent `as` truncation is a soundness bug here, not a style question:
+# `4294967296u64 as u32` is `0`, which made `pow(2, 2^32)` report a bound of 1.
+# There is no overflow left to saturate, so the monotonicity argument does not
+# cover it. Denied rather than warned.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
