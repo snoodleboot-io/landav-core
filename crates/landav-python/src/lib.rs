@@ -36,25 +36,65 @@
 //!
 //! [`F-005`]: https://linear.app/snoodleboot/issue/LAN-4
 
-#![doc(html_root_url = "https://docs.rs/landav-python")]
+//! # The `LAN-65` contract
+//!
+//! The types below and [`analysis::analyze_source`] are the surface the
+//! `LAN-65` fixture corpus is written against. They were declared by the test
+//! author before any rule existed, which is the point: per `CONTRIBUTING.md`,
+//! the acceptance criteria are encoded by someone other than the implementer
+//! and are not edited to make an implementation pass.
+//!
+//! [`registry::registry`] is empty and `analyze_source` returns nothing. Every
+//! positive fixture therefore fails, and that red state is the deliverable of
+//! the test lane.
 
-// TODO(LAN-4): Quadratic anti-pattern rules over the parsed frontend.
-//
+#![doc(html_root_url = "https://docs.rs/landav-python")]
+#![forbid(unsafe_code)]
+
 // TODO(LAN-25): Implement the six FDK traits once F-043 publishes them at R3.
 // Until then this crate is written against the shape in `landav_fdk`, so that
 // the eventual extraction is a move rather than a redesign.
 
-/// Placeholder so the workspace builds before `LAN-4` lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Unimplemented;
+pub mod analysis;
+pub mod finding;
+pub mod location;
+pub mod python_error;
+pub mod registry;
+pub mod rule;
+pub mod rule_code;
+
+pub use crate::{
+    analysis::analyze_source,
+    finding::Finding,
+    location::Location,
+    python_error::PythonError,
+    registry::{registry, rule, rule_for_code},
+    rule::Rule,
+    rule_code::RuleCode,
+};
+
+/// The lowest rule count `F-005` may ship with.
+///
+/// Acceptance criterion 1 of `LAN-65`. It lives here rather than only inside a
+/// test so that the number is a published fact about the crate: a build that
+/// silently dropped to seven rules is a build whose release notes are wrong,
+/// not merely a build with a failing test.
+pub const MINIMUM_RULE_COUNT: usize = 8;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn workspace_builds() {
-        assert_eq!(Unimplemented, Unimplemented);
+    fn registry_is_sorted_by_code() {
+        let codes: Vec<&str> = registry().iter().map(|rule| rule.code().as_str()).collect();
+        let mut sorted = codes.clone();
+        sorted.sort_unstable();
+        assert_eq!(codes, sorted, "registry() must be in ascending code order");
+    }
+
+    #[test]
+    fn rule_for_code_rejects_an_unknown_code() {
+        assert!(rule_for_code("LAV999").is_none());
     }
 }
