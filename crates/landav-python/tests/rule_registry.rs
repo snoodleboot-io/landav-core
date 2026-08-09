@@ -53,6 +53,44 @@ fn codes_are_well_formed_and_distinct() {
     );
 }
 
+/// A retired code is never reassigned to a different rule.
+///
+/// `LAV010` was issued, shipped in this corpus, and withdrawn — see
+/// `tests/deferred/LAV010_exception_as_control_flow_in_loop/README.md` for why
+/// no syntactic narrowing can save it. The number stays burned.
+///
+/// The reason is the scheme's own premise: a suppression comment in somebody's
+/// repository names a code. If `LAV010` were recycled for an unrelated rule,
+/// every existing `LAV010` suppression would silently begin suppressing
+/// something its author never saw. Reviving the *same* rule under the same
+/// code is permitted, which is why the assertion is on the rule's name rather
+/// than on mere absence — though if it does return it belongs in the `LAV2xx`
+/// block, because what it needs is a derived execution frequency and not a
+/// pattern match.
+#[test]
+fn retired_codes_are_not_reused() {
+    const RETIRED: [(&str, &str); 1] = [("LAV010", "exception-as-control-flow-in-loop")];
+
+    let mut problems = Vec::new();
+    for (code, original_name) in RETIRED {
+        if let Some(rule) = rule_for_code(code)
+            && rule.name() != original_name
+        {
+            problems.push(format!(
+                "`{code}` is retired but is registered as `{}`; it was `{original_name}`. A code \
+                 names one rule forever, because a suppression comment names a code.",
+                rule.name()
+            ));
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "a retired code was reused:\n  {}",
+        problems.join("\n  ")
+    );
+}
+
 #[test]
 fn names_are_kebab_case_and_distinct() {
     let mut problems = Vec::new();

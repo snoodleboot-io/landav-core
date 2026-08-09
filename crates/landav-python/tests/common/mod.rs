@@ -158,6 +158,19 @@ pub fn fixtures_root() -> PathBuf {
         .join("fixtures")
 }
 
+/// The root of the tree that is deliberately **not** walked.
+///
+/// Holds a withdrawn rule's fixtures and the recorded known gaps. Nothing here
+/// is analysed or asserted; see `tests/deferred/README.md`. It is a sibling of
+/// [`fixtures_root`] rather than a subdirectory of it precisely so that no
+/// filter is required to keep it out of the corpus — the corpus walk simply
+/// starts somewhere else.
+pub fn deferred_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("deferred")
+}
+
 /// Loads the whole corpus, in ascending rule-code order.
 pub fn load_corpus() -> Vec<RuleFixtures> {
     let root = fixtures_root();

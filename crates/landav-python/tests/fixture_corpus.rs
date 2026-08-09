@@ -281,6 +281,58 @@ fn findings_are_ordered_and_reproducible() {
     );
 }
 
+/// `tests/deferred/` holds a withdrawn rule and the recorded known gaps, and
+/// the harness must genuinely not walk it.
+///
+/// Without this, "deferred" degrades into "quietly deleted": the tree would
+/// still be there, nothing would notice if it were emptied, and nothing would
+/// notice if a directory were moved back into `tests/fixtures/` by a merge and
+/// started asserting again. Both directions are checked.
+#[test]
+fn deferred_tree_is_not_walked() {
+    let deferred = common::deferred_root();
+    assert!(
+        deferred.is_dir(),
+        "{} is missing; the withdrawn LAV010 fixtures and the known-gap record live there",
+        deferred.display()
+    );
+
+    let deferred_files = common::collect_python_files(&deferred);
+    assert!(
+        !deferred_files.is_empty(),
+        "{} has no Python files left; a deferred tree that has been emptied is a deleted one, \
+         and the reason it was kept is in its README",
+        deferred.display()
+    );
+
+    let walked = common::collect_python_files(&common::fixtures_root());
+    let leaked: Vec<String> = deferred_files
+        .iter()
+        .filter(|path| walked.contains(path))
+        .map(|path| path.display().to_string())
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "deferred files reached the corpus walk:\n  {}",
+        leaked.join("\n  ")
+    );
+
+    let revived: Vec<String> = load_corpus()
+        .into_iter()
+        .filter(|rule| RETIRED_CODES.contains(&rule.code.as_str()))
+        .map(|rule| rule.directory_name)
+        .collect();
+    assert!(
+        revived.is_empty(),
+        "a retired rule has fixtures back in tests/fixtures/: {}",
+        revived.join(", ")
+    );
+}
+
+/// Codes that were issued and then withdrawn. See
+/// `tests/deferred/LAV010_exception_as_control_flow_in_loop/README.md`.
+pub const RETIRED_CODES: [&str; 1] = ["LAV010"];
+
 /// Every code a positive fixture has an opinion about: the rule the directory
 /// is for, plus any rule an explicit marker names.
 ///
