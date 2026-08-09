@@ -218,7 +218,9 @@ impl Bound {
     ///
     /// # Errors
     ///
-    /// [`BoundError::DepthExceeded`] or [`BoundError::NodeBudgetExceeded`].
+    /// [`BoundError::DepthExceeded`], [`BoundError::NodeBudgetExceeded`], or
+    /// [`BoundError::ArityExceeded`] if flattening would produce more
+    /// operands than [`crate::MAX_NODES`] allows nodes.
     pub fn sum_checked(terms: impl IntoIterator<Item = Self>) -> Result<Self, BoundError> {
         Self::assemble(NaryOp::Sum, terms.into_iter().collect())
     }
@@ -227,7 +229,9 @@ impl Bound {
     ///
     /// # Errors
     ///
-    /// [`BoundError::DepthExceeded`] or [`BoundError::NodeBudgetExceeded`].
+    /// [`BoundError::DepthExceeded`], [`BoundError::NodeBudgetExceeded`], or
+    /// [`BoundError::ArityExceeded`] if flattening would produce more
+    /// operands than [`crate::MAX_NODES`] allows nodes.
     pub fn max_of_checked(terms: impl IntoIterator<Item = Self>) -> Result<Self, BoundError> {
         Self::assemble(NaryOp::Max, terms.into_iter().collect())
     }
@@ -236,7 +240,9 @@ impl Bound {
     ///
     /// # Errors
     ///
-    /// [`BoundError::DepthExceeded`] or [`BoundError::NodeBudgetExceeded`].
+    /// [`BoundError::DepthExceeded`], [`BoundError::NodeBudgetExceeded`], or
+    /// [`BoundError::ArityExceeded`] if flattening would produce more
+    /// operands than [`crate::MAX_NODES`] allows nodes.
     pub fn prod_checked(terms: impl IntoIterator<Item = Self>) -> Result<Self, BoundError> {
         Self::assemble(NaryOp::Prod, terms.into_iter().collect())
     }
@@ -576,10 +582,29 @@ impl Bound {
     /// re-canonicalisation preserves the one-program-one-key property the
     /// F-008 cache rests on.
     ///
+    /// # This is stricter than the constructors, deliberately
+    ///
+    /// A document is measured against the **tree** it would materialise, not
+    /// against the node table that carries it: fifty in-budget wire nodes can
+    /// describe a term of `2^24` tree nodes, and while every observer on
+    /// [`Bound`] is memoised over the shared nodes, [`core::fmt::Display`]
+    /// still renders the tree.
+    ///
+    /// The smart constructors carry no such limit, so a term built in process
+    /// can be one this method would refuse on the way back in. That asymmetry
+    /// is intended - ingest is the untrusted direction and in-process
+    /// construction is the caller doing it to themselves - but it means
+    /// [`Bound::to_wire`] can emit a document that this method rejects, and a
+    /// caller relying on a total round trip should check
+    /// [`Bound::wire_node_count`] and the term's own size first. If
+    /// `Display` is ever made DAG-aware, this guard becomes unnecessary and
+    /// the round trip can be made total again.
+    ///
     /// # Errors
     ///
     /// [`BoundError::WireVersionUnsupported`], [`BoundError::WireMalformed`],
     /// [`BoundError::DepthExceeded`], [`BoundError::NodeBudgetExceeded`],
+    /// [`BoundError::TreeSizeExceeded`], [`BoundError::ArityExceeded`],
     /// [`BoundError::BaseTooSmall`].
     pub fn try_from_wire(wire: &BoundWire) -> Result<Self, BoundError> {
         if wire.version != crate::WIRE_VERSION {
@@ -851,36 +876,41 @@ impl Bound {
                 }
             }
             NaryOp::Prod => {
-                // `omega` absorbs unconditionally, including `0 * omega`.
+                // `omega` absorbs unconditionally, including `0 * omega`, so
+                // it is tested first and it wins even against a zero.
                 if literals.iter().any(|value| !value.is_finite()) {
                     return Ok(Self::omega());
                 }
-                let has_zero = literals.contains(&Nat::ZERO);
-                // Overflow saturates to `omega`, and it does so even against a
-                // zero: reporting a magnitude the carrier could not hold is
-                // the one direction that is not sound.
-                let product = product_of_non_zero(&literals);
-                if product == Nat::OMEGA {
-                    return Ok(Self::omega());
-                }
-                if operands.is_empty() {
-                    return Ok(if has_zero {
-                        Self::zero()
-                    } else {
-                        Self::magnitude(product)
-                    });
-                }
-                // `Prod[Const(0), Var(x)]` is **not** folded to `0`: variables
-                // range over `N u {omega}` and the product is `omega` at
-                // `x = omega`. The zero and the remaining literal product stay
-                // *separate* operands, so an overflow that only the symbolic
-                // operands can trigger is still seen at evaluation time
-                // instead of being pre-empted by the zero.
-                if has_zero {
+                if literals.contains(&Nat::ZERO) {
+                    // A zero literal decides the literal part **exactly**.
+                    // The product of the literals really is zero; only
+                    // saturating the other literals *first* could have
+                    // invented an `omega`, and inventing one here published
+                    // `Err(UnblamedOmega)` for a program proved to cost
+                    // nothing. The remaining literals carry no information
+                    // once a zero is among them, so they are dropped - which
+                    // is also what step 3 of this constructor's contract
+                    // describes.
+                    if operands.is_empty() {
+                        return Ok(Self::zero());
+                    }
+                    // `Prod[Const(0), Var(x)]` is **not** folded to `0`:
+                    // variables range over `N u {omega}` and the product is
+                    // `omega` at `x = omega`. That is why the zero survives as
+                    // an operand rather than collapsing the node.
                     operands.push(Self::zero());
-                }
-                if product != Nat::ONE {
-                    operands.push(Self::magnitude(product));
+                } else {
+                    // Every literal is at least one here, so the running
+                    // product only grows and whether it leaves the carrier
+                    // does not depend on the order. Overflow saturates to
+                    // `omega`, never truncating.
+                    let folded = fold_product(&literals);
+                    if folded == Nat::OMEGA {
+                        return Ok(Self::omega());
+                    }
+                    if folded != Nat::ONE {
+                        operands.push(Self::magnitude(folded));
+                    }
                 }
             }
         }
@@ -953,40 +983,36 @@ impl Bound {
     }
 }
 
-/// The product of the factors that are not zero.
-///
-/// Order independent: every factor here is at least one, so the running
-/// product only ever grows, and whether it overflows - saturating to `omega`,
-/// never truncating to `u64::MAX` - does not depend on the order the factors
-/// arrive in.
-fn product_of_non_zero(factors: &[Nat]) -> Nat {
-    factors
-        .iter()
-        .filter(|value| **value != Nat::ZERO)
-        .fold(Nat::ONE, |accumulator, value| accumulator.times(*value))
-}
-
 /// The product of a multiset of magnitudes, computed order independently.
 ///
-/// `omega` absorbs unconditionally, including against zero, so it is tested
-/// first. Overflow of the remaining factors then saturates to `omega` **even
-/// when a zero is present**: `Nat::times` is not associative on a saturating
-/// carrier, so a product whose factors exceed `u64::MAX` may be either the
-/// exact zero or `omega` depending on the order the factors are folded in, and
-/// only `omega` over-approximates both. Too high is looseness; too low is a
-/// bound the code can exceed.
+/// The three cases, in the order they are tested, are exactly the ideal
+/// product saturated once at the end:
+///
+/// 1. `omega` absorbs **unconditionally**, including against zero - the
+///    frozen `Nat::times` rule - so it is tested first;
+/// 2. a zero factor then makes the product exactly zero. It may not be
+///    pre-empted by an overflow of the *other* factors: that product is a
+///    magnitude the carrier cannot hold, but multiplying it by zero still
+///    gives zero, and reporting `omega` there is looseness with a hard
+///    consequence - `Verdict::classify` refuses an unblamed `omega`, so a
+///    cost proved to be nothing became a tool error;
+/// 3. everything left is at least one, so the running product only grows and
+///    whether it leaves the carrier does not depend on the order the factors
+///    arrive in. Overflow saturates to `omega`, never truncating to
+///    `u64::MAX`.
+///
+/// Order independent in all three cases, which is what `Prod`'s canonical
+/// operand order requires of it.
 fn fold_product(factors: &[Nat]) -> Nat {
     if factors.iter().any(|value| !value.is_finite()) {
-        return Nat::OMEGA;
-    }
-    let product = product_of_non_zero(factors);
-    if product == Nat::OMEGA {
         return Nat::OMEGA;
     }
     if factors.contains(&Nat::ZERO) {
         return Nat::ZERO;
     }
-    product
+    factors
+        .iter()
+        .fold(Nat::ONE, |accumulator, value| accumulator.times(*value))
 }
 
 /// The depth of an n-ary node, refused rather than truncated at the limit.

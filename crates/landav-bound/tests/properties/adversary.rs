@@ -237,17 +237,21 @@ fn a_hand_built_wire_document_cannot_smuggle_in_an_unobservable_term() {
 // TIGHTNESS - the saturating-with-a-zero regime
 // ---------------------------------------------------------------------------
 //
-// THESE THREE ARE CHARACTERISATION TESTS AND THE FINDINGS ARE STILL OPEN.
+// THESE THREE WERE CHARACTERISATION TESTS. THE FIX LANDED; THEY ARE INVERTED.
+//
+// They used to be, and are still findable under, these names:
 //
 //   a_closed_product_denoting_zero_becomes_an_unblamed_omega
+//     -> a_closed_product_denoting_zero_is_proved_zero
 //   prod_keeps_a_redundant_literal_beside_the_zero_and_pays_for_it
+//     -> prod_keeps_only_the_zero_beside_a_symbolic_operand
 //   closed_terms_denoting_zero_do_not_all_fold_to_const_zero
+//     -> a_saturating_subgroup_still_defeats_an_enclosing_zero
 //
-// Each pins the *current* behaviour and each says so in its assertion
-// messages ("the tightness gap is closed", "the deviation has been fixed").
-// They are green today because the gaps are real and unfixed. **Whoever lands
-// the tightness fix must invert all three in the same commit** - they are not
-// contracts, and a red suite there means the fix worked.
+// Each pinned the *unfixed* behaviour and said so in its assertion messages
+// ("the tightness gap is closed", "the deviation has been fixed"). Each now
+// asserts the corrected behaviour, and each doc comment names what it used to
+// pin and why it changed. The third is only *narrowed*, not closed: see it.
 //
 // Nothing in `denotation.rs` blocks the fix any more. It used to: an
 // overflow-dominant floor under `Bound::prod`, a flattening-direction claim
@@ -263,122 +267,149 @@ fn at_x(value: Nat, default: Nat) -> TotalValuation {
     TotalValuation::with_default(known, default)
 }
 
-/// **TIGHTNESS, with a hard consequence.** A *closed* term that denotes
-/// exactly `0` folds to `Const(omega)`, and [`Verdict::classify`] then refuses
-/// to publish it at all.
+/// **TIGHTNESS 1, fixed. Inverted from
+/// `a_closed_product_denoting_zero_becomes_an_unblamed_omega`.**
 ///
-/// `Bound::prod([0, 2^40, 2^40])` has no symbolic operand and no `omega`
-/// anywhere. Its value is `0` under any reading. `assemble` nonetheless
-/// multiplies the *non-zero* literals first, overflows, and returns
-/// `Bound::omega()` before it ever looks at `has_zero`.
+/// It used to pin the defect: `Bound::prod([0, 2^40, 2^40])` has no symbolic
+/// operand and no `omega` anywhere and denotes `0` under any reading, but
+/// `assemble` multiplied the *non-zero* literals first, overflowed, and
+/// returned `Bound::omega()` before it ever looked at `has_zero`. That was
+/// not merely loose: [`Verdict::classify`] refuses an unblamed `omega`, so a
+/// program proved to cost nothing produced `Err(BoundError::UnblamedOmega)`,
+/// a tool error with a non-clean exit.
 ///
-/// The result is not merely loose. A program proved to cost nothing produces
-/// `Err(BoundError::UnblamedOmega)` - a tool error with a non-clean exit -
-/// where the correct verdict is `Proved(0)`.
-///
-/// The order in `assemble` that causes it is deliberate for the *symbolic*
-/// case (a `Var` may be `omega`, so a zero cannot pre-empt the overflow). It
-/// is not needed here: with no symbolic operands left, `has_zero` decides the
-/// value outright, which is what the very next branch already does when the
-/// product happens to fit.
+/// `assemble` now consults the zero first. The overflow-first ordering is
+/// kept for the *symbolic* case, where a `Var` may be `omega` and a zero
+/// therefore may not pre-empt it - which is why
+/// `omega_totality::prod_does_not_fold_zero_times_a_symbolic_operand` still
+/// holds.
 #[test]
-fn a_closed_product_denoting_zero_becomes_an_unblamed_omega() {
+fn a_closed_product_denoting_zero_is_proved_zero() {
     let big = 1u64 << 40;
     let closed = Bound::prod([Bound::zero(), Bound::constant(big), Bound::constant(big)]);
 
     assert_eq!(
         closed,
-        Bound::omega(),
-        "prod([0, 2^40, 2^40]) is no longer omega - the tightness gap is closed"
+        Bound::zero(),
+        "prod([0, 2^40, 2^40]) is closed and denotes 0"
     );
-    assert!(!closed.is_finite());
-    assert_eq!(
-        closed.eval(&at_x(Nat::ZERO, Nat::ZERO)),
-        Nat::OMEGA,
-        "true value is 0"
-    );
+    assert!(closed.is_finite());
+    assert_eq!(closed.eval(&at_x(Nat::ZERO, Nat::ZERO)), Nat::ZERO);
 
-    // And the consequence: a proved-zero cost cannot be published.
-    let verdict = Verdict::classify(Lifted::Elem(closed), Origin::new("f"), None);
+    // And the consequence: a proved-zero cost is publishable again.
+    let verdict = Verdict::classify(Lifted::Elem(closed.clone()), Origin::new("f"), None);
     assert!(
-        verdict.is_err(),
-        "prod([0, 2^40, 2^40]) now classifies: {verdict:?}"
+        matches!(&verdict, Ok(Verdict::Proved(finite)) if finite.get() == &Bound::zero()),
+        "a cost proved to be nothing must classify as Proved(0), got {verdict:?}"
     );
 
-    // The same multiset, grouped so the zero is folded first, is exact.
+    // The same multiset, grouped so the zero is folded first, agrees - the
+    // grouping no longer decides once every factor is a literal.
     let regrouped = Bound::prod([
         Bound::prod([Bound::zero(), Bound::constant(big)]),
         Bound::constant(big),
     ]);
     assert_eq!(regrouped, Bound::zero());
+    assert_eq!(regrouped, closed);
 }
 
-/// **TIGHTNESS + contract deviation.** `Bound::prod`'s doc comment, step 3,
-/// says the finite literals are constant-folded; step 5 says a folded `0` is
-/// collapsed only when there are no other operands. The implementation does
-/// something the doc does not describe: it pushes the zero **and** the folded
-/// product of the other literals as *two separate operands*.
+/// **TIGHTNESS 2, fixed. Inverted from
+/// `prod_keeps_a_redundant_literal_beside_the_zero_and_pays_for_it`.**
 ///
-/// The extra literal is pure looseness. `Prod[0, k, x]` is `omega` whenever
-/// `k * x` leaves `u64`; `Prod[0, x]` - which has the same denotation, because
-/// a zero factor annihilates every finite `x` and `omega` still absorbs at
-/// `x = omega` - is exact. Dropping `k` cannot cost soundness: it can only
-/// remove a factor from the overflow test, and the zero already decides every
-/// case the overflow test would have caught.
+/// It used to pin a deviation from `Bound::prod`'s own doc comment: step 3
+/// says the finite literals are constant-folded and step 5 says a folded `0`
+/// collapses only when there are no other operands, but the implementation
+/// pushed the zero **and** the folded product of the other literals as *two
+/// separate operands*. `Prod[0, k, x]` was then `omega` whenever `k * x` left
+/// `u64`, where `Prod[0, x]` - the same denotation - was exact.
+///
+/// The extra literal was pure looseness, and dropping it cannot cost
+/// soundness: it only removes a factor from the overflow test, and the zero
+/// already decides every case that test would have caught. `omega` still
+/// absorbs at `x = omega`, which the last two assertions pin.
 #[test]
-fn prod_keeps_a_redundant_literal_beside_the_zero_and_pays_for_it() {
-    let loose = Bound::prod([Bound::zero(), Bound::constant(3), Bound::var("x")]);
-    let tight = Bound::prod([Bound::zero(), Bound::var("x")]);
+fn prod_keeps_only_the_zero_beside_a_symbolic_operand() {
+    let folded = Bound::prod([Bound::zero(), Bound::constant(3), Bound::var("x")]);
+    let direct = Bound::prod([Bound::zero(), Bound::var("x")]);
 
     assert_eq!(
-        arity_of(&loose),
-        3,
-        "the zero and the 3 are separate operands"
+        arity_of(&folded),
+        2,
+        "only the zero survives beside the symbolic operand"
     );
-    assert_eq!(arity_of(&tight), 2);
+    assert_eq!(arity_of(&direct), 2);
+    assert_eq!(folded, direct, "the redundant literal is gone");
 
     let at = at_x(Nat::Fin(u64::MAX), Nat::OMEGA);
-    assert_eq!(
-        loose.eval(&at),
-        Nat::OMEGA,
-        "0 * 3 * u64::MAX is 0, not omega - the deviation has been fixed"
-    );
-    assert_eq!(tight.eval(&at), Nat::ZERO, "0 * u64::MAX is 0");
+    assert_eq!(folded.eval(&at), Nat::ZERO, "0 * 3 * u64::MAX is 0");
+    assert_eq!(direct.eval(&at), Nat::ZERO, "0 * u64::MAX is 0");
 
-    // Both are still sound at the top of the lattice.
+    // And `omega` still absorbs unconditionally at the top of the lattice,
+    // so the zero has not been allowed to pre-empt an unbounded operand.
     let top = at_x(Nat::OMEGA, Nat::OMEGA);
-    assert_eq!(loose.eval(&top), Nat::OMEGA);
-    assert_eq!(tight.eval(&top), Nat::OMEGA);
+    assert_eq!(folded.eval(&top), Nat::OMEGA);
+    assert_eq!(direct.eval(&top), Nat::OMEGA);
 }
 
-/// **TIGHTNESS, and it falsifies a frozen claim made in `b.rs`.**
+/// **TIGHTNESS 3: narrowed by the T1 fix, and still open. Inverted from
+/// `closed_terms_denoting_zero_do_not_all_fold_to_const_zero`.**
 ///
 /// [`landav_bound::B::star`]'s doc comment justifies its syntactic zero test
 /// like this: *"it is well defined only because the smart constructors
 /// constant-fold: any closed term denoting zero folds to `Const(0)`, so `star`
 /// is a function of the denotation rather than of the spelling."*
 ///
-/// That premise is false, and this is the witness. Both terms below are
-/// closed, `omega`-free as recipes, and denote `0`; one folds to `Const(0)`
-/// and the other to `Const(omega)`. Once `B::star` is implemented against that
-/// test it will return `one` for the first spelling and `Elem(omega)` for the
-/// second - two different answers for one denotation, which is precisely the
-/// determinism hazard the comment claims is closed.
+/// The old witness for that premise being false was
+/// `prod([0, 2^40, 2^40])` folding to `Const(omega)` while
+/// `prod([0, 3])` folded to `Const(0)`. T1 closed that one: a product whose
+/// factors are **all literals** now folds to `Const(0)` whenever one of them
+/// is zero, however the recipe grouped them.
+///
+/// What T1 did not close, and could not: a subgroup that saturates *on its
+/// own* becomes `Const(omega)` as a term, and `omega` then absorbs
+/// unconditionally - the frozen `Nat::times` rule - so an enclosing zero can
+/// no longer rescue it. `prod([prod([2^40, 2^40]), 0])` and
+/// `prod([0, 2^40, 2^40])` are both closed and both denote `0`, and they
+/// still fold to different constants.
+///
+/// So the premise remains false and `B::star` would still return `one` for
+/// one spelling and `Elem(omega)` for the other. `b.rs`'s comment is left
+/// exactly as it is on purpose: LAN-59 owns `B::star`, and the finding is
+/// carried to wave 2 rather than papered over here.
 #[test]
-fn closed_terms_denoting_zero_do_not_all_fold_to_const_zero() {
-    let folds_to_zero = Bound::prod([Bound::zero(), Bound::constant(3)]);
-    let folds_to_omega = Bound::prod([
-        Bound::zero(),
-        Bound::constant(1 << 40),
-        Bound::constant(1 << 40),
-    ]);
+fn a_saturating_subgroup_still_defeats_an_enclosing_zero() {
+    let big = 1u64 << 40;
 
-    assert_eq!(folds_to_zero.kind(), &BoundKind::Const(Nat::ZERO));
+    // Closed by T1: every grouping whose factors are all literals is exact.
+    let flat = Bound::prod([Bound::zero(), Bound::constant(big), Bound::constant(big)]);
+    let zero_first = Bound::prod([
+        Bound::prod([Bound::zero(), Bound::constant(big)]),
+        Bound::constant(big),
+    ]);
+    assert_eq!(flat.kind(), &BoundKind::Const(Nat::ZERO));
+    assert_eq!(zero_first.kind(), &BoundKind::Const(Nat::ZERO));
     assert_eq!(
-        folds_to_omega.kind(),
-        &BoundKind::Const(Nat::OMEGA),
-        "star's well-definedness premise now holds"
+        Bound::prod([Bound::zero(), Bound::constant(3)]).kind(),
+        &BoundKind::Const(Nat::ZERO)
     );
+
+    // Still open: the subgroup saturates before the zero is ever in scope,
+    // and `omega` absorbs unconditionally from there on.
+    let saturating_subgroup = Bound::prod([Bound::constant(big), Bound::constant(big)]);
+    assert_eq!(
+        saturating_subgroup.kind(),
+        &BoundKind::Const(Nat::OMEGA),
+        "2^40 * 2^40 leaves u64, so the subgroup is omega as a term"
+    );
+    let poisoned = Bound::prod([Bound::zero(), saturating_subgroup]);
+    assert_eq!(
+        poisoned.kind(),
+        &BoundKind::Const(Nat::OMEGA),
+        "star's well-definedness premise now holds for every closed term"
+    );
+
+    // Two closed spellings of one denotation, still folding to two constants.
+    assert_ne!(flat, poisoned);
 }
 
 // ---------------------------------------------------------------------------
