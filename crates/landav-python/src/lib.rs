@@ -45,10 +45,27 @@
 //! and are not edited to make an implementation pass.
 //!
 //! The implementation lane fills them: [`registry::registry`] declares the
-//! eleven `LAV0xx` rules and [`analysis::analyze_source`] parses the source and
-//! runs them. The contract itself is unchanged — no fixture and no assertion
-//! was edited to make a rule pass, which is the only reading of the corpus that
+//! `LAV0xx` rules and [`analysis::analyze_source`] parses the source and runs
+//! them. The contract itself is unchanged — no fixture and no assertion was
+//! edited to make a rule pass, which is the only reading of the corpus that
 //! means anything.
+//!
+//! # Ten rules, not eleven
+//!
+//! `LAV010` (`try`/`except` in a loop) was specified, implemented, and then
+//! **withdrawn**. Its premise is that a never-slower total alternative to the
+//! guarded lookup always exists, and that premise is false: `sqlite3.Row` has
+//! no `.get`, `Element.get` reads an XML attribute rather than a child, and on
+//! a hot dispatch table `.get` costs an attribute lookup and a Python-level
+//! call where `[]` is one opcode. Which of those applies depends on the
+//! receiver's type, which this crate cannot know. The corpus contains a case
+//! that is *structurally identical* to a true positive and is nonetheless
+//! correct code, so no narrowing separates them.
+//!
+//! `MINIMUM_RULE_COUNT` is eight and the specification carried eleven
+//! precisely so that a rule which cannot be made precise can be withdrawn
+//! rather than shipped noisy. Its fixture directory is left in place: deleting
+//! it needs the test author's sign-off, not the implementer's.
 
 #![doc(html_root_url = "https://docs.rs/landav-python")]
 #![forbid(unsafe_code)]

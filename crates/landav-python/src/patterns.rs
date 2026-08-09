@@ -1,19 +1,23 @@
-//! The eleven `F-005` pattern rules.
+//! The `F-005` pattern rules.
 //!
 //! # The shape every rule shares
 //!
-//! Each one asks the same three questions in the same order:
+//! Each one asks the same four questions in the same order:
 //!
 //! 1. *Does the enclosing loop run an unbounded number of times?* A fixed
 //!    three-element loop makes any per-iteration cost a constant.
-//! 2. *Is the per-iteration cost linear in something that grows?* That is the
-//!    pattern itself.
-//! 3. *Is there a cheaper spelling with the same meaning?* If rewriting changes
+//! 2. *Is the object the loop's subject, or something the loop just made?*
+//!    `cells = row.split(",")` is a fresh list per row; scanning it costs its
+//!    own length, and summed over the loop that is the size of the input.
+//! 3. *Is the per-iteration cost linear in something that grows?* That is the
+//!    pattern itself, and "grows" is stricter than "is not constant" — a window
+//!    that *moves* across a buffer copies each byte once in total.
+//! 4. *Is there a cheaper spelling with the same meaning?* If rewriting changes
 //!    the result rather than the cost, the rule must stay silent — the finding
 //!    would be advice to introduce a bug.
 //!
-//! Question 3 is where the false-positive budget is spent, and it is the reason
-//! several rules below look narrower than their names suggest.
+//! Questions 2 and 4 are where the false-positive budget is spent, and they are
+//! the reason several rules below look narrower than their names suggest.
 
 use std::collections::BTreeSet;
 
@@ -21,8 +25,9 @@ use rustpython_parser::ast::{CmpOp, Expr, ExprContext, Operator, Ranged, Stmt};
 
 use crate::{
     context::{
-        Bindings, LoopInfo, StmtCtx, body_reads_a_subscript, contains, depends_on, is_call_of,
-        is_scanned_list, is_str_expr, slice_of,
+        Bindings, LoopInfo, Program, RESOLUTION_DEPTH, StmtCtx, contains, depends_on,
+        escapes_the_iteration, integer_constant, is_call_of, is_one_shot_iterator, is_scanned_list,
+        is_short_constant_sequence, is_str_expr, slice_of,
     },
     finding::Finding,
     location::Location,
@@ -32,9 +37,6 @@ use crate::{
         stmt_own_exprs, stmt_tree,
     },
 };
-
-/// How far `is_str_expr` and friends chase a binding. See `context`.
-const TYPE_DEPTH: u32 = 4;
 
 /// Names whose call builds a whole collection eagerly, for `LAV007`.
 const COLLECTION_BUILDERS: [&str; 5] = ["set", "dict", "list", "frozenset", "tuple"];
@@ -66,25 +68,19 @@ const REGEX_SCANS: [&str; 8] = [
     "split",
 ];
 
-/// The exceptions `LAV010` will act on.
-///
-/// Both have a total, non-raising alternative that is never slower —
-/// `dict.get`, or a membership test. `OSError` deliberately does not: the
-/// "look before you leap" rewrite of `open` is a TOCTOU bug, so a handler is
-/// the only correct spelling and the rule has nothing to suggest.
-const RECOVERABLE_LOOKUP_ERRORS: [&str; 2] = ["KeyError", "IndexError"];
-
 /// Everything one file's rules are run against.
 pub(crate) struct Analysis<'a> {
     pub(crate) path: &'a std::path::Path,
     pub(crate) source: &'a str,
     pub(crate) index: LineIndex,
-    pub(crate) bindings: Bindings<'a>,
-    pub(crate) loops: Vec<LoopInfo<'a>>,
-    pub(crate) statements: Vec<StmtCtx<'a>>,
+    pub(crate) program: Program<'a>,
 }
 
 impl<'a> Analysis<'a> {
+    fn bindings(&self) -> &Bindings<'a> {
+        &self.program.bindings
+    }
+
     /// A finding pointing at a byte offset in this file.
     fn at<T: Ranged>(&self, code: RuleCode, node: &T, explanation: &str) -> Finding {
         let (line, column) = self.index.position(node.range().start().to_usize());
@@ -98,7 +94,7 @@ impl<'a> Analysis<'a> {
     /// The innermost enclosing loop, but only when its trip count is unbounded.
     fn hot_loop(&self, ctx: &StmtCtx<'a>) -> Option<&LoopInfo<'a>> {
         let index = ctx.innermost()?;
-        let info = self.loops.get(index)?;
+        let info = self.program.loops.get(index)?;
         (!info.bounded).then_some(info)
     }
 
@@ -106,7 +102,7 @@ impl<'a> Analysis<'a> {
     fn enclosing(&self, ctx: &StmtCtx<'a>) -> Vec<&LoopInfo<'a>> {
         ctx.loops
             .iter()
-            .filter_map(|index| self.loops.get(*index))
+            .filter_map(|index| self.program.loops.get(*index))
             .collect()
     }
 
@@ -117,11 +113,31 @@ impl<'a> Analysis<'a> {
         own.into_iter().flat_map(expr_tree).collect()
     }
 
+    /// The values `name` is assigned outside `info`, in the same scope.
+    ///
+    /// Scope matters more than it looks: a module-wide search reports
+    /// `result += record.errors` as string concatenation because a *different
+    /// function* happens to have a string called `result`.
+    fn initialisers_outside(&self, info: &LoopInfo<'a>, scope: usize, name: &str) -> Vec<&'a Expr> {
+        self.program
+            .statements
+            .iter()
+            .filter(|ctx| ctx.scope == scope && !contains(info.stmt, ctx.stmt))
+            .filter_map(|ctx| match ctx.stmt {
+                Stmt::Assign(node) => match node.targets.as_slice() {
+                    [target] if name_of(target) == Some(name) => Some(node.value.as_ref()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Runs every rule and returns the findings in `(line, column, code)` order.
     pub(crate) fn run(&self) -> Vec<Finding> {
         let mut findings = Vec::new();
 
-        for ctx in &self.statements {
+        for ctx in &self.program.statements {
             lav001(self, ctx, &mut findings);
             lav002(self, ctx, &mut findings);
             lav003(self, ctx, &mut findings);
@@ -131,7 +147,6 @@ impl<'a> Analysis<'a> {
             lav007(self, ctx, &mut findings);
             lav008(self, ctx, &mut findings);
             lav009(self, ctx, &mut findings);
-            lav010(self, ctx, &mut findings);
             lav011(self, ctx, &mut findings);
         }
 
@@ -152,31 +167,58 @@ impl<'a> Analysis<'a> {
     }
 }
 
-/// `LAV001` — `list.index()` inside a loop over an unbounded sequence.
+/// `LAV001` — `list.index()` over a collection the loop did not just build.
 fn lav001(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
-    if analysis.hot_loop(ctx).is_none() {
+    let Some(info) = analysis.hot_loop(ctx) else {
         return;
-    }
+    };
     for expr in analysis.exprs_of(ctx.stmt) {
         let Expr::Call(call) = expr else { continue };
         let Expr::Attribute(func) = call.func.as_ref() else {
             continue;
         };
-        if func.attr.as_str() == "index" && !call.args.is_empty() {
-            out.push(analysis.at(
-                crate::registry::LAV001,
-                call,
-                "list.index() scans from the front on every iteration; build a position map once",
-            ));
+        if func.attr.as_str() != "index" || call.args.is_empty() {
+            continue;
         }
+        // `stripped.index("=")` on this line, or `cells.index(m)` on this row,
+        // scans an object the loop just produced. Summed over the loop that is
+        // one pass over the input, and there is no shared ordering to index.
+        if info.varies_with(func.value.as_ref()) {
+            continue;
+        }
+        // `str.index` walks one string, not one collection, and a string has no
+        // position map to build. Different complexity class, same spelling.
+        if is_str_expr(
+            func.value.as_ref(),
+            analysis.bindings(),
+            ctx.scope,
+            RESOLUTION_DEPTH,
+        ) {
+            continue;
+        }
+        // A short constant table is a bounded scan whatever encloses it.
+        if is_short_constant_sequence(
+            func.value.as_ref(),
+            analysis.bindings(),
+            ctx.scope,
+            RESOLUTION_DEPTH,
+        ) {
+            continue;
+        }
+
+        out.push(analysis.at(
+            crate::registry::LAV001,
+            call,
+            "list.index() scans from the front on every iteration; build a position map once",
+        ));
     }
 }
 
 /// `LAV002` — `in` against a list inside a loop.
 fn lav002(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
-    if analysis.hot_loop(ctx).is_none() {
+    let Some(info) = analysis.hot_loop(ctx) else {
         return;
-    }
+    };
     for expr in analysis.exprs_of(ctx.stmt) {
         let Expr::Compare(compare) = expr else {
             continue;
@@ -184,15 +226,17 @@ fn lav002(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
         let membership = compare
             .ops
             .iter()
-            .enumerate()
-            .find(|(_, op)| matches!(op, CmpOp::In | CmpOp::NotIn));
-        let Some((position, _)) = membership else {
+            .position(|op| matches!(op, CmpOp::In | CmpOp::NotIn));
+        let Some(position) = membership else {
             continue;
         };
         let Some(container) = compare.comparators.get(position) else {
             continue;
         };
-        if is_scanned_list(container, &analysis.bindings, TYPE_DEPTH) {
+        if info.varies_with(container) {
+            continue;
+        }
+        if is_scanned_list(container, analysis.bindings(), ctx.scope, RESOLUTION_DEPTH) {
             out.push(analysis.at(
                 crate::registry::LAV002,
                 compare,
@@ -222,7 +266,7 @@ fn lav003(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
     };
     let Some(name) = accumulator else { return };
 
-    if !is_string_accumulator(analysis, info, &name) {
+    if !is_string_accumulator(analysis, info, ctx.scope, &name) {
         return;
     }
 
@@ -244,16 +288,25 @@ fn leftmost_addend(expr: &Expr) -> Option<&str> {
     }
 }
 
-/// `true` when `name` is initialised to a `str` outside the loop and never
-/// reset inside it.
+/// `true` when `name` is initialised to a `str` outside the loop, in this same
+/// scope, and never reset inside it.
 ///
-/// The reset check is the whole rule: `line = ""` at the top of the body means
-/// the string is per-iteration and the total work is linear, which is the
-/// idiom `per_iteration_string_is_not_an_accumulator.py` is built from.
-fn is_string_accumulator(analysis: &Analysis<'_>, info: &LoopInfo<'_>, name: &str) -> bool {
+/// The reset check keeps a per-iteration string out: `line = ""` at the top of
+/// the body means the total work is linear. The scope check keeps *another
+/// function's* `result` out, which is the same rule applied to names instead of
+/// to values.
+fn is_string_accumulator(
+    analysis: &Analysis<'_>,
+    info: &LoopInfo<'_>,
+    scope: usize,
+    name: &str,
+) -> bool {
     let mut initialised_outside = false;
 
-    for ctx in &analysis.statements {
+    for ctx in &analysis.program.statements {
+        if ctx.scope != scope {
+            continue;
+        }
         let Stmt::Assign(node) = ctx.stmt else {
             continue;
         };
@@ -271,7 +324,14 @@ fn is_string_accumulator(analysis: &Analysis<'_>, info: &LoopInfo<'_>, name: &st
             if rebinds {
                 return false;
             }
-        } else if rebinds && is_str_expr(node.value.as_ref(), &analysis.bindings, TYPE_DEPTH) {
+        } else if rebinds
+            && is_str_expr(
+                node.value.as_ref(),
+                analysis.bindings(),
+                scope,
+                RESOLUTION_DEPTH,
+            )
+        {
             initialised_outside = true;
         }
     }
@@ -279,11 +339,11 @@ fn is_string_accumulator(analysis: &Analysis<'_>, info: &LoopInfo<'_>, name: &st
     initialised_outside
 }
 
-/// `LAV004` — `insert(0, …)` or `pop(0)` on a list inside a loop.
+/// `LAV004` — `insert(0, …)` or `pop(0)` on a list the loop drains.
 fn lav004(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
-    if analysis.hot_loop(ctx).is_none() {
+    let Some(info) = analysis.hot_loop(ctx) else {
         return;
-    }
+    };
     for expr in analysis.exprs_of(ctx.stmt) {
         let Expr::Call(call) = expr else { continue };
         let Expr::Attribute(func) = call.func.as_ref() else {
@@ -298,8 +358,19 @@ fn lav004(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
         if !front {
             continue;
         }
+        // `parts.pop(0)` shifts this line's fields, not the whole file.
+        if info.varies_with(func.value.as_ref()) {
+            continue;
+        }
         // A `deque` shifts nothing, so the same spelling is O(1) on one.
-        if is_call_of(func.value.as_ref(), &analysis.bindings, "deque") {
+        if is_call_of(func.value.as_ref(), analysis.bindings(), ctx.scope, "deque") {
+            continue;
+        }
+        // The quadratic claim needs the loop to keep going until the list is
+        // empty. A `while` that also stops on a predicate — a leading-flag
+        // parser — runs as many times as there are flags, not as there are
+        // elements, so the shifts do not compound.
+        if !drains_the_container(info, func.value.as_ref()) {
             continue;
         }
 
@@ -311,40 +382,96 @@ fn lav004(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
     }
 }
 
+/// `true` when the loop is guaranteed to keep mutating until the list runs out.
+fn drains_the_container(info: &LoopInfo<'_>, container: &Expr) -> bool {
+    let test = match info.stmt {
+        // An unbounded `for` performs one mutation per input element.
+        Stmt::For(_) | Stmt::AsyncFor(_) => return true,
+        Stmt::While(node) => node.test.as_ref(),
+        _ => return false,
+    };
+    let Some(name) = name_of(container) else {
+        return false;
+    };
+
+    let is_emptiness_of = |expr: &Expr| match expr {
+        Expr::Name(node) => node.id.as_str() == name,
+        Expr::Call(call) => {
+            name_of(call.func.as_ref()) == Some("len")
+                && call.args.first().and_then(name_of) == Some(name)
+        }
+        _ => false,
+    };
+
+    match test {
+        Expr::Compare(node) => is_emptiness_of(node.left.as_ref()),
+        other => is_emptiness_of(other),
+    }
+}
+
 /// `LAV005` — a loop nested inside another loop over the same collection.
 fn lav005(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
-    let iter = match ctx.stmt {
-        Stmt::For(node) => node.iter.as_ref(),
-        Stmt::AsyncFor(node) => node.iter.as_ref(),
+    let (iter, body) = match ctx.stmt {
+        Stmt::For(node) => (node.iter.as_ref(), node.body.as_slice()),
+        Stmt::AsyncFor(node) => (node.iter.as_ref(), node.body.as_slice()),
         _ => return,
     };
     let Some(text) = slice_of(analysis.source, iter) else {
         return;
     };
 
-    let inner_is_bounded = analysis
+    let inner = analysis
+        .program
         .loops
         .iter()
-        .find(|info| std::ptr::eq(info.stmt, ctx.stmt))
-        .is_some_and(|info| info.bounded);
-    if inner_is_bounded {
+        .find(|info| std::ptr::eq(info.stmt, ctx.stmt));
+    let Some(inner) = inner else { return };
+    if inner.bounded {
         return;
     }
 
-    let repeats = analysis
+    // One iterator shared by both headers is consumed once between them, not
+    // restarted by the inner loop. `for a in stream: for b in stream:` visits
+    // every element exactly once in total.
+    if is_one_shot_iterator(iter, analysis.bindings(), ctx.scope, RESOLUTION_DEPTH) {
+        return;
+    }
+
+    let outer_targets: BTreeSet<String> = analysis
         .enclosing(ctx)
         .iter()
-        .any(|outer| outer.iter_text == Some(text) && !outer.bounded);
-    if repeats {
-        out.push(analysis.at(
-            crate::registry::LAV005,
-            ctx.stmt,
-            "both loops walk the same collection, so the pair costs n squared comparisons",
-        ));
+        .filter(|outer| outer.iter_text == Some(text) && !outer.bounded)
+        .flat_map(|outer| outer.targets.iter().cloned())
+        .collect();
+    if outer_targets.is_empty() {
+        return;
     }
+
+    // The quadratic shape is a *pairing*: every outer item is examined against
+    // every inner item. An inner loop that never mentions the outer variable is
+    // not forming pairs — it is continuing the same traversal, which is what a
+    // paragraph reader or a length-prefixed record reader does.
+    if !body_reads_any(body, &outer_targets) {
+        return;
+    }
+
+    out.push(analysis.at(
+        crate::registry::LAV005,
+        ctx.stmt,
+        "both loops walk the same collection, so the pair costs n squared comparisons",
+    ));
 }
 
-/// `LAV006` — sorting a list that the same loop is still appending to.
+/// `true` when any expression in these statements reads one of `names`.
+fn body_reads_any(body: &[Stmt], names: &BTreeSet<String>) -> bool {
+    let mut own = Vec::new();
+    for stmt in stmt_tree(body) {
+        stmt_own_exprs(stmt, &mut own);
+    }
+    own.into_iter().any(|expr| depends_on(expr, names))
+}
+
+/// `LAV006` — sorting a list the same loop is still appending to.
 fn lav006(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
     let Some(info) = analysis.hot_loop(ctx) else {
         return;
@@ -360,7 +487,20 @@ fn lav006(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
         };
         let Some(name) = subject else { continue };
 
-        if !accumulates_in(info, name) || !built_outside(analysis, info, name) {
+        if !accumulates_in(info, name) {
+            continue;
+        }
+        let built_outside = analysis
+            .initialisers_outside(info, ctx.scope, name)
+            .iter()
+            .any(|value| matches!(value, Expr::List(_) | Expr::ListComp(_)));
+        if !built_outside {
+            continue;
+        }
+        // A list emptied every batch, or trimmed to a constant every pass, never
+        // grows: each sort is O(k log k) for a fixed k, and "sort once after the
+        // loop" would change what the code produces.
+        if resets_inside(info, name) || bounded_by_a_constant(analysis, info, ctx.scope, name) {
             continue;
         }
 
@@ -392,19 +532,91 @@ fn accumulates_in(info: &LoopInfo<'_>, name: &str) -> bool {
     false
 }
 
-/// `true` when `name` is bound to a fresh list before the loop starts.
-fn built_outside(analysis: &Analysis<'_>, info: &LoopInfo<'_>, name: &str) -> bool {
-    analysis.statements.iter().any(|ctx| {
-        let Stmt::Assign(node) = ctx.stmt else {
-            return false;
-        };
-        let [target] = node.targets.as_slice() else {
-            return false;
-        };
-        name_of(target) == Some(name)
-            && !contains(info.stmt, ctx.stmt)
-            && matches!(node.value.as_ref(), Expr::List(_) | Expr::ListComp(_))
+/// `true` when the body rebinds `name` to a fresh empty list.
+fn resets_inside(info: &LoopInfo<'_>, name: &str) -> bool {
+    stmt_tree(info.body).into_iter().any(|stmt| match stmt {
+        Stmt::Assign(node) => match node.targets.as_slice() {
+            [target] => {
+                name_of(target) == Some(name)
+                    && matches!(node.value.as_ref(), Expr::List(list) if list.elts.is_empty())
+            }
+            _ => false,
+        },
+        _ => false,
     })
+}
+
+/// `true` when the body caps `name`'s length at a compile-time constant.
+fn bounded_by_a_constant(
+    analysis: &Analysis<'_>,
+    info: &LoopInfo<'_>,
+    scope: usize,
+    name: &str,
+) -> bool {
+    let constant = |expr: &Expr| {
+        integer_constant(expr, analysis.bindings(), scope, RESOLUTION_DEPTH).is_some()
+    };
+    let truncation = |target: &Expr| match target {
+        Expr::Subscript(node) => {
+            name_of(node.value.as_ref()) == Some(name)
+                && match node.slice.as_ref() {
+                    Expr::Slice(slice) => {
+                        slice.lower.as_deref().is_some_and(&constant)
+                            || slice.upper.as_deref().is_some_and(&constant)
+                    }
+                    _ => false,
+                }
+        }
+        _ => false,
+    };
+
+    for stmt in stmt_tree(info.body) {
+        // `del top[_TOP_N:]`
+        if let Stmt::Delete(node) = stmt
+            && node.targets.iter().any(truncation)
+        {
+            return true;
+        }
+        // `top = top[:_TOP_N]`
+        if let Stmt::Assign(node) = stmt
+            && let [target] = node.targets.as_slice()
+            && name_of(target) == Some(name)
+            && truncation_slice(node.value.as_ref(), name, &constant)
+        {
+            return true;
+        }
+
+        // `if len(batch) == _BATCH:`
+        let mut own = Vec::new();
+        stmt_own_exprs(stmt, &mut own);
+        for expr in own.into_iter().flat_map(expr_tree) {
+            if let Expr::Compare(node) = expr
+                && let Expr::Call(call) = node.left.as_ref()
+                && name_of(call.func.as_ref()) == Some("len")
+                && call.args.first().and_then(name_of) == Some(name)
+                && node.comparators.iter().any(&constant)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn truncation_slice(value: &Expr, name: &str, constant: &dyn Fn(&Expr) -> bool) -> bool {
+    let Expr::Subscript(node) = value else {
+        return false;
+    };
+    if name_of(node.value.as_ref()) != Some(name) {
+        return false;
+    }
+    match node.slice.as_ref() {
+        Expr::Slice(slice) => {
+            slice.upper.as_deref().is_some_and(constant)
+                || slice.lower.as_deref().is_some_and(constant)
+        }
+        _ => false,
+    }
 }
 
 /// `LAV007` — a collection rebuilt every iteration from loop-invariant inputs.
@@ -423,8 +635,7 @@ fn lav007(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
         return;
     }
 
-    // `y = tuple(y)` reads the previous iteration's value; there is nothing
-    // invariant about it.
+    // `y = tuple(y)` reads the previous iteration's value; nothing invariant.
     if free_names(value).iter().any(|read| read == name) {
         return;
     }
@@ -437,10 +648,7 @@ fn lav007(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
     }
 
     // Anything the loop varies makes the build genuinely per-iteration.
-    let mut varying: BTreeSet<String> = info.targets.clone();
-    for outer in analysis.enclosing(ctx) {
-        varying.extend(outer.targets.iter().cloned());
-    }
+    let mut varying: BTreeSet<String> = info.varies.clone();
     varying.extend(info.assigned.iter().cloned());
     varying.remove(name);
     if depends_on(value, &varying) {
@@ -450,6 +658,14 @@ fn lav007(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
     // Hoisting a collection the body mutates changes the result, not the cost:
     // `seen = set()` per group is the whole point of `seen`.
     if mutated_in(info, name) || assigned_more_than_once(info, name) {
+        return;
+    }
+
+    // The same argument, one indirection out. A fresh list stored into a dict,
+    // or handed to a helper that fills it, is depended on for its *identity*;
+    // hoisting would alias every group onto one object. The build is invariant
+    // in value and emphatically not in identity.
+    if escapes_the_iteration(info.body, name) {
         return;
     }
 
@@ -476,11 +692,6 @@ fn is_eager_collection_build(expr: &Expr) -> bool {
 }
 
 /// `true` when nothing inside the build can have an effect of its own.
-///
-/// The outermost constructor is exempt — that call *is* the build. Anything
-/// nested is not: a generator, an iterator or a method call may be stateful,
-/// and moving a stateful expression out of a loop changes what the program
-/// does. The rule would rather miss a hoistable build than propose one.
 fn build_is_side_effect_free(expr: &Expr) -> bool {
     let inner: Vec<&Expr> = match expr {
         Expr::Call(call) => call
@@ -549,11 +760,7 @@ fn lav008(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
         return;
     };
 
-    let mut targets: BTreeSet<String> = info.targets.clone();
-    for outer in analysis.enclosing(ctx) {
-        targets.extend(outer.targets.iter().cloned());
-    }
-    let mut varying = targets.clone();
+    let mut varying = info.varies.clone();
     varying.extend(info.assigned.iter().cloned());
 
     for expr in analysis.exprs_of(ctx.stmt) {
@@ -568,24 +775,21 @@ fn lav008(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
         if !matches!(subscript.ctx, ExprContext::Load) {
             continue;
         }
-        if is_fixed_width(slice, analysis.source, &varying) {
-            continue;
-        }
-        // A slice of the item the loop is currently on copies that item, not the
-        // whole input, so the loop total stays linear.
-        if depends_on(subscript.value.as_ref(), &targets) {
+        // A slice of the object the loop is currently on copies that object,
+        // not the whole input, so the loop total stays linear.
+        if info.varies_with(subscript.value.as_ref()) {
             continue;
         }
         // `memoryview` slices share storage; nothing is copied.
-        if is_call_of(subscript.value.as_ref(), &analysis.bindings, "memoryview") {
+        if is_call_of(
+            subscript.value.as_ref(),
+            analysis.bindings(),
+            ctx.scope,
+            "memoryview",
+        ) {
             continue;
         }
-        // The span has to be shown to grow, not merely to be a slice. Either
-        // the loop consumes the object by reslicing it into itself, or a bound
-        // is driven by the loop variable. Every other slice in a loop copies
-        // something whose size this pass cannot see, and reporting those is
-        // what makes a slice rule fire on half a repository.
-        if !(consumes_by_reslicing(analysis, ctx, subscript) || is_driven_by(slice, &targets)) {
+        if !span_grows(analysis, ctx, info, subscript, slice, &varying) {
             continue;
         }
 
@@ -597,17 +801,56 @@ fn lav008(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
     }
 }
 
+/// `true` when the slice copies more on each pass than it did on the last.
+///
+/// # Moving is not growing, and this is the distinction the rule lives or dies on
+///
+/// `text[start:end]` over tokeniser offsets and `blob[off:off + length]` over a
+/// record directory both have bounds that move with the loop, and both copy
+/// each byte of the subject exactly once *in total*. What makes a slice
+/// quadratic is one endpoint anchored while the other travels — a prefix that
+/// keeps growing, or a tail the loop keeps re-copying. So growth needs one of:
+///
+/// * the loop rebinds the object to a slice of itself, consuming it; or
+/// * exactly one endpoint moves, and the other is a constant or absent.
+///
+/// Two moving endpoints is a window, and a window tiles.
+fn span_grows(
+    analysis: &Analysis<'_>,
+    ctx: &StmtCtx<'_>,
+    info: &LoopInfo<'_>,
+    subscript: &rustpython_parser::ast::ExprSubscript,
+    slice: &rustpython_parser::ast::ExprSlice,
+    varying: &BTreeSet<String>,
+) -> bool {
+    if consumes_by_reslicing(analysis, ctx, subscript) {
+        return true;
+    }
+    if is_fixed_width(slice, analysis.source, varying) {
+        return false;
+    }
+
+    let anchored = |bound: Option<&Expr>| match bound {
+        None => true,
+        Some(expr) => {
+            integer_constant(expr, analysis.bindings(), ctx.scope, RESOLUTION_DEPTH).is_some()
+                || is_negative_literal(expr)
+        }
+    };
+    let travels = |bound: Option<&Expr>| bound.is_some_and(|expr| depends_on(expr, &info.varies));
+
+    let lower = slice.lower.as_deref();
+    let upper = slice.upper.as_deref();
+    (travels(lower) && anchored(upper)) || (travels(upper) && anchored(lower))
+}
+
 /// `true` when the slice's length does not grow with the loop.
 ///
-/// Three shapes qualify, and all three are common enough that missing any one
-/// of them makes a slice rule unusable on real code:
-///
-/// * literal bounds — `line[:19]`;
-/// * a negative literal lower with no upper — `line[-1:]` is one element,
-///   however long `line` is;
-/// * a window whose *difference* is loop-invariant — `buf[i:i + 4]`,
-///   `self[i:i + width]`. Neither bound is a constant, but the length is, and
-///   this is how every binary-format parser is written.
+/// Three shapes qualify: literal bounds — `line[:19]`; a negative literal lower
+/// with no upper — `line[-1:]` is one element however long `line` is; and a
+/// window whose *difference* is loop-invariant — `buf[i:i + 4]`. The last is
+/// how every binary-format parser is written, and missing it makes a slice rule
+/// unusable on the code that slices most.
 fn is_fixed_width(
     slice: &rustpython_parser::ast::ExprSlice,
     source: &str,
@@ -616,8 +859,6 @@ fn is_fixed_width(
     let lower = slice.lower.as_deref();
 
     let Some(upper) = slice.upper.as_deref() else {
-        // `buf[-k:]` keeps the last k elements. Anything else open-ended copies
-        // whatever is left, and "whatever is left" is what the loop consumes.
         return lower.is_some_and(is_negative_literal);
     };
 
@@ -666,19 +907,6 @@ fn consumes_by_reslicing(
     sliced.is_some() && slice_of(analysis.source, target) == sliced
 }
 
-/// `true` when a slice bound is driven by an enclosing loop's variable, which
-/// is what makes the span grow from one iteration to the next.
-fn is_driven_by(slice: &rustpython_parser::ast::ExprSlice, targets: &BTreeSet<String>) -> bool {
-    [
-        slice.lower.as_deref(),
-        slice.upper.as_deref(),
-        slice.step.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|bound| depends_on(bound, targets))
-}
-
 /// `true` for `-1`, `-8` and friends, which the parser sees as a unary minus.
 fn is_negative_literal(expr: &Expr) -> bool {
     match expr {
@@ -690,11 +918,17 @@ fn is_negative_literal(expr: &Expr) -> bool {
     }
 }
 
-/// `LAV009` — a dataframe grown one row or one frame at a time.
+/// `LAV009` — a pandas dataframe grown one row or one frame at a time.
+///
+/// The rule demands *positive* evidence of pandas. `x = x.append(item)` is also
+/// how every persistent structure is used — a cons list, a `pyrsistent`
+/// vector — where the append is O(1) and rebinding the name is the whole point.
+/// Without the evidence this rule tells people that immutable data structures
+/// are a performance bug.
 fn lav009(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
-    if analysis.hot_loop(ctx).is_none() {
+    let Some(info) = analysis.hot_loop(ctx) else {
         return;
-    }
+    };
     let Stmt::Assign(node) = ctx.stmt else { return };
     let [target] = node.targets.as_slice() else {
         return;
@@ -703,16 +937,20 @@ fn lav009(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
     let Expr::Call(call) = node.value.as_ref() else {
         return;
     };
+    let Expr::Attribute(func) = call.func.as_ref() else {
+        return;
+    };
 
-    let grows = match call.func.as_ref() {
-        // `frame = frame.append(row)` — `list.append` returns `None`, so an
-        // assignment back to the receiver is never a list.
-        Expr::Attribute(func) if func.attr.as_str() == "append" => {
+    let grows = match func.attr.as_str() {
+        "append" => {
             name_of(func.value.as_ref()) == Some(name)
+                && built_by_pandas(analysis, info, ctx.scope, name)
         }
-        // `frame = pd.concat([frame, chunk])`.
-        Expr::Attribute(func) if func.attr.as_str() == "concat" => concat_reuses(call, name),
-        Expr::Name(func) if func.id.as_str() == "concat" => concat_reuses(call, name),
+        "concat" => {
+            name_of(func.value.as_ref())
+                .is_some_and(|module| analysis.bindings().is_pandas_module(module))
+                && concat_reuses(call, name)
+        }
         _ => false,
     };
 
@@ -723,6 +961,21 @@ fn lav009(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
             "every concat copies the whole accumulated frame; collect the parts and concat once",
         ));
     }
+}
+
+/// `true` when `name` starts life as something built by pandas.
+fn built_by_pandas(analysis: &Analysis<'_>, info: &LoopInfo<'_>, scope: usize, name: &str) -> bool {
+    analysis
+        .initialisers_outside(info, scope, name)
+        .into_iter()
+        .any(|value| match value {
+            Expr::Call(call) => match call.func.as_ref() {
+                Expr::Attribute(func) => name_of(func.value.as_ref())
+                    .is_some_and(|module| analysis.bindings().is_pandas_module(module)),
+                _ => false,
+            },
+            _ => false,
+        })
 }
 
 /// `true` when the first argument of a concat is a sequence containing `name`.
@@ -740,90 +993,11 @@ fn concat_reuses(call: &rustpython_parser::ast::ExprCall, name: &str) -> bool {
         .any(|element| name_of(element) == Some(name))
 }
 
-/// `LAV010` — an exception used as control flow inside a loop.
-///
-/// # The narrowing, and why it has to be this tight
-///
-/// Setting up `try` is free in CPython; only *raising* costs, and how often a
-/// loop raises is a runtime property no static pass can see. So the rule does
-/// not report `try` in a loop. It reports the statically decidable proxy:
-///
-/// * the handler's sole effect is `continue`, `pass`, or a default assignment —
-///   which is what "the exception is the branch" looks like; and
-/// * the guarded operation is a subscript, for which a total, never-slower
-///   alternative exists (`dict.get`, a membership test); and
-/// * the exception is a lookup error, not an I/O error.
-///
-/// `open()` fails all three, and must: `os.path.exists` before `open` is a
-/// TOCTOU bug, so the handler is the only correct spelling however often it
-/// fires.
-fn lav010(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
-    if analysis.hot_loop(ctx).is_none() {
-        return;
-    }
-    let Stmt::Try(node) = ctx.stmt else { return };
-    if node.handlers.is_empty() || !node.finalbody.is_empty() {
-        return;
-    }
-    if !body_reads_a_subscript(&node.body) {
-        return;
-    }
-
-    let every_handler_is_a_branch = node.handlers.iter().all(|handler| {
-        let rustpython_parser::ast::ExceptHandler::ExceptHandler(handler) = handler;
-        handler
-            .type_
-            .as_deref()
-            .is_some_and(is_recoverable_lookup_error)
-            && handler_is_pure_branch(&handler.body)
-    });
-
-    if every_handler_is_a_branch {
-        out.push(analysis.at(
-            crate::registry::LAV010,
-            ctx.stmt,
-            "the handler is the branch, so every miss pays an unwind; dict.get expresses it directly",
-        ));
-    }
-}
-
-/// `true` for `KeyError`, `IndexError`, or a tuple of only those.
-fn is_recoverable_lookup_error(expr: &Expr) -> bool {
-    match expr {
-        Expr::Tuple(node) => {
-            !node.elts.is_empty() && node.elts.iter().all(is_recoverable_lookup_error)
-        }
-        _ => name_of(expr).is_some_and(|name| RECOVERABLE_LOOKUP_ERRORS.contains(&name)),
-    }
-}
-
-/// `true` when a handler body does nothing but redirect control or store a
-/// default — no calls, no logging, no bookkeeping.
-fn handler_is_pure_branch(body: &[Stmt]) -> bool {
-    if body.is_empty() {
-        return false;
-    }
-    body.iter().all(|stmt| match stmt {
-        Stmt::Continue(_) | Stmt::Pass(_) => true,
-        Stmt::Assign(node) => {
-            node.targets.iter().all(|target| name_of(target).is_some())
-                && !contains_call(node.value.as_ref())
-        }
-        _ => false,
-    })
-}
-
-fn contains_call(expr: &Expr) -> bool {
-    expr_tree(expr)
-        .into_iter()
-        .any(|node| matches!(node, Expr::Call(_)))
-}
-
-/// `LAV011` — a regex re-scanning a subject that the loop keeps re-deriving.
+/// `LAV011` — a regex re-scanning a subject the loop keeps re-deriving.
 fn lav011(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
-    if analysis.hot_loop(ctx).is_none() {
+    let Some(info) = analysis.hot_loop(ctx) else {
         return;
-    }
+    };
 
     let rebound = match ctx.stmt {
         Stmt::Assign(node) => match node.targets.as_slice() {
@@ -841,7 +1015,7 @@ fn lav011(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
         if !REGEX_SCANS.contains(&func.attr.as_str()) {
             continue;
         }
-        if !is_regex_handle(func.value.as_ref(), &analysis.bindings) {
+        if !is_regex_handle(func.value.as_ref(), analysis.bindings(), ctx.scope) {
             continue;
         }
 
@@ -851,9 +1025,14 @@ fn lav011(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
             .chain(call.keywords.iter().map(|keyword| &keyword.value))
             .collect();
 
-        // A freshly sliced subject is a copy plus a rescan of the same tail.
+        // A freshly sliced subject is a copy plus a rescan of the same tail —
+        // but only when the subject outlives the iteration. A slice of *this
+        // line* is scanned once and thrown away.
         let scans_a_copy = arguments.iter().any(|argument| match argument {
-            Expr::Subscript(node) => matches!(node.slice.as_ref(), Expr::Slice(_)),
+            Expr::Subscript(node) => {
+                matches!(node.slice.as_ref(), Expr::Slice(_))
+                    && !info.varies_with(node.value.as_ref())
+            }
             _ => false,
         });
         // `text = re.sub(..., text)` repeats whole passes until a fixpoint.
@@ -874,6 +1053,6 @@ fn lav011(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
 }
 
 /// `true` for `re` itself or a name bound to `re.compile(...)`.
-fn is_regex_handle(expr: &Expr, bindings: &Bindings<'_>) -> bool {
-    name_of(expr) == Some("re") || is_call_of(expr, bindings, "compile")
+fn is_regex_handle(expr: &Expr, bindings: &Bindings<'_>, scope: usize) -> bool {
+    name_of(expr) == Some("re") || is_call_of(expr, bindings, scope, "compile")
 }

@@ -5,7 +5,7 @@ use std::path::Path;
 use rustpython_parser::{Parse, ast};
 
 use crate::{
-    context::{Bindings, collect},
+    context::analyse_program,
     finding::Finding,
     patterns::Analysis,
     python_error::PythonError,
@@ -63,16 +63,11 @@ pub fn analyze_source(path: &Path, source: &str) -> Result<Vec<Finding>, PythonE
         }
     })?;
 
-    let bindings = Bindings::new(&module);
-    let (loops, statements) = collect(&module, source, &bindings);
-
     let analysis = Analysis {
         path,
         source,
         index,
-        bindings,
-        loops,
-        statements,
+        program: analyse_program(&module, source),
     };
 
     Ok(analysis.run())

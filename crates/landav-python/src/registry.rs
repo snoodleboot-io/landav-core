@@ -33,7 +33,6 @@ pub(crate) const LAV006: RuleCode = RuleCode::new("LAV006");
 pub(crate) const LAV007: RuleCode = RuleCode::new("LAV007");
 pub(crate) const LAV008: RuleCode = RuleCode::new("LAV008");
 pub(crate) const LAV009: RuleCode = RuleCode::new("LAV009");
-pub(crate) const LAV010: RuleCode = RuleCode::new("LAV010");
 pub(crate) const LAV011: RuleCode = RuleCode::new("LAV011");
 
 static RULES: &[Rule] = &[
@@ -138,19 +137,6 @@ static RULES: &[Rule] = &[
          is amortised O(1) — and call `pd.concat(frames)` or `pd.DataFrame.from_records(rows)` \
          once after the loop. A concat whose result is discarded each iteration is not reported: \
          nothing accumulates, so the total stays linear.",
-    ),
-    Rule::new(
-        LAV010,
-        "exception-as-control-flow-in-loop",
-        "an exception used as a branch inside a loop",
-        "Entering a `try` block is free in CPython; raising is not, costing an exception object, \
-         a traceback and an unwind. When the handler *is* the branch, the raise rate equals the \
-         miss rate and the loop pays that cost per miss. Because the raise rate is a runtime \
-         property, this rule reports only the statically decidable case: the handler's sole \
-         effect is `continue`, `pass` or a default assignment, the guarded operation is a \
-         subscript, and the exception is a lookup error — so `dict.get(key, default)` expresses \
-         the same thing without the unwind. `OSError` around `open()` is never reported, because \
-         checking first is a TOCTOU bug and the handler is the only correct spelling.",
     ),
     Rule::new(
         LAV011,
