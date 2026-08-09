@@ -1,4 +1,8 @@
-<!-- Replace with landav-lockup-light.png / landav-lockup-dark.png from the brand kit before the repo goes public. -->
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/landav-lockup-dark.png">
+  <img src="assets/brand/landav-lockup-light.png" alt="Landav" width="260">
+</picture>
+
 # Landav
 
 **Symbolic resource analysis for real codebases.** Landav derives and verifies

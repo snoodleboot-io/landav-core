@@ -1,0 +1,37 @@
+/* Landav — brand tokens
+   Palette sampled from the source mark. Do not eyeball replacements. */
+:root {
+  /* Brand */
+  --landav-violet:        #6F00FF;  /* primary accent, peak of the mark gradient */
+  --landav-violet-core:   #5500D5;  /* mid of the mark gradient */
+  --landav-deep:          #20025C;  /* shadow of the mark gradient */
+  --landav-gradient: linear-gradient(28deg, #20025C 0%, #5500D5 55%, #6F00FF 100%);
+
+  /* Neutrals — dark first */
+  --landav-ink:           #0B0B10;  /* primary dark surface */
+  --landav-ink-raised:    #14141C;  /* cards on dark */
+  --landav-paper:         #FAF9F7;  /* primary light surface */
+  --landav-paper-sunk:    #F0EEEB;  /* cards on light */
+
+  /* Text */
+  --landav-text-on-dark:      #FAF9F7;
+  --landav-text-on-dark-mute: #A096BE;
+  --landav-text-on-light:     #111117;
+  --landav-text-on-light-mute:#5A5869;
+
+  /* Semantic — verdicts */
+  --landav-ok:      #22C55E;  /* bound holds / improved */
+  --landav-warn:    #F0A500;  /* unverified / partial bound */
+  --landav-regress: #FF4D6D;  /* regression / bound violated */
+  --landav-info:    #6F00FF;  /* derived, informational */
+
+  /* Type */
+  --landav-font-display: "Söhne", "Inter Display", "Inter", system-ui, sans-serif;
+  --landav-font-body:    "Inter", system-ui, -apple-system, sans-serif;
+  --landav-font-mono:    "Berkeley Mono", "JetBrains Mono", ui-monospace, monospace;
+
+  /* Geometry */
+  --landav-radius:   10px;
+  --landav-radius-lg: 18px;
+  --landav-clearspace: 0.5; /* multiple of mark height, minimum on all sides */
+}
