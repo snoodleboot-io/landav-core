@@ -19,5 +19,11 @@ laws = []
 serde = { workspace = true }
 thiserror = { workspace = true }
 
+# The LAN-56 acceptance criteria are property tests (`tests/properties/`), not
+# example tests: weak monotonicity and composition-by-substitution soundness
+# are properties, and a handful of examples will not catch a violation.
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true
