@@ -316,9 +316,16 @@ proptest! {
         }
     }
 
-    /// `vars()` is sorted ascending, deduplicated, and drawn only from the
-    /// recipe. Sorted rather than merely canonical because it reaches
+    /// `vars()` is sorted ascending, deduplicated, drawn only from the recipe,
+    /// and **exactly the set of variables the built term contains**. Sorted
+    /// rather than merely canonical because it reaches
     /// `BoundError::UnboundVariable`, which reaches a CI log diff.
+    ///
+    /// The exactness half is the load-bearing one and was missing: sortedness,
+    /// deduplication and "drawn from the recipe" are all satisfied by the
+    /// empty list, so `vars()` could have returned nothing at all. It reaches
+    /// `Bound::subst`'s callers and `TotalValuation::require_total`, where an
+    /// unreported variable is a silently unsubstituted one.
     #[test]
     fn vars_is_sorted_deduplicated_and_contained(spec in arb_spec()) {
         let bound = build(&spec);
@@ -327,6 +334,29 @@ proptest! {
         for pair in listed.windows(2) {
             prop_assert!(pair[0] < pair[1], "vars() is not sorted and deduplicated: {listed:?}");
         }
+
+        // Exactly the variables the *term* holds - computed by walking the
+        // observation type, which absorption and deduplication have already
+        // acted on, rather than the recipe, which they have not.
+        prop_assert_eq!(
+            &listed,
+            &crate::support::variables_in_term(&bound),
+            "vars() disagrees with the variables {} actually contains",
+            bound
+        );
+
+        // The O(1) summary and the exact list must agree on emptiness. A
+        // `VarSet` may over-approximate *which* variables occur, but a term
+        // with a variable may never summarise as closed - that is the false
+        // negative `subst` would act on by skipping the subtree.
+        prop_assert_eq!(
+            listed.is_empty(),
+            bound.var_set().is_empty(),
+            "{} lists {:?} but its VarSet reports empty = {}",
+            bound,
+            listed,
+            bound.var_set().is_empty()
+        );
 
         // Absorption may drop a variable (`omega + x` is `omega`), so
         // containment runs one way only: every reported variable must come
@@ -392,22 +422,46 @@ proptest! {
         );
     }
 
-    /// `wire_node_count` reports what `to_wire` will emit, so a caller can
+    /// `wire_node_count` reports **what `to_wire` will emit**, so a caller can
     /// check the serialised size before serialising.
+    ///
+    /// Both halves of that sentence are asserted. The count is compared
+    /// against the document's own node table rather than merely being
+    /// positive - a `wire_node_count` fixed at `1` satisfied "at least one"
+    /// and answers the question it is offered for wrongly. And a term drawn
+    /// from `arb_spec` has at most a few dozen nodes against a budget of
+    /// `2^20`, so `to_wire` refusing one is not a legitimate outcome here: the
+    /// earlier `if let Ok` swallowed a budget guard that fires on every term.
     #[test]
     fn wire_round_trip_rebuilds_the_same_term(spec in arb_spec()) {
         let bound = build(&spec);
         prop_assert!(bound.wire_node_count() >= 1);
-        // A budget refusal from `to_wire` is a legitimate outcome; a panic is
-        // not, and neither is emitting a document this crate cannot read back.
-        if let Ok(wire) = bound.to_wire() {
-            match Bound::try_from_wire(&wire) {
-                Ok(rebuilt) => {
-                    let (there, back) = (bound.canonical_bytes(), rebuilt.canonical_bytes());
-                    prop_assert_eq!(back.as_bytes(), there.as_bytes());
+        match bound.to_wire() {
+            Ok(wire) => {
+                prop_assert_eq!(
+                    usize::try_from(bound.wire_node_count()).unwrap_or(usize::MAX),
+                    wire.nodes.len(),
+                    "wire_node_count disagrees with the document to_wire emitted for {}",
+                    bound
+                );
+                prop_assert_eq!(wire.version, landav_bound::WIRE_VERSION);
+                match Bound::try_from_wire(&wire) {
+                    Ok(rebuilt) => {
+                        let (there, back) = (bound.canonical_bytes(), rebuilt.canonical_bytes());
+                        prop_assert_eq!(back.as_bytes(), there.as_bytes());
+                    }
+                    Err(e) => {
+                        prop_assert!(false, "a wire form this crate emitted was rejected: {e}");
+                    }
                 }
-                Err(e) => prop_assert!(false, "a wire form this crate emitted was rejected: {e}"),
             }
+            Err(refusal) => prop_assert!(
+                false,
+                "to_wire refused {} ({} nodes, budget {}): {refusal}",
+                bound,
+                bound.wire_node_count(),
+                landav_bound::MAX_NODES
+            ),
         }
     }
 }
@@ -543,6 +597,57 @@ fn display_uses_canonical_operand_order() {
         "Display must not expose the order operands were supplied in"
     );
     assert!(!rendered.is_empty());
+
+    // Order independence alone is satisfied by a renderer that prints every
+    // operand list identically - which is what dropping the separator does.
+    // LAN-57's acceptance criterion is restated against *this* string, and
+    // LAN-58's golden tests will pin it, so the exact rendering is pinned
+    // here first.
+    assert_eq!(rendered, "(x1 * (2 + log2(x1)))");
+}
+
+/// The exact rendering of each shape. `Display` walks the tree, and it is the
+/// only observer that does, so it is also the only place a separator or a
+/// parenthesis can go missing without any other property noticing.
+#[test]
+fn display_renders_each_shape_exactly() {
+    use landav_bound::Base;
+
+    let (x0, x1, x2) = (Bound::var("x0"), Bound::var("x1"), Bound::var("x2"));
+
+    assert_eq!(Bound::constant(7).to_string(), "7");
+    assert_eq!(Bound::omega().to_string(), "omega");
+    assert_eq!(x0.to_string(), "x0");
+
+    // Two and three operands: with two, "a separator before every operand"
+    // and "a separator before the first only" are still distinguishable from
+    // "a separator between them", but only if the string is compared rather
+    // than the operand order.
+    assert_eq!(
+        Bound::sum([x0.clone(), x1.clone()]).to_string(),
+        "(x0 + x1)"
+    );
+    assert_eq!(
+        Bound::sum([x0.clone(), x1.clone(), x2.clone()]).to_string(),
+        "(x0 + x1 + x2)"
+    );
+    assert_eq!(
+        Bound::prod([x0.clone(), x1.clone(), x2.clone()]).to_string(),
+        "(x0 * x1 * x2)"
+    );
+    assert_eq!(
+        Bound::max_of([x0.clone(), x1.clone(), x2.clone()]).to_string(),
+        "max(x0, x1, x2)"
+    );
+    assert_eq!(Bound::log(Base::TEN, x0.clone()).to_string(), "log10(x0)");
+    assert_eq!(Bound::pow(Base::TWO, x0.clone()).to_string(), "2^(x0)");
+
+    // Nesting: every operand list is parenthesised, so the rendering is
+    // unambiguous without a precedence table.
+    assert_eq!(
+        Bound::prod([x0, Bound::sum([x1, x2])]).to_string(),
+        "(x0 * (x1 + x2))"
+    );
 }
 
 /// The reference semantics used by every property in this file, checked
@@ -573,4 +678,75 @@ fn the_reference_semantics_is_itself_correct() {
     assert_eq!(ref_nat(None), Nat::OMEGA);
     assert!(ref_le(Some(u64::MAX), None));
     assert!(!ref_le(None, Some(u64::MAX)));
+}
+
+/// The free-variable summary must actually **discriminate**, not merely avoid
+/// false negatives.
+///
+/// `VarSet` is a 64-bit Bloom-ish filter and its contract is one-sided: `false`
+/// guarantees absence, `true` means "may". A summary that answered `true` for
+/// every query would satisfy that contract exactly, and satisfy every property
+/// in this suite, while making `Bound::subst` walk the whole term on every
+/// call - which is the entire reason the field exists, and the difference
+/// between O(touched) and O(size) per fixpoint round.
+///
+/// So precision is asserted directly, on the names this suite uses and over a
+/// corpus wide enough to see the hash spread. Both halves matter: mutating the
+/// FNV mixer's `^=` to `|=` keeps the filter *sound* and collapses ninety-three
+/// distinct names onto eight of the sixty-four bits, with `x0`, `x1` and `x2`
+/// all landing on the same one.
+#[test]
+fn the_free_variable_summary_discriminates_between_names() {
+    use crate::support::VAR_NAMES;
+
+    // The generated names must be pairwise distinguishable, or every property
+    // in this file that substitutes one of them exercises the slow path only.
+    for name in VAR_NAMES {
+        let term = Bound::var(name);
+        assert!(term.may_contain_var(&VarId::new(name)));
+        for other in VAR_NAMES {
+            if other != name {
+                assert!(
+                    !term.may_contain_var(&VarId::new(other)),
+                    "the summary of {name} cannot rule out {other}, so subst({other}) \
+                     rebuilds a term it could have returned by handle"
+                );
+            }
+        }
+    }
+
+    // And the spread over a wider corpus. Ninety-three names into sixty-four
+    // buckets fills about `64 * (1 - (63/64)^93) = 49` of them under a uniform
+    // hash; the real mixer reaches 46. The floor below is far under that and
+    // far over the 8 a damaged mixer produces, so it is a test of the mixer
+    // rather than of its exact constants.
+    let mut names: Vec<String> = (0..64).map(|i| format!("v{i}")).collect();
+    names.extend((0..16).map(|i| format!("x{i}")));
+    names.extend(
+        [
+            "a", "b", "c", "x", "y", "z", "n", "m", "foo", "bar", "baz", "alpha", "beta",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned()),
+    );
+
+    let mut buckets = 0usize;
+    for candidate in &names {
+        let probe = VarId::new(candidate.clone());
+        // A name lands in its own bucket, so counting the names that no
+        // *earlier* name shadows counts the distinct buckets.
+        let shadowed = names
+            .iter()
+            .take_while(|earlier| *earlier != candidate)
+            .any(|earlier| Bound::var(earlier.clone()).may_contain_var(&probe));
+        if !shadowed {
+            buckets += 1;
+        }
+    }
+    assert!(
+        buckets >= 32,
+        "{} names occupy only {buckets} of the 64 summary bits; the filter is \
+         not discriminating and subst's O(1) skip cannot fire",
+        names.len()
+    );
 }

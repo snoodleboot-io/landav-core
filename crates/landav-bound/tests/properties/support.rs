@@ -753,6 +753,123 @@ pub fn irreducible_spec_of_shape(shape: BoundShape) -> BoundSpec {
 }
 
 // ---------------------------------------------------------------------------
+// near-miss pairs
+// ---------------------------------------------------------------------------
+
+/// One syntactic edit to a recipe, small enough that the two terms have the
+/// same *shape* everywhere and differ only in a payload.
+///
+/// # Why the suite needs these
+///
+/// "Distinct values encode to distinct bytes" is checked over two
+/// **independent** draws from [`arb_spec`], and two independent draws
+/// essentially never differ in one leaf payload alone. So the property was
+/// discharged, over and over, by pairs whose *shapes* already differed - and
+/// every payload the encoder writes (the variable name, the base, which of
+/// `Pow`/`Log`) could have been dropped from the encoding without a single
+/// failure. Mutation testing found all four.
+///
+/// A near-miss pair is the case that separates a real encoding from a
+/// structural sketch, and nothing else in the suite produces one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Perturbation {
+    /// Shift every variable to the next name in [`VAR_NAMES`].
+    RenameVariables,
+    /// Swap `Pow` for `Log` and back at every `Trans` node.
+    SwapTransKind,
+    /// Move every base one higher, staying `>= 2`.
+    BumpBase,
+    /// Add one to every finite literal, leaving `omega` alone.
+    BumpLiterals,
+}
+
+impl Perturbation {
+    /// Every perturbation, so a fifth is a compile error in the harness.
+    pub const ALL: [Self; 4] = [
+        Self::RenameVariables,
+        Self::SwapTransKind,
+        Self::BumpBase,
+        Self::BumpLiterals,
+    ];
+}
+
+/// Applies one [`Perturbation`] everywhere in `spec`.
+///
+/// The result may still build to the *same* term - `Const(omega) + x` absorbs
+/// whatever `x` is called - which is why every property over these pairs is
+/// stated as an `iff` against `==` rather than as "these two differ".
+#[must_use]
+pub fn perturb(spec: &BoundSpec, how: Perturbation) -> BoundSpec {
+    let recurse =
+        |xs: &Vec<BoundSpec>| -> Vec<BoundSpec> { xs.iter().map(|x| perturb(x, how)).collect() };
+    match spec {
+        BoundSpec::Const(r) => match how {
+            Perturbation::BumpLiterals => {
+                BoundSpec::Const(r.map(|v| v.checked_add(1).unwrap_or(v)))
+            }
+            _ => spec.clone(),
+        },
+        BoundSpec::Var(i) => match how {
+            Perturbation::RenameVariables => BoundSpec::Var((i + 1) % VAR_NAMES.len()),
+            _ => spec.clone(),
+        },
+        BoundSpec::Sum(xs) => BoundSpec::Sum(recurse(xs)),
+        BoundSpec::Max(xs) => BoundSpec::Max(recurse(xs)),
+        BoundSpec::Prod(xs) => BoundSpec::Prod(recurse(xs)),
+        BoundSpec::Trans { log, base, arg } => BoundSpec::Trans {
+            log: match how {
+                Perturbation::SwapTransKind => !*log,
+                _ => *log,
+            },
+            base: match how {
+                Perturbation::BumpBase => base.checked_add(1).unwrap_or(*base),
+                _ => *base,
+            },
+            arg: Box::new(perturb(arg, how)),
+        },
+    }
+}
+
+/// A perturbation, for a property that wants to draw one.
+pub fn arb_perturbation() -> impl Strategy<Value = Perturbation> {
+    proptest::sample::select(Perturbation::ALL.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// observing a built term
+// ---------------------------------------------------------------------------
+
+/// Every variable occurring in the **built term**, by walking the observation
+/// type rather than the recipe.
+///
+/// Distinct from [`BoundSpec::var_indices`], which walks the recipe: the smart
+/// constructors drop operands (`omega + x` absorbs) and deduplicate them, so
+/// the recipe's variables are a superset. This is the exact set
+/// [`landav_bound::Bound::vars`] has to reproduce.
+#[must_use]
+pub fn variables_in_term(root: &Bound) -> Vec<VarId> {
+    let mut found: Vec<VarId> = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            BoundKind::Const(_) => {}
+            BoundKind::Var(var) => {
+                if !found.contains(var) {
+                    found.push(var.clone());
+                }
+            }
+            BoundKind::Sum(operands) | BoundKind::Prod(operands) => {
+                stack.extend(operands.as_slice().iter().cloned());
+            }
+            BoundKind::Max(operands) => stack.extend(operands.as_slice().iter().cloned()),
+            BoundKind::Trans { arg, .. } => stack.push(arg.clone()),
+        }
+    }
+    found.sort();
+    found
+}
+
+// ---------------------------------------------------------------------------
 // valuations
 // ---------------------------------------------------------------------------
 
@@ -809,13 +926,33 @@ impl Env {
 // structural invariants
 // ---------------------------------------------------------------------------
 
+/// Describes the first flatness violation under `parent`, if any.
+///
+/// **Flatness is the one invariant Rust's type system cannot express.** A
+/// `Sum` may not carry a `Sum` operand, a `Prod` may not carry a `Prod`, and a
+/// `Max` may not carry a `Max`: `Sum[Sum[a, b], c]` and `Sum[a, b, c]` denote
+/// the same function, so admitting both gives one value two representations -
+/// a second cache key for one program, before normalisation has started.
+///
+/// Checked here rather than trusted because each of the three operators
+/// flattens through its **own** match arm in `Bound::assemble`, so losing one
+/// of them leaves the other two working and every denotational property
+/// green.
+#[must_use]
+fn flatness_violation(parent: BoundShape, operands: &[Bound]) -> Option<String> {
+    operands.iter().find(|operand| operand.shape() == parent).map(|nested| {
+        format!("a {parent} node carries a {parent} operand ({nested}): the operand list did not flatten")
+    })
+}
+
 /// Describes the first canonical-form invariant `root` violates, if any.
 ///
 /// Checks, at every node: arity `>= 2` for the n-ary shapes, operands
 /// non-decreasing under `canonical_cmp` for `Sum`/`Prod`, operands *strictly*
 /// increasing for `Max` (which is sortedness and pairwise distinctness at
-/// once), `is_empty()` consistent with `len()`, `shape()` consistent with
-/// `kind()`, and `depth()` within [`landav_bound::MAX_DEPTH`].
+/// once), **flatness** (see [`flatness_violation`]), `is_empty()` consistent
+/// with `len()`, `shape()` consistent with `kind()`, and `depth()` within
+/// [`landav_bound::MAX_DEPTH`].
 #[must_use]
 pub fn canonical_violation(root: &Bound) -> Option<String> {
     let mut stack = vec![root.clone()];
@@ -823,6 +960,7 @@ pub fn canonical_violation(root: &Bound) -> Option<String> {
         if node.depth() > landav_bound::MAX_DEPTH {
             return Some(format!("depth {} exceeds MAX_DEPTH", node.depth()));
         }
+        let here = node.shape();
         match node.kind() {
             BoundKind::Const(_) => {
                 if node.shape() != BoundShape::Const {
@@ -847,6 +985,9 @@ pub fn canonical_violation(root: &Bound) -> Option<String> {
                         return Some("Sum/Prod operands are not in canonical order".to_owned());
                     }
                 }
+                if let Some(nested) = flatness_violation(here, operands) {
+                    return Some(nested);
+                }
                 stack.extend(operands.iter().cloned());
             }
             BoundKind::Max(terms) => {
@@ -864,6 +1005,9 @@ pub fn canonical_violation(root: &Bound) -> Option<String> {
                                 .to_owned(),
                         );
                     }
+                }
+                if let Some(nested) = flatness_violation(here, operands) {
+                    return Some(nested);
                 }
                 stack.extend(operands.iter().cloned());
             }

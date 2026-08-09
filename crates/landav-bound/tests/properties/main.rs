@@ -41,6 +41,7 @@ mod support;
 mod adversary;
 mod canonical_order;
 mod denotation;
+mod limits;
 mod log_edges;
 mod monotonicity;
 mod omega_totality;

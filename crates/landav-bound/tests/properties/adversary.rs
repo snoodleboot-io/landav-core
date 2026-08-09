@@ -21,8 +21,8 @@
 use std::collections::BTreeMap;
 
 use landav_bound::{
-    Base, Bound, BoundKind, BoundWire, Lifted, Nat, Origin, TotalValuation, VarId, Verdict,
-    WireNode,
+    Base, Bound, BoundError, BoundKind, BoundWire, Lifted, Nat, Origin, TotalValuation, VarId,
+    Verdict, WireNode,
 };
 use proptest::prelude::*;
 
@@ -70,22 +70,51 @@ fn arity_of(bound: &Bound) -> usize {
 fn nary_arity_must_be_budgeted() {
     let limit = usize::try_from(landav_bound::MAX_NODES).unwrap_or(usize::MAX);
     let mut summed = Bound::var("x");
-    let mut refused = false;
+    let mut refused = None;
+    let mut peak = 0usize;
     for _ in 0..40 {
         match Bound::sum_checked([summed.clone(), summed.clone()]) {
             Ok(next) => summed = next,
-            Err(_) => {
-                refused = true;
+            Err(refusal) => {
+                refused = Some(refusal);
                 break;
             }
         }
+        peak = arity_of(&summed);
         assert!(
-            arity_of(&summed) <= limit,
-            "arity {} exceeds the node budget with no error reported",
-            arity_of(&summed)
+            peak <= limit,
+            "arity {peak} exceeds the node budget with no error reported"
         );
     }
-    assert!(refused, "40 doublings produced no budget refusal");
+    assert!(refused.is_some(), "40 doublings produced no budget refusal");
+
+    // **Where** it refused, not merely that it did. Each doubling asks for
+    // twice the previous arity, so the guard is crossed exactly once and the
+    // last accepted arity is the largest one the budget permits. A guard that
+    // fires one step early also "produces a refusal" - and it would make
+    // `MAX_NODES` mean half of what it says, which is a limit the hosted
+    // platform's ingest is documented against.
+    assert_eq!(
+        peak, limit,
+        "the last accepted arity must be exactly MAX_NODES; refusing at {peak} \
+         halves the documented limit"
+    );
+
+    // And the refusal carries the operator and the count it actually made, so
+    // an arity report cannot name the wrong node or an invented number.
+    assert!(
+        matches!(
+            &refused,
+            Some(BoundError::ArityExceeded { op, got, limit: named })
+                if *op == landav_bound::BoundShape::Sum
+                    && *got == 2 * u64::try_from(limit).unwrap_or(u64::MAX)
+                    && *named == landav_bound::MAX_NODES
+        ),
+        "a doubling past MAX_NODES must be ArityExceeded {{ op: Sum, got: {}, limit: {} }}, \
+         not {refused:?}",
+        2 * u64::try_from(limit).unwrap_or(u64::MAX),
+        landav_bound::MAX_NODES
+    );
 }
 
 // ---------------------------------------------------------------------------
