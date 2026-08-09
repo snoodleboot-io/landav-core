@@ -14,15 +14,15 @@ Use this mode when reviewing code for quality, performance, or accessibility iss
 **Read and follow this workflow file:**
 
 ```
-.claude/workflows/accessibility.md
+.claude/workflows/review.md
 ```
 
 This workflow will guide you through:
-- Overview
-- Requirements & Planning
-- Automated Testing
-- Manual Testing
-- Semantic HTML Review
+- Review code against conventions
+- Check test coverage and quality
+- Verify error handling patterns
+- Validate security and access control
+- Audit API contracts
 
 ## Subagents
 
@@ -69,7 +69,7 @@ Skills are reusable capabilities. Load only when workflow requires:
 
 1. **Read the workflow file now:**
    ```
-   Read: .claude/workflows/accessibility.md
+   Read: .claude/workflows/review.md
    ```
 
 2. **Follow the workflow steps sequentially**
