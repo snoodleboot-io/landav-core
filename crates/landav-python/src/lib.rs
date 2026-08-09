@@ -36,25 +36,92 @@
 //!
 //! [`F-005`]: https://linear.app/snoodleboot/issue/LAN-4
 
-#![doc(html_root_url = "https://docs.rs/landav-python")]
+//! # The `LAN-65` contract
+//!
+//! The types below and [`analysis::analyze_source`] are the surface the
+//! `LAN-65` fixture corpus is written against. They were declared by the test
+//! author before any rule existed, which is the point: per `CONTRIBUTING.md`,
+//! the acceptance criteria are encoded by someone other than the implementer
+//! and are not edited to make an implementation pass.
+//!
+//! The implementation lane fills them: [`registry::registry`] declares the
+//! `LAV0xx` rules and [`analysis::analyze_source`] parses the source and runs
+//! them. The contract itself is unchanged — no fixture and no assertion was
+//! edited to make a rule pass, which is the only reading of the corpus that
+//! means anything.
+//!
+//! # Ten rules, not eleven
+//!
+//! `LAV010` (`try`/`except` in a loop) was specified, implemented, and then
+//! **withdrawn**. Its premise is that a never-slower total alternative to the
+//! guarded lookup always exists, and that premise is false: `sqlite3.Row` has
+//! no `.get`, `Element.get` reads an XML attribute rather than a child, and on
+//! a hot dispatch table `.get` costs an attribute lookup and a Python-level
+//! call where `[]` is one opcode. Which of those applies depends on the
+//! receiver's type, which this crate cannot know. The corpus contains a case
+//! that is *structurally identical* to a true positive and is nonetheless
+//! correct code, so no narrowing separates them.
+//!
+//! `MINIMUM_RULE_COUNT` is eight and the specification carried eleven
+//! precisely so that a rule which cannot be made precise can be withdrawn
+//! rather than shipped noisy. Its fixture directory is left in place: deleting
+//! it needs the test author's sign-off, not the implementer's.
 
-// TODO(LAN-4): Quadratic anti-pattern rules over the parsed frontend.
-//
+#![doc(html_root_url = "https://docs.rs/landav-python")]
+#![forbid(unsafe_code)]
+
 // TODO(LAN-25): Implement the six FDK traits once F-043 publishes them at R3.
 // Until then this crate is written against the shape in `landav_fdk`, so that
 // the eventual extraction is a move rather than a redesign.
 
-/// Placeholder so the workspace builds before `LAN-4` lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Unimplemented;
+pub mod analysis;
+pub mod finding;
+pub mod location;
+pub mod python_error;
+pub mod registry;
+pub mod rule;
+pub mod rule_code;
+
+// Internal, and deliberately not `pub`. Everything below is a detail of *how*
+// the rules are decided; publishing it would make the parser choice part of the
+// crate's contract, and F-043 has to be able to swap it at R3 without a
+// breaking change.
+mod context;
+mod patterns;
+mod syntax;
+
+pub use crate::{
+    analysis::analyze_source,
+    finding::Finding,
+    location::Location,
+    python_error::PythonError,
+    registry::{registry, rule, rule_for_code},
+    rule::Rule,
+    rule_code::RuleCode,
+};
+
+/// The lowest rule count `F-005` may ship with.
+///
+/// Acceptance criterion 1 of `LAN-65`. It lives here rather than only inside a
+/// test so that the number is a published fact about the crate: a build that
+/// silently dropped to seven rules is a build whose release notes are wrong,
+/// not merely a build with a failing test.
+pub const MINIMUM_RULE_COUNT: usize = 8;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn workspace_builds() {
-        assert_eq!(Unimplemented, Unimplemented);
+    fn registry_is_sorted_by_code() {
+        let codes: Vec<&str> = registry().iter().map(|rule| rule.code().as_str()).collect();
+        let mut sorted = codes.clone();
+        sorted.sort_unstable();
+        assert_eq!(codes, sorted, "registry() must be in ascending code order");
+    }
+
+    #[test]
+    fn rule_for_code_rejects_an_unknown_code() {
+        assert!(rule_for_code("LAV999").is_none());
     }
 }
