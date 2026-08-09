@@ -101,7 +101,13 @@ pub fn ref_pow(base: u32, exponent: Ref) -> Ref {
 /// *definition* of the ceiling, rather than as any adjustment of a floor.
 #[must_use]
 pub fn ref_ceil_log(base: u32, argument: Ref) -> Ref {
-    let n = argument?.max(1);
+    Some(ceil_log_u64(base, argument?))
+}
+
+/// The least `i` with `base^i >= max(1, argument)`.
+#[must_use]
+pub fn ceil_log_u64(base: u32, argument: u64) -> u64 {
+    let n = argument.max(1);
     let k = u64::from(base);
     let mut acc: u64 = 1;
     let mut i: u64 = 0;
@@ -110,10 +116,174 @@ pub fn ref_ceil_log(base: u32, argument: Ref) -> Ref {
         match acc.checked_mul(k) {
             Some(next) => acc = next,
             // `k^i` exceeded `u64::MAX`, so it certainly reached `n`.
-            None => return Some(i),
+            None => return i,
         }
     }
-    Some(i)
+    i
+}
+
+/// The least `i` with `base^i >= 2^64`, computed in `u128`.
+///
+/// Every [`Ideal::Beyond`] magnitude is at least `2^64`, so this is a valid
+/// **lower** bound on its ceiling log - the direction that keeps the reference
+/// below the implementation, which is the direction soundness is checked in.
+#[must_use]
+pub fn ceil_log_beyond(base: u32) -> u64 {
+    let target: u128 = 1 << 64;
+    let k = u128::from(base);
+    let mut acc: u128 = 1;
+    let mut i: u64 = 0;
+    while acc < target {
+        i += 1;
+        acc *= k;
+    }
+    i
+}
+
+// ---------------------------------------------------------------------------
+// the ideal denotation
+// ---------------------------------------------------------------------------
+
+/// A magnitude in the **ideal** semantics - the function the algebra
+/// over-approximates - computed without saturating at intermediate steps.
+///
+/// # Why three cases and not two
+///
+/// `Beyond` is a magnitude that is *finite but larger than `u64::MAX`*. It
+/// observes as `omega`, but it is **not** `omega`, and the distinction is the
+/// whole reason this type exists.
+///
+/// Saturating multiplication on `N u {omega}` is **not associative**:
+/// `(2 * u64::MAX) * 0` saturates to `omega` and then absorbs to `omega`,
+/// while `2 * (u64::MAX * 0)` is `0`. A left fold with `checked_mul` therefore
+/// gives an n-ary product two different answers for the same multiset of
+/// factors, which is not a semantics at all - `Prod` is commutative, its
+/// operands are held in canonical order, and a reference that depends on the
+/// order they were supplied in cannot be a denotation.
+///
+/// Keeping `Beyond` distinct from `Omega` restores associativity, because a
+/// zero factor annihilates a merely-large one (`Beyond * 0 = 0`) while
+/// `omega` still absorbs unconditionally (`Omega * 0 = Omega`, the LAN-73
+/// rule). All three folds below are then over genuinely associative and
+/// commutative operations, so the reference is a function of the operand
+/// *multiset*, as `Prod` requires.
+///
+/// Saturation happens exactly once, at the observation point
+/// ([`ideal_ref`]) - which is where `Bound::eval` returns a `Nat` and where
+/// the loss of precision is a deliberate, sound, upward rounding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ideal {
+    /// A natural number that fits in `u64`.
+    Fin(u64),
+    /// Finite, but larger than `u64::MAX`.
+    Beyond,
+    /// Unbounded.
+    Omega,
+}
+
+/// Lifts an observed magnitude into the ideal domain.
+#[must_use]
+pub fn ideal_of(r: Ref) -> Ideal {
+    match r {
+        Some(v) => Ideal::Fin(v),
+        None => Ideal::Omega,
+    }
+}
+
+/// Observes an ideal magnitude, saturating `Beyond` to `omega`.
+#[must_use]
+pub fn ideal_ref(i: Ideal) -> Ref {
+    match i {
+        Ideal::Fin(v) => Some(v),
+        Ideal::Beyond | Ideal::Omega => REF_OMEGA,
+    }
+}
+
+/// Ideal addition. Associative and commutative.
+#[must_use]
+pub fn ideal_plus(a: Ideal, b: Ideal) -> Ideal {
+    match (a, b) {
+        (Ideal::Omega, _) | (_, Ideal::Omega) => Ideal::Omega,
+        (Ideal::Beyond, _) | (_, Ideal::Beyond) => Ideal::Beyond,
+        (Ideal::Fin(x), Ideal::Fin(y)) => match x.checked_add(y) {
+            Some(sum) => Ideal::Fin(sum),
+            None => Ideal::Beyond,
+        },
+    }
+}
+
+/// Ideal multiplication. Associative and commutative.
+///
+/// `omega` absorbs unconditionally, including against zero - that is the
+/// frozen LAN-73 rule and it is checked here first. A zero factor then
+/// annihilates everything else, including a `Beyond`, because the product
+/// really is zero and only saturation could have invented an `omega`.
+#[must_use]
+pub fn ideal_times(a: Ideal, b: Ideal) -> Ideal {
+    match (a, b) {
+        (Ideal::Omega, _) | (_, Ideal::Omega) => Ideal::Omega,
+        (Ideal::Fin(0), _) | (_, Ideal::Fin(0)) => Ideal::Fin(0),
+        (Ideal::Beyond, _) | (_, Ideal::Beyond) => Ideal::Beyond,
+        (Ideal::Fin(x), Ideal::Fin(y)) => match x.checked_mul(y) {
+            Some(product) => Ideal::Fin(product),
+            None => Ideal::Beyond,
+        },
+    }
+}
+
+/// Ideal join. Associative and commutative.
+#[must_use]
+pub fn ideal_join(a: Ideal, b: Ideal) -> Ideal {
+    match (a, b) {
+        (Ideal::Omega, _) | (_, Ideal::Omega) => Ideal::Omega,
+        (Ideal::Beyond, _) | (_, Ideal::Beyond) => Ideal::Beyond,
+        (Ideal::Fin(x), Ideal::Fin(y)) => Ideal::Fin(x.max(y)),
+    }
+}
+
+/// `base ^ exponent` in the ideal domain.
+#[must_use]
+pub fn ideal_pow(base: u32, exponent: Ideal) -> Ideal {
+    match exponent {
+        Ideal::Omega => Ideal::Omega,
+        Ideal::Beyond => Ideal::Beyond,
+        Ideal::Fin(e) => {
+            // `base >= 2`, so `base^64 > u64::MAX` - finite, but Beyond.
+            if e >= REFERENCE_MAX_FINITE_EXPONENT {
+                return Ideal::Beyond;
+            }
+            match u32::try_from(e)
+                .ok()
+                .and_then(|narrowed| u64::from(base).checked_pow(narrowed))
+            {
+                Some(value) => Ideal::Fin(value),
+                None => Ideal::Beyond,
+            }
+        }
+    }
+}
+
+/// `ceil(log_base(max(1, argument)))` in the ideal domain.
+#[must_use]
+pub fn ideal_ceil_log(base: u32, argument: Ideal) -> Ideal {
+    match argument {
+        Ideal::Omega => Ideal::Omega,
+        Ideal::Beyond => Ideal::Fin(ceil_log_beyond(base)),
+        Ideal::Fin(v) => Ideal::Fin(ceil_log_u64(base, v)),
+    }
+}
+
+/// `true` iff an observed magnitude soundly over-approximates an ideal one.
+///
+/// `omega` dominates everything. A finite observation must be at least the
+/// ideal value, and may never stand in for a `Beyond` or an `Omega`.
+#[must_use]
+pub fn observed_dominates(observed: Ref, exact: Ideal) -> bool {
+    match (observed, exact) {
+        (None, _) => true,
+        (Some(_), Ideal::Beyond | Ideal::Omega) => false,
+        (Some(got), Ideal::Fin(want)) => got >= want,
+    }
 }
 
 /// Reads a `Nat` without going through `Ord` or `magnitude_cmp`.
@@ -229,27 +399,41 @@ pub fn build(spec: &BoundSpec) -> Bound {
 /// smart constructors to be denotation preserving.
 #[must_use]
 pub fn naive_eval(spec: &BoundSpec, env: &Env) -> Ref {
+    ideal_ref(naive_eval_ideal(spec, env))
+}
+
+/// The naive interpretation in the ideal domain, before the single saturation
+/// at the observation point.
+///
+/// Every fold here is over an associative, commutative operation, so the value
+/// of an n-ary node is a function of its operand **multiset** - which is what
+/// `Sum`, `Max` and `Prod` require, since all three hold their operands in
+/// canonical order and have therefore already forgotten the order they were
+/// supplied in. See [`Ideal`] for why a left fold with `checked_mul` is not
+/// such a function.
+#[must_use]
+pub fn naive_eval_ideal(spec: &BoundSpec, env: &Env) -> Ideal {
     match spec {
-        BoundSpec::Const(r) => *r,
-        BoundSpec::Var(i) => env.value_of(*i),
+        BoundSpec::Const(r) => ideal_of(*r),
+        BoundSpec::Var(i) => ideal_of(env.value_of(*i)),
         BoundSpec::Sum(xs) => xs
             .iter()
-            .map(|x| naive_eval(x, env))
-            .fold(Some(0), ref_plus),
+            .map(|x| naive_eval_ideal(x, env))
+            .fold(Ideal::Fin(0), ideal_plus),
         BoundSpec::Max(xs) => xs
             .iter()
-            .map(|x| naive_eval(x, env))
-            .fold(Some(0), ref_join),
+            .map(|x| naive_eval_ideal(x, env))
+            .fold(Ideal::Fin(0), ideal_join),
         BoundSpec::Prod(xs) => xs
             .iter()
-            .map(|x| naive_eval(x, env))
-            .fold(Some(1), ref_times),
+            .map(|x| naive_eval_ideal(x, env))
+            .fold(Ideal::Fin(1), ideal_times),
         BoundSpec::Trans { log, base, arg } => {
-            let inner = naive_eval(arg, env);
+            let inner = naive_eval_ideal(arg, env);
             if *log {
-                ref_ceil_log(*base, inner)
+                ideal_ceil_log(*base, inner)
             } else {
-                ref_pow(*base, inner)
+                ideal_pow(*base, inner)
             }
         }
     }

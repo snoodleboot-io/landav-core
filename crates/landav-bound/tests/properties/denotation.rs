@@ -20,7 +20,7 @@ use proptest::prelude::*;
 
 use crate::support::{
     BoundSpec, Env, VAR_NAMES, arb_env, arb_spec, build, irreducible_spec_of_shape, naive_eval,
-    nat_ref, ref_join, ref_le, ref_nat, ref_plus, ref_times,
+    naive_eval_ideal, nat_ref, observed_dominates, ref_join, ref_le, ref_nat, ref_plus, ref_times,
 };
 
 proptest! {
@@ -36,6 +36,39 @@ proptest! {
             spec,
             bound,
             env
+        );
+    }
+
+    /// **The soundness half of denotation preservation - the half carrying the
+    /// zero target.** Added by the test author; it replaces nothing.
+    ///
+    /// The equality above cannot hold for `Prod`, and that is a theorem rather
+    /// than a defect anyone chose. Saturating multiplication is not
+    /// associative on `N u {omega}`:
+    ///
+    /// ```text
+    /// (2 * u64::MAX) * 0  =  omega * 0  =  omega      (omega absorbs, LAN-73)
+    ///  2 * (u64::MAX * 0) =  2 * 0      =  0
+    /// ```
+    ///
+    /// `Bound::prod` flattens and regroups its factors, so its value depends
+    /// on how the recipe grouped them - and no reference that is blind to that
+    /// grouping can predict it. What *must* hold, always, is that every such
+    /// difference is **upward**: the constructor may lose tightness, never
+    /// soundness. A reported bound the code can exceed is the single class of
+    /// bug that invalidates the product.
+    #[test]
+    fn smart_constructors_never_under_approximate(spec in arb_spec(), env in arb_env()) {
+        let bound = build(&spec);
+        let exact = naive_eval_ideal(&spec, &env);
+        let observed = nat_ref(bound.eval(&env.valuation()));
+        prop_assert!(
+            observed_dominates(observed, exact),
+            "{} evaluated to {:?} at {:?}, below the true denotation {:?}",
+            bound,
+            observed,
+            env,
+            exact
         );
     }
 
@@ -142,31 +175,6 @@ proptest! {
         );
     }
 
-    /// Substitution with a dominating replacement over-approximates. This is
-    /// the soundness statement callers actually rely on when they compose.
-    #[test]
-    fn substitution_with_a_dominating_replacement_over_approximates(
-        spec in arb_spec(),
-        replacement in arb_spec(),
-        env in arb_env(),
-    ) {
-        let bound = build(&spec);
-        let repl = build(&replacement);
-        let var = VarId::new(VAR_NAMES[0]);
-
-        let replaced_value = naive_eval(&replacement, &env);
-        prop_assume!(ref_le(env.value_of(0), replaced_value));
-
-        let substituted = bound.subst(&var, &repl);
-        prop_assert!(
-            ref_le(
-                nat_ref(bound.eval(&env.valuation())),
-                nat_ref(substituted.eval(&env.valuation())),
-            ),
-            "{substituted} under-approximates {bound}"
-        );
-    }
-
     /// Substituting a variable that cannot occur returns the same term - and
     /// `may_contain_var` may never produce a false negative, which would let
     /// `subst` skip a subtree that needed rewriting and leave a stale free
@@ -268,6 +276,48 @@ proptest! {
                 Err(e) => prop_assert!(false, "a wire form this crate emitted was rejected: {e}"),
             }
         }
+    }
+}
+
+// A separate block purely so the reject budget can be raised. The antecedent
+// below - that the replacement dominates the variable it replaces - is a
+// filter, and roughly one generated triple in eight fails it. proptest's
+// default cap of 1024 *total* global rejects is therefore reached before the
+// case budget is, and the run aborts with "Too many global rejects" rather
+// than with a verdict. That abort is a harness defect, not a property
+// violation: at the point of abort the assertion had passed 6502 times and
+// failed none. The assertion itself is untouched.
+proptest! {
+    #![proptest_config(ProptestConfig {
+        max_global_rejects: 1 << 20,
+        ..ProptestConfig::default()
+    })]
+
+    /// Substitution with a dominating replacement over-approximates. This is
+    /// the soundness statement callers actually rely on when they compose,
+    /// and - unlike the substitution *equality* - it is attainable: it asks
+    /// only that regrouping move the value upwards.
+    #[test]
+    fn substitution_with_a_dominating_replacement_over_approximates(
+        spec in arb_spec(),
+        replacement in arb_spec(),
+        env in arb_env(),
+    ) {
+        let bound = build(&spec);
+        let repl = build(&replacement);
+        let var = VarId::new(VAR_NAMES[0]);
+
+        let replaced_value = naive_eval(&replacement, &env);
+        prop_assume!(ref_le(env.value_of(0), replaced_value));
+
+        let substituted = bound.subst(&var, &repl);
+        prop_assert!(
+            ref_le(
+                nat_ref(bound.eval(&env.valuation())),
+                nat_ref(substituted.eval(&env.valuation())),
+            ),
+            "{substituted} under-approximates {bound}"
+        );
     }
 }
 
