@@ -1,0 +1,162 @@
+[
+  {
+    "diff": "--- crates/landav-bound/src/base.rs\n+++ replace Base::get -> u32 with 0\n@@ -41,17 +41,17 @@\n             return Err(BoundError::BaseTooSmall { got: k });\n         }\n         Ok(Self(k))\n     }\n \n     /// The validated base, always `>= 2`.\n     #[must_use]\n     pub const fn get(self) -> u32 {\n-        self.0\n+        0 /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl TryFrom<u32> for Base {\n     type Error = BoundError;\n \n     fn try_from(k: u32) -> Result<Self, Self::Error> {\n         Self::new(k)\n",
+    "file": "crates/landav-bound/src/base.rs",
+    "function": {
+      "function_name": "Base::get",
+      "return_type": "-> u32",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 50
+        },
+        "start": {
+          "column": 5,
+          "line": 46
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/landav-bound/src/base.rs:49:9: replace Base::get -> u32 with 0",
+    "package": "landav-bound",
+    "replacement": "0",
+    "span": {
+      "end": {
+        "column": 15,
+        "line": 49
+      },
+      "start": {
+        "column": 9,
+        "line": 49
+      }
+    }
+  },
+  {
+    "diff": "--- crates/landav-bound/src/base.rs\n+++ replace Base::get -> u32 with 1\n@@ -41,17 +41,17 @@\n             return Err(BoundError::BaseTooSmall { got: k });\n         }\n         Ok(Self(k))\n     }\n \n     /// The validated base, always `>= 2`.\n     #[must_use]\n     pub const fn get(self) -> u32 {\n-        self.0\n+        1 /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl TryFrom<u32> for Base {\n     type Error = BoundError;\n \n     fn try_from(k: u32) -> Result<Self, Self::Error> {\n         Self::new(k)\n",
+    "file": "crates/landav-bound/src/base.rs",
+    "function": {
+      "function_name": "Base::get",
+      "return_type": "-> u32",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 50
+        },
+        "start": {
+          "column": 5,
+          "line": 46
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/landav-bound/src/base.rs:49:9: replace Base::get -> u32 with 1",
+    "package": "landav-bound",
+    "replacement": "1",
+    "span": {
+      "end": {
+        "column": 15,
+        "line": 49
+      },
+      "start": {
+        "column": 9,
+        "line": 49
+      }
+    }
+  },
+  {
+    "diff": "--- crates/landav-bound/src/base.rs\n+++ replace <impl TryFrom<u32> for Base>::try_from -> Result<Self, Self::Error> with Ok(Default::default())\n@@ -49,17 +49,17 @@\n         self.0\n     }\n }\n \n impl TryFrom<u32> for Base {\n     type Error = BoundError;\n \n     fn try_from(k: u32) -> Result<Self, Self::Error> {\n-        Self::new(k)\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl Canonical for Base {\n     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {\n         self.0.cmp(&other.0)\n     }\n \n",
+    "file": "crates/landav-bound/src/base.rs",
+    "function": {
+      "function_name": "<impl TryFrom<u32> for Base>::try_from",
+      "return_type": "-> Result<Self, Self::Error>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 58
+        },
+        "start": {
+          "column": 5,
+          "line": 56
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/landav-bound/src/base.rs:57:9: replace <impl TryFrom<u32> for Base>::try_from -> Result<Self, Self::Error> with Ok(Default::default())",
+    "package": "landav-bound",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 21,
+        "line": 57
+      },
+      "start": {
+        "column": 9,
+        "line": 57
+      }
+    }
+  },
+  {
+    "diff": "--- crates/landav-bound/src/base.rs\n+++ replace <impl Canonical for Base>::canonical_cmp -> core::cmp::Ordering with Default::default()\n@@ -55,15 +55,15 @@\n \n     fn try_from(k: u32) -> Result<Self, Self::Error> {\n         Self::new(k)\n     }\n }\n \n impl Canonical for Base {\n     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {\n-        self.0.cmp(&other.0)\n+        Default::default() /* ~ changed by cargo-mutants ~ */\n     }\n \n     fn write_canonical(&self, out: &mut Vec<u8>) {\n         out.extend_from_slice(&self.0.to_be_bytes());\n     }\n }\n",
+    "file": "crates/landav-bound/src/base.rs",
+    "function": {
+      "function_name": "<impl Canonical for Base>::canonical_cmp",
+      "return_type": "-> core::cmp::Ordering",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 64
+        },
+        "start": {
+          "column": 5,
+          "line": 62
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/landav-bound/src/base.rs:63:9: replace <impl Canonical for Base>::canonical_cmp -> core::cmp::Ordering with Default::default()",
+    "package": "landav-bound",
+    "replacement": "Default::default()",
+    "span": {
+      "end": {
+        "column": 29,
+        "line": 63
+      },
+      "start": {
+        "column": 9,
+        "line": 63
+      }
+    }
+  },
+  {
+    "diff": "--- crates/landav-bound/src/base.rs\n+++ replace <impl Canonical for Base>::write_canonical with ()\n@@ -59,11 +59,11 @@\n }\n \n impl Canonical for Base {\n     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {\n         self.0.cmp(&other.0)\n     }\n \n     fn write_canonical(&self, out: &mut Vec<u8>) {\n-        out.extend_from_slice(&self.0.to_be_bytes());\n+        () /* ~ changed by cargo-mutants ~ */\n     }\n }\n",
+    "file": "crates/landav-bound/src/base.rs",
+    "function": {
+      "function_name": "<impl Canonical for Base>::write_canonical",
+      "return_type": "",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 68
+        },
+        "start": {
+          "column": 5,
+          "line": 66
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/landav-bound/src/base.rs:67:9: replace <impl Canonical for Base>::write_canonical with ()",
+    "package": "landav-bound",
+    "replacement": "()",
+    "span": {
+      "end": {
+        "column": 54,
+        "line": 67
+      },
+      "start": {
+        "column": 9,
+        "line": 67
+      }
+    }
+  }
+]

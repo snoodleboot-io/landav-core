@@ -1,0 +1,2 @@
+crates/landav-bound/src/base.rs:57:9: replace <impl TryFrom<u32> for Base>::try_from -> Result<Self, Self::Error> with Ok(Default::default())
+crates/landav-bound/src/base.rs:63:9: replace <impl Canonical for Base>::canonical_cmp -> core::cmp::Ordering with Default::default()

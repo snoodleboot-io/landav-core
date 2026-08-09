@@ -189,6 +189,20 @@ impl Nat {
         let mut exponent: u64 = 0;
         while reached < target {
             exponent = exponent.saturating_add(1);
+            // Termination does not depend on `Base >= 2` being upheld in
+            // another file by another type. At `k >= 2` the accumulator at
+            // least doubles, so this cannot trip; at `k <= 1` it never grows
+            // and the loop would run forever. Mutation testing found exactly
+            // that - `Base::get -> 0` and `-> 1` both hung for the full
+            // 120-second budget rather than failing an assertion.
+            //
+            // Returning omega is a sound over-approximation: too high is
+            // looseness, too low is the one class of bug that invalidates the
+            // product. And a hang is worse than either, because a process that
+            // never exits produces no exit code at all.
+            if exponent > Self::MAX_FINITE_EXPONENT {
+                return Self::OMEGA;
+            }
             match reached.checked_mul(k) {
                 Some(next) => reached = next,
                 // `base^exponent` exceeded `u64::MAX`, so it certainly

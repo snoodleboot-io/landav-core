@@ -1,0 +1,347 @@
+{
+  "outcomes": [
+    {
+      "scenario": "Baseline",
+      "summary": "Success",
+      "log_path": "log/baseline.log",
+      "diff_path": null,
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 15.699180793,
+          "process_status": "Success",
+          "argv": [
+            "/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=landav-bound@0.0.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 6.673106091,
+          "process_status": "Success",
+          "argv": [
+            "/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=landav-bound@0.0.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/landav-bound/src/base.rs:49:9: replace Base::get -> u32 with 0",
+          "package": "landav-bound",
+          "file": "crates/landav-bound/src/base.rs",
+          "function": {
+            "function_name": "Base::get",
+            "return_type": "-> u32",
+            "span": {
+              "start": {
+                "line": 46,
+                "column": 5
+              },
+              "end": {
+                "line": 50,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 49,
+              "column": 9
+            },
+            "end": {
+              "line": 49,
+              "column": 15
+            }
+          },
+          "replacement": "0",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__landav-bound__src__base.rs_line_49_col_9.log",
+      "diff_path": "diff/crates__landav-bound__src__base.rs_line_49_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.278888193,
+          "process_status": "Success",
+          "argv": [
+            "/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=landav-bound@0.0.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.260083352,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=landav-bound@0.0.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/landav-bound/src/base.rs:67:9: replace <impl Canonical for Base>::write_canonical with ()",
+          "package": "landav-bound",
+          "file": "crates/landav-bound/src/base.rs",
+          "function": {
+            "function_name": "<impl Canonical for Base>::write_canonical",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 66,
+                "column": 5
+              },
+              "end": {
+                "line": 68,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 67,
+              "column": 9
+            },
+            "end": {
+              "line": 67,
+              "column": 54
+            }
+          },
+          "replacement": "()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__landav-bound__src__base.rs_line_67_col_9.log",
+      "diff_path": "diff/crates__landav-bound__src__base.rs_line_67_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.3456036860000005,
+          "process_status": "Success",
+          "argv": [
+            "/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=landav-bound@0.0.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 18.081346527,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=landav-bound@0.0.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/landav-bound/src/base.rs:57:9: replace <impl TryFrom<u32> for Base>::try_from -> Result<Self, Self::Error> with Ok(Default::default())",
+          "package": "landav-bound",
+          "file": "crates/landav-bound/src/base.rs",
+          "function": {
+            "function_name": "<impl TryFrom<u32> for Base>::try_from",
+            "return_type": "-> Result<Self, Self::Error>",
+            "span": {
+              "start": {
+                "line": 56,
+                "column": 5
+              },
+              "end": {
+                "line": 58,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 57,
+              "column": 9
+            },
+            "end": {
+              "line": 57,
+              "column": 21
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__landav-bound__src__base.rs_line_57_col_9.log",
+      "diff_path": "diff/crates__landav-bound__src__base.rs_line_57_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 29.800858806,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=landav-bound@0.0.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/landav-bound/src/base.rs:63:9: replace <impl Canonical for Base>::canonical_cmp -> core::cmp::Ordering with Default::default()",
+          "package": "landav-bound",
+          "file": "crates/landav-bound/src/base.rs",
+          "function": {
+            "function_name": "<impl Canonical for Base>::canonical_cmp",
+            "return_type": "-> core::cmp::Ordering",
+            "span": {
+              "start": {
+                "line": 62,
+                "column": 5
+              },
+              "end": {
+                "line": 64,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 63,
+              "column": 9
+            },
+            "end": {
+              "line": 63,
+              "column": 29
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__landav-bound__src__base.rs_line_63_col_9.log",
+      "diff_path": "diff/crates__landav-bound__src__base.rs_line_63_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 32.087942374,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=landav-bound@0.0.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/landav-bound/src/base.rs:49:9: replace Base::get -> u32 with 1",
+          "package": "landav-bound",
+          "file": "crates/landav-bound/src/base.rs",
+          "function": {
+            "function_name": "Base::get",
+            "return_type": "-> u32",
+            "span": {
+              "start": {
+                "line": 46,
+                "column": 5
+              },
+              "end": {
+                "line": 50,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 49,
+              "column": 9
+            },
+            "end": {
+              "line": 49,
+              "column": 15
+            }
+          },
+          "replacement": "1",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__landav-bound__src__base.rs_line_49_col_9_001.log",
+      "diff_path": "diff/crates__landav-bound__src__base.rs_line_49_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 34.905837074,
+          "process_status": "Success",
+          "argv": [
+            "/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=landav-bound@0.0.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.102151988,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=landav-bound@0.0.0"
+          ]
+        }
+      ]
+    }
+  ],
+  "total_mutants": 5,
+  "missed": 0,
+  "caught": 3,
+  "timeout": 0,
+  "unviable": 2,
+  "success": 0,
+  "start_time": "2026-08-09T16:15:14.142948644Z",
+  "end_time": "2026-08-09T16:16:11.80730827Z",
+  "cargo_mutants_version": "27.1.0"
+}

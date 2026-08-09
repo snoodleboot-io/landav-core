@@ -1,0 +1,162 @@
+
+*** crates/landav-bound/src/base.rs:49:9: replace Base::get -> u32 with 0
+
+*** mutation diff:
+--- crates/landav-bound/src/base.rs
++++ replace Base::get -> u32 with 0
+@@ -41,17 +41,17 @@
+             return Err(BoundError::BaseTooSmall { got: k });
+         }
+         Ok(Self(k))
+     }
+ 
+     /// The validated base, always `>= 2`.
+     #[must_use]
+     pub const fn get(self) -> u32 {
+-        self.0
++        0 /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ impl TryFrom<u32> for Base {
+     type Error = BoundError;
+ 
+     fn try_from(k: u32) -> Result<Self, Self::Error> {
+         Self::new(k)
+
+
+*** /home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=landav-bound@0.0.0
+       Fresh libc v0.2.189
+       Fresh cfg-if v1.0.4
+       Fresh unicode-ident v1.0.24
+       Fresh bitflags v2.13.1
+       Fresh proc-macro2 v1.0.107
+       Fresh linux-raw-sys v0.12.1
+       Fresh autocfg v1.5.1
+       Fresh quote v1.0.47
+       Fresh getrandom v0.3.4
+       Fresh rustix v1.1.4
+       Fresh zerocopy v0.8.56
+       Fresh getrandom v0.4.3
+       Fresh fastrand v2.5.0
+       Fresh syn v3.0.3
+       Fresh rand_core v0.9.5
+       Fresh once_cell v1.21.4
+       Fresh ppv-lite86 v0.2.21
+       Fresh serde_core v1.0.229
+       Fresh wait-timeout v0.2.1
+       Fresh tempfile v3.27.0
+       Fresh thiserror-impl v2.0.20
+       Fresh serde_derive v1.0.229
+       Fresh quick-error v1.2.3
+       Fresh fnv v1.0.7
+       Fresh bit-vec v0.8.0
+       Fresh rand_chacha v0.9.0
+       Fresh num-traits v0.2.19
+       Fresh rusty-fork v0.3.1
+       Fresh bit-set v0.8.0
+       Fresh serde v1.0.229
+       Fresh thiserror v2.0.20
+       Fresh rand v0.9.5
+       Fresh rand_xorshift v0.4.0
+       Fresh regex-syntax v0.8.11
+       Fresh unarray v0.1.4
+       Fresh proptest v1.11.0
+       Dirty landav-bound v0.0.0 (/tmp/cargo-mutants-landav-core-8nLWJU.tmp/crates/landav-bound): the file `crates/landav-bound/src/base.rs` has changed (1786292136.555507871s, 14s after last build at 1786292122.090543271s)
+   Compiling landav-bound v0.0.0 (/tmp/cargo-mutants-landav-core-8nLWJU.tmp/crates/landav-bound)
+     Running `/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name landav_bound --edition=2024 crates/landav-bound/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::unwrap_used' --forbid=unsafe_code '--warn=clippy::panic' --warn=missing_docs '--warn=clippy::expect_used' '--deny=clippy::cast_sign_loss' '--deny=clippy::cast_possible_truncation' --test --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "laws"))' -C metadata=3a5ed246955abad5 -C extra-filename=-64e2655cb73b6c2f --out-dir /tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps --extern proptest=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libproptest-42639fde807c5120.rlib --extern serde=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libserde-19069e741e4dec19.rlib --extern thiserror=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libthiserror-0095ebf214e71f49.rlib`
+     Running `/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name landav_bound --edition=2024 crates/landav-bound/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::unwrap_used' --forbid=unsafe_code '--warn=clippy::panic' --warn=missing_docs '--warn=clippy::expect_used' '--deny=clippy::cast_sign_loss' '--deny=clippy::cast_possible_truncation' --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "laws"))' -C metadata=870e1f92fe15bfae -C extra-filename=-92eae8267b625b90 --out-dir /tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps --extern serde=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libserde-19069e741e4dec19.rmeta --extern thiserror=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libthiserror-0095ebf214e71f49.rmeta`
+     Running `/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name properties --edition=2024 crates/landav-bound/tests/properties/main.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::unwrap_used' --forbid=unsafe_code '--warn=clippy::panic' --warn=missing_docs '--warn=clippy::expect_used' '--deny=clippy::cast_sign_loss' '--deny=clippy::cast_possible_truncation' --test --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "laws"))' -C metadata=a032fa1dc989b775 -C extra-filename=-1136f4ba376d21d6 --out-dir /tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps --extern landav_bound=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/liblandav_bound-92eae8267b625b90.rlib --extern proptest=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libproptest-42639fde807c5120.rlib --extern serde=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libserde-19069e741e4dec19.rlib --extern thiserror=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libthiserror-0095ebf214e71f49.rlib`
+     Running `/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name frozen_invariants --edition=2024 crates/landav-bound/tests/frozen_invariants.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::unwrap_used' --forbid=unsafe_code '--warn=clippy::panic' --warn=missing_docs '--warn=clippy::expect_used' '--deny=clippy::cast_sign_loss' '--deny=clippy::cast_possible_truncation' --test --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "laws"))' -C metadata=173ab37a75e61381 -C extra-filename=-4fc74f03a650452c --out-dir /tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps --extern landav_bound=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/liblandav_bound-92eae8267b625b90.rlib --extern proptest=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libproptest-42639fde807c5120.rlib --extern serde=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libserde-19069e741e4dec19.rlib --extern thiserror=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libthiserror-0095ebf214e71f49.rlib`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.23s
+  Executable `/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/landav_bound-64e2655cb73b6c2f`
+  Executable `/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/frozen_invariants-4fc74f03a650452c`
+  Executable `/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/properties-1136f4ba376d21d6`
+
+*** result: Success
+
+*** /home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo test --verbose --package=landav-bound@0.0.0
+       Fresh libc v0.2.189
+       Fresh cfg-if v1.0.4
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh syn v3.0.3
+       Fresh getrandom v0.3.4
+       Fresh rand_core v0.9.5
+       Fresh bitflags v2.13.1
+       Fresh linux-raw-sys v0.12.1
+       Fresh autocfg v1.5.1
+       Fresh rustix v1.1.4
+       Fresh getrandom v0.4.3
+       Fresh zerocopy v0.8.56
+       Fresh fastrand v2.5.0
+       Fresh once_cell v1.21.4
+       Fresh tempfile v3.27.0
+       Fresh ppv-lite86 v0.2.21
+       Fresh serde_core v1.0.229
+       Fresh thiserror-impl v2.0.20
+       Fresh serde_derive v1.0.229
+       Fresh wait-timeout v0.2.1
+       Fresh quick-error v1.2.3
+       Fresh fnv v1.0.7
+       Fresh bit-vec v0.8.0
+       Fresh bit-set v0.8.0
+       Fresh rusty-fork v0.3.1
+       Fresh serde v1.0.229
+       Fresh thiserror v2.0.20
+       Fresh num-traits v0.2.19
+       Fresh rand_chacha v0.9.0
+       Fresh rand_xorshift v0.4.0
+       Fresh rand v0.9.5
+       Fresh regex-syntax v0.8.11
+       Fresh unarray v0.1.4
+       Fresh proptest v1.11.0
+       Fresh landav-bound v0.0.0 (/tmp/cargo-mutants-landav-core-8nLWJU.tmp/crates/landav-bound)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running `/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/landav_bound-64e2655cb73b6c2f`
+
+running 2 tests
+test registry::frozen_registry::resource_surface_is_pinned ... ok
+test bound_shape::frozen_tags::tags_are_pinned ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running `/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/frozen_invariants-4fc74f03a650452c`
+
+running 7 tests
+test an_n_ary_node_is_never_empty ... ok
+test structural_equality_holds_on_the_shape_that_needs_it ... ok
+test the_base_constants_agree_with_the_checked_path ... FAILED
+test base_refuses_every_value_that_would_make_ceil_log_diverge ... ok
+test a_validated_base_reports_the_value_it_was_validated_from ... FAILED
+test leaf_equality_separates_the_meaning_critical_values ... ok
+test operand_count_is_reported_honestly ... ok
+
+failures:
+
+---- the_base_constants_agree_with_the_checked_path stdout ----
+
+thread 'the_base_constants_agree_with_the_checked_path' (1418125) panicked at crates/landav-bound/tests/frozen_invariants.rs:84:5:
+assertion `left == right` failed
+  left: 0
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_validated_base_reports_the_value_it_was_validated_from stdout ----
+
+thread 'a_validated_base_reports_the_value_it_was_validated_from' (1418119) panicked at crates/landav-bound/tests/frozen_invariants.rs:72:9:
+assertion `left == right` failed: Base::new(2) must be accepted and must report 2 back
+  left: Some(0)
+ right: Some(2)
+
+
+failures:
+    a_validated_base_reports_the_value_it_was_validated_from
+    the_base_constants_agree_with_the_checked_path
+
+test result: FAILED. 5 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p landav-bound --test frozen_invariants`
+
+*** result: Failure(101)
