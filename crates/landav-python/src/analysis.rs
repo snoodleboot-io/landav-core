@@ -12,7 +12,7 @@ use crate::{
     syntax::{LineIndex, MAX_EXPRESSION_DEPTH, MAX_NESTING_DEPTH, nesting_overflow},
 };
 
-/// Runs every rule in [`crate::registry`] over one Python source file.
+/// Runs every rule in [`crate::registry()`] over one Python source file.
 ///
 /// `path` is not read; it is the label stamped into every
 /// [`crate::Location`]. Callers that already have the source in memory — the
