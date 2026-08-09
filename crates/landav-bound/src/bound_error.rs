@@ -52,6 +52,45 @@ pub enum BoundError {
         limit: u32,
     },
 
+    /// An n-ary node was given more operands than [`crate::MAX_NODES`] allows
+    /// nodes.
+    ///
+    /// Separate from [`BoundError::DepthExceeded`] and
+    /// [`BoundError::NodeBudgetExceeded`] because neither of them can see it:
+    /// `b = op([b, b])` flattens the child into the parent, so the operand
+    /// vector *doubles* while the depth stays at 2 and the DAG stays at two
+    /// distinct nodes. Forty such calls ask for a `Vec` of `2^40` handles, and
+    /// a `Vec` that cannot grow calls `handle_alloc_error`, which **aborts** -
+    /// a failure mode `#![forbid(unsafe_code)]`, `unwrap_used` and `panic`
+    /// cannot see.
+    #[error("`{op}` was given {got} operands, exceeding the {limit} operand budget")]
+    ArityExceeded {
+        /// Which operator.
+        op: BoundShape,
+        /// How many operands were supplied, after flattening.
+        got: u64,
+        /// The limit that was exceeded.
+        limit: u32,
+    },
+
+    /// A term's expansion as a *tree* exceeds [`crate::MAX_NODES`].
+    ///
+    /// Distinct from [`BoundError::NodeBudgetExceeded`], which counts the
+    /// *distinct* nodes of the DAG. A wire document of fifty nodes, inside
+    /// every other budget, can rebuild a term whose tree is `2^24` nodes;
+    /// [`crate::Bound::canonical_bytes`] and the other observers are
+    /// memoised over the shared nodes, but [`std::fmt::Display`] still
+    /// renders the tree, so untrusted input is measured against the tree it
+    /// is about to materialise rather than against the document that carries
+    /// it.
+    #[error("bound expands to {got} tree nodes, exceeding the {limit} node budget")]
+    TreeSizeExceeded {
+        /// The tree size, saturating at `u64::MAX`.
+        got: u64,
+        /// The limit that was exceeded.
+        limit: u32,
+    },
+
     /// `--resource` was given a value that is not registered.
     #[error("unknown resource `{got}`; registered resources are: {}", known.join(", "))]
     UnknownResource {

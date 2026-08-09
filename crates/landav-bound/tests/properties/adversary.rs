@@ -105,7 +105,6 @@ fn nary_arity_doubles_per_call_and_no_budget_stops_it() {
 /// operands than [`landav_bound::MAX_NODES`] allows nodes, because a term with
 /// more operands than that has no wire form and no observer that terminates.
 #[test]
-#[ignore = "BLOCKER: n-ary arity is unbudgeted; this is the property that should hold"]
 fn nary_arity_must_be_budgeted() {
     let limit = usize::try_from(landav_bound::MAX_NODES).unwrap_or(usize::MAX);
     let mut summed = Bound::var("x");
@@ -213,7 +212,6 @@ fn every_observer_is_exponential_in_a_shared_dag() {
 /// The statement: the canonical encoding of a term must be bounded by its DAG
 /// size, not by its tree size. A 42-node DAG must not produce 40 MB of bytes.
 #[test]
-#[ignore = "BLOCKER: observers walk the tree, not the DAG; this is the property that should hold"]
 fn observers_must_be_polynomial_in_the_dag() {
     let bound = shared_ladder(20);
     let nodes = usize::try_from(bound.wire_node_count()).unwrap_or(usize::MAX);
