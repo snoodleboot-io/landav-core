@@ -25,7 +25,7 @@ pub struct CacheKeyMaterial(Vec<u8>);
 impl CacheKeyMaterial {
     /// Builds the key material for `bound` under `resource`.
     #[must_use]
-    pub fn new(resource: ResourceId, bound: &Bound) -> Self {
+    pub fn new(_resource: ResourceId, _bound: &Bound) -> Self {
         todo!()
     }
 

@@ -24,11 +24,17 @@
 //! derived, denotation-preserving smart constructors, and a `Verdict` that
 //! refuses to publish an unblamed `omega`.
 //!
-//! # These tests are written against the frozen signatures, before the bodies
+//! # These tests were written against the frozen signatures, before the bodies
 //!
-//! Every body in `landav-bound` is `todo!()` at the time of writing, so this
-//! suite is expected to fail. That red state is the point: a property that
-//! only exists after the code it judges has a way of agreeing with it.
+//! Every body in `landav-bound` was `todo!()` when this suite was written, so
+//! it started red on purpose: a property that only exists after the code it
+//! judges has a way of agreeing with it.
+//!
+//! **It is green now, and green is the expectation.** The note that used to
+//! stand here said the suite "is expected to fail", which outlived the
+//! condition that made it true — and a red-is-expected note on a suite that
+//! passes is exactly how a genuinely red suite gets waved through. A failure
+//! below is a soundness defect in the algebra, not a milestone artefact.
 
 mod support;
 
