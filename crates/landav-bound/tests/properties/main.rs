@@ -32,6 +32,7 @@
 
 mod support;
 
+mod adversary;
 mod canonical_order;
 mod denotation;
 mod log_edges;
