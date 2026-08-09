@@ -55,12 +55,19 @@ struct Node {
 /// enforced, not merely documented - the following does not compile:
 ///
 /// ```compile_fail
-/// use landav_bound_frozen::{Bound, Lifted};
+/// use landav_bound::{Bound, Lifted};
 /// let a = Lifted::Elem(Bound::omega());
 /// let b = Lifted::Elem(Bound::var("x"));
 /// // `Lifted<Bound>: !Ord`, because `Bound: !Ord`.
 /// let _joined = a.max(b);
 /// ```
+///
+/// A `compile_fail` doctest passes whenever the snippet fails to compile, for
+/// *any* reason - so it is only worth as much as its imports. Keep the crate
+/// name and both paths above correct: if they ever go stale this assertion
+/// silently stops testing anything, which is exactly what it exists to prevent.
+/// `Lifted<Nat>` *is* `Ord`; swapping `Bound` for `Nat` above must make this
+/// doctest fail, and that is the check that it still bites.
 ///
 /// There is no `Default` either: a default `Bound` would have to be `Const(0)`
 /// or `Const(omega)`, and both are meaning-critical values that must never
