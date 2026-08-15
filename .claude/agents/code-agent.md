@@ -14,15 +14,15 @@ Use this mode when implementing new features, making code changes, or fixing bug
 **Read and follow this workflow file:**
 
 ```
-.claude/workflows/boilerplate.md
+.claude/workflows/code.md
 ```
 
 This workflow will guide you through:
 - Overview
-- Pattern Recognition
-- Study Existing Code
-- Template Creation
-- Parameterization
+- Pre-Implementation Analysis
+- Read Existing Code
+- Follow Conventions
+- Inline Comments - Comment WHY, Not WHAT
 
 ## Subagents
 
@@ -70,7 +70,7 @@ Skills are reusable capabilities. Load only when workflow requires:
 
 1. **Read the workflow file now:**
    ```
-   Read: .claude/workflows/boilerplate.md
+   Read: .claude/workflows/code.md
    ```
 
 2. **Follow the workflow steps sequentially**

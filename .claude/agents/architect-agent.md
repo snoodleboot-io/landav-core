@@ -14,13 +14,15 @@ Use this mode for system design, architecture planning, or making technical deci
 **Read and follow this workflow file:**
 
 ```
-.claude/workflows/data-model.md
+.claude/workflows/decision-log.md
 ```
 
 This workflow will guide you through:
-- Steps
-- Common Mistakes
-- Examples
+- Overview
+- Context Gathering
+- ADR Creation
+- Writing Best Practices
+- Review and Approval
 
 ## Subagents
 
@@ -76,7 +78,7 @@ Skills are reusable capabilities. Load only when workflow requires:
 
 1. **Read the workflow file now:**
    ```
-   Read: .claude/workflows/data-model.md
+   Read: .claude/workflows/decision-log.md
    ```
 
 2. **Follow the workflow steps sequentially**

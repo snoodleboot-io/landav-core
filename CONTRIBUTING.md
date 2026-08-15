@@ -66,6 +66,36 @@ property-tested rather than example-tested — weak monotonicity and
 composition-by-substitution soundness are properties, and a handful of examples
 will not catch a violation.
 
+#### Required tools
+
+```sh
+cargo install cargo-llvm-cov --locked --version 0.8.7   # line/branch/function coverage
+cargo install cargo-mutants  --locked --version 27.1.0  # mutation coverage
+```
+
+Pin both. An unpinned tool makes the coverage and mutation gates drift between
+your machine and CI, and a gate that means something different in two places is
+not a gate.
+
+`cargo-mutants` matters more here than on a typical project: **a surviving
+mutant means the property set is too weak**, whatever line coverage claims. On
+an analyser whose central promise is soundness, that distinction is the whole
+point.
+
+#### Property tests are owned by the test author
+
+Property tests under `tests/properties/` encode the acceptance criteria. They
+are written **before** the implementation and **by someone other than the
+implementer**.
+
+**If you are implementing a feature, do not edit its property tests to make them
+pass.** Weakening a property needs sign-off from whoever wrote it. Without that
+rule the property quietly softens until the code passes, and a zero-target
+metric becomes decorative.
+
+If a property is genuinely wrong, say so and get it changed deliberately — that
+is a real outcome, and it should leave a trace.
+
 ### Commits and branches
 
 Conventional Commits. Branches follow `{type}/{ticket}-{description}`:

@@ -8,6 +8,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Exposes the law suite outside `cfg(test)` so that a `Dioid` instance defined
+# in another crate inherits the identical conformance suite. This is what makes
+# "law tests run for every instance" hold beyond this crate's own boundary.
+laws = []
+
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }

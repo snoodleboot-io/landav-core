@@ -32,6 +32,16 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Declared centrally so concurrent M0 lanes cannot each resolve a different
+# version of the same crate.
+clap = { version = "4.6", features = ["derive"] }
+proptest = "1.11"
+
+# Pinned exactly, not "0.11". egg declares no MSRV, so there is no contractual
+# floor and a patch release could silently raise it above our 1.95 pin. Treat
+# `cargo update -p egg` as requiring re-verification of the toolchain gate.
+egg = "=0.11.0"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
@@ -42,6 +52,13 @@ missing_docs = "warn"
 unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
+
+# A silent `as` truncation is a soundness bug here, not a style question:
+# `4294967296u64 as u32` is `0`, which made `pow(2, 2^32)` report a bound of 1.
+# There is no overflow left to saturate, so the monotonicity argument does not
+# cover it. Denied rather than warned.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
 
 [profile.release]
 lto = "thin"

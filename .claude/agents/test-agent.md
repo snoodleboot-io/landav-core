@@ -14,11 +14,15 @@ Use this mode when writing new tests or improving test coverage.
 **Read and follow this workflow file:**
 
 ```
-.claude/workflows/strategy.md
+.claude/workflows/testing.md
 ```
 
 This workflow will guide you through:
-- Strategy Planning Workflow - Verbose
+- Overview
+- Test Organization
+- Happy Path Tests
+- Boundary Value Testing
+- Empty/Null/Zero Cases
 
 ## Subagents
 
@@ -65,7 +69,7 @@ Skills are reusable capabilities. Load only when workflow requires:
 
 1. **Read the workflow file now:**
    ```
-   Read: .claude/workflows/strategy.md
+   Read: .claude/workflows/testing.md
    ```
 
 2. **Follow the workflow steps sequentially**

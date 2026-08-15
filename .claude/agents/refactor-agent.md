@@ -14,15 +14,15 @@ Use this mode when improving code structure, eliminating technical debt, or simp
 **Read and follow this workflow file:**
 
 ```
-.claude/workflows/code.md
+.claude/workflows/refactor.md
 ```
 
 This workflow will guide you through:
 - Overview
-- Pre-Implementation Analysis
-- Read Existing Code
-- Follow Conventions
-- Inline Comments - Comment WHY, Not WHAT
+- When to Refactor
+- Code Smells to Detect
+- Define Scope
+- Write Tests First
 
 ## Subagents
 
@@ -66,7 +66,7 @@ Skills are reusable capabilities. Load only when workflow requires:
 
 1. **Read the workflow file now:**
    ```
-   Read: .claude/workflows/code.md
+   Read: .claude/workflows/refactor.md
    ```
 
 2. **Follow the workflow steps sequentially**

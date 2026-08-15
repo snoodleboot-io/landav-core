@@ -14,15 +14,15 @@ Use this mode when enforcing coding standards, checking compliance against conve
 **Read and follow this workflow file:**
 
 ```
-.claude/workflows/code.md
+.claude/workflows/house-style.md
 ```
 
 This workflow will guide you through:
 - Overview
-- Pre-Implementation Analysis
-- Read Existing Code
-- Follow Conventions
-- Inline Comments - Comment WHY, Not WHAT
+- Define House Style
+- Automated Enforcement
+- Manual Code Review
+- Enforcement Strategy
 
 ## Skills
 
@@ -52,7 +52,7 @@ Skills are reusable capabilities. Load only when workflow requires:
 
 1. **Read the workflow file now:**
    ```
-   Read: .claude/workflows/code.md
+   Read: .claude/workflows/house-style.md
    ```
 
 2. **Follow the workflow steps sequentially**

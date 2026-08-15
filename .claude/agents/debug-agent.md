@@ -14,15 +14,15 @@ Use this mode when diagnosing bugs, crashes, or unexpected behavior.
 **Read and follow this workflow file:**
 
 ```
-.claude/workflows/log-analysis.md
+.claude/workflows/root-cause.md
 ```
 
 This workflow will guide you through:
-- Overview
-- Log Collection
-- Pattern Recognition
-- Request Tracing
-- Root Cause Analysis
+- Gather Symptoms and Context
+- Collect Artifacts
+- Form Hypotheses
+- Test Hypotheses
+- Identify Root Cause
 
 ## Subagents
 
@@ -68,7 +68,7 @@ Skills are reusable capabilities. Load only when workflow requires:
 
 1. **Read the workflow file now:**
    ```
-   Read: .claude/workflows/log-analysis.md
+   Read: .claude/workflows/root-cause.md
    ```
 
 2. **Follow the workflow steps sequentially**
