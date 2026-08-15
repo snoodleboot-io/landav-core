@@ -7,12 +7,15 @@ use rustpython_parser::{Parse, ast};
 use crate::{
     context::analyse_program,
     finding::Finding,
+    noqa,
     patterns::Analysis,
     python_error::PythonError,
+    suppression::{PathWaiver, Suppression},
     syntax::{LineIndex, MAX_EXPRESSION_DEPTH, MAX_NESTING_DEPTH, nesting_overflow},
 };
 
-/// One module, analysed: what the rules found and how much code they ran over.
+/// One module, analysed: what the rules found, what was waived, and how much
+/// code they ran over.
 ///
 /// The second half is not decoration. A caller that turns findings into a
 /// verdict has to be able to tell "analysed, nothing to report" from "there
@@ -20,14 +23,21 @@ use crate::{
 /// neither a clean bill of health nor a finding — and counting Python
 /// statements is a question only the frontend can answer. Publishing it here
 /// is what lets a driver stay ignorant of Python.
+///
+/// [`ModuleAnalysis::suppressions`] is the same argument applied to waivers:
+/// the findings are filtered, and the waivers that did the filtering — plus
+/// the ones that did nothing at all — are published so that a driver can
+/// report them without knowing what a `# noqa` comment looks like.
 #[derive(Debug, Clone)]
 pub struct ModuleAnalysis {
     findings: Vec<Finding>,
+    suppressions: Vec<Suppression>,
     statements: usize,
 }
 
 impl ModuleAnalysis {
-    /// Every rule that fired, in `(line, column, rule code)` order.
+    /// Every rule that fired and was **not** waived, in
+    /// `(line, column, rule code)` order.
     #[must_use]
     pub fn findings(&self) -> &[Finding] {
         &self.findings
@@ -37,6 +47,24 @@ impl ModuleAnalysis {
     #[must_use]
     pub fn into_findings(self) -> Vec<Finding> {
         self.findings
+    }
+
+    /// Every waiver that applies to this module, whether or not it did
+    /// anything.
+    ///
+    /// Includes the ones that suppressed nothing, the ones naming a retired
+    /// code and the ones naming no code this build has ever issued — that is
+    /// the whole point. A waiver nobody can see is a waiver that rots, and
+    /// `LAN-66` criterion 3 exists to prevent exactly that.
+    ///
+    /// # Ordering
+    ///
+    /// Inline waivers first, by `(line, code)`; then per-path waivers, by
+    /// `(pattern, code)`. A contract, not an accident: two runs over identical
+    /// bytes must produce byte-identical output.
+    #[must_use]
+    pub fn suppressions(&self) -> &[Suppression] {
+        &self.suppressions
     }
 
     /// How many Python statements the module contains, at any nesting depth.
@@ -62,6 +90,36 @@ impl ModuleAnalysis {
 /// As [`analyze_module`].
 pub fn analyze_source(path: &Path, source: &str) -> Result<Vec<Finding>, PythonError> {
     analyze_module(path, source).map(ModuleAnalysis::into_findings)
+}
+
+/// Runs every rule over one Python source file, honouring the `# noqa`
+/// comments in it and the per-path waivers in `waivers`.
+///
+/// [`analyze_module`] is this with no configured waivers. Inline suppression
+/// is not optional and has no "off" spelling here: it is part of what the
+/// source text means, the same way a comment is.
+///
+/// # Precedence
+///
+/// A finding waived by both forms is credited to the **inline** one. It is the
+/// narrower waiver, it sits against the line it excuses, and `git blame`
+/// resolves it to a person; crediting the path glob instead would report the
+/// broad waiver as load-bearing and the specific one as dead, which is exactly
+/// backwards for anyone deciding which waiver to remove.
+///
+/// # Errors
+///
+/// As [`analyze_module`].
+pub fn analyze_module_with(
+    path: &Path,
+    source: &str,
+    waivers: &[PathWaiver],
+) -> Result<ModuleAnalysis, PythonError> {
+    let mut module = analyze_raw(path, source)?;
+    let (kept, suppressions) = apply(path, source, waivers, std::mem::take(&mut module.findings));
+    module.findings = kept;
+    module.suppressions = suppressions;
+    Ok(module)
 }
 
 /// Runs every rule in [`crate::registry()`] over one Python source file, and
@@ -91,6 +149,11 @@ pub fn analyze_source(path: &Path, source: &str) -> Result<Vec<Finding>, PythonE
 /// takes the blame path with it, whereas a `Parse` error naming the offset
 /// leaves the caller something to act on.
 pub fn analyze_module(path: &Path, source: &str) -> Result<ModuleAnalysis, PythonError> {
+    analyze_module_with(path, source, &[])
+}
+
+/// The analysis proper, before any waiver has been consulted.
+fn analyze_raw(path: &Path, source: &str) -> Result<ModuleAnalysis, PythonError> {
     let index = LineIndex::new(source);
 
     if let Some(offset) = nesting_overflow(source) {
@@ -126,8 +189,117 @@ pub fn analyze_module(path: &Path, source: &str) -> Result<ModuleAnalysis, Pytho
     let statements = analysis.program.statements.len();
     Ok(ModuleAnalysis {
         findings: analysis.run(),
+        suppressions: Vec::new(),
         statements,
     })
+}
+
+/// One waiver, tracked while it is still deciding what it did.
+struct Waiver {
+    /// The code, verbatim as written.
+    code: String,
+    /// The line it covers, for an inline waiver.
+    line: Option<u32>,
+    /// The glob it was declared with, for a per-path waiver.
+    pattern: Option<String>,
+    /// The justification, if any.
+    reason: Option<String>,
+    /// How many findings it has taken so far.
+    taken: usize,
+}
+
+impl Waiver {
+    /// Whether this waiver covers a finding of `code` on `line`.
+    fn covers(&self, code: &str, line: u32) -> bool {
+        self.code == code && self.line.is_none_or(|only| only == line)
+    }
+
+    /// The published record.
+    fn into_record(self, file: &Path) -> Suppression {
+        match (self.line, self.pattern) {
+            (Some(line), _) => {
+                Suppression::inline(self.code, file.to_path_buf(), line, self.reason, self.taken)
+            }
+            (None, pattern) => Suppression::per_path(
+                self.code,
+                pattern.unwrap_or_default(),
+                self.reason,
+                self.taken,
+            ),
+        }
+    }
+}
+
+/// Splits `findings` into the ones that survive and the waivers that explain
+/// the rest.
+///
+/// Every waiver in scope produces a record, including the ones that took
+/// nothing. Nothing here consults a licence, an entitlement or a policy: this
+/// crate records waivers, and governing them is `E-001`'s job on the other
+/// side of the edition boundary. See `docs/EDITIONS.md`.
+fn apply(
+    path: &Path,
+    source: &str,
+    waivers: &[PathWaiver],
+    findings: Vec<Finding>,
+) -> (Vec<Finding>, Vec<Suppression>) {
+    let mut inline: Vec<Waiver> = Vec::new();
+    for directive in noqa::directives(source) {
+        for code in directive.codes {
+            if inline
+                .iter()
+                .any(|waiver| waiver.line == Some(directive.line) && waiver.code == code)
+            {
+                // The same code twice on one line is one waiver, not two.
+                continue;
+            }
+            inline.push(Waiver {
+                code,
+                line: Some(directive.line),
+                pattern: None,
+                reason: directive.reason.clone(),
+                taken: 0,
+            });
+        }
+    }
+
+    let mut per_path: Vec<Waiver> = Vec::new();
+    for waiver in waivers.iter().filter(|waiver| waiver.covers(path)) {
+        for code in waiver.rules() {
+            per_path.push(Waiver {
+                code: code.clone(),
+                line: None,
+                pattern: Some(waiver.pattern().to_owned()),
+                reason: Some(waiver.reason().to_owned()),
+                taken: 0,
+            });
+        }
+    }
+
+    let mut kept = Vec::with_capacity(findings.len());
+    for finding in findings {
+        let code = finding.rule().as_str();
+        let line = finding.location().line();
+        // Inline first: the narrower waiver is the one credited.
+        let taker = inline
+            .iter_mut()
+            .chain(per_path.iter_mut())
+            .find(|waiver| waiver.covers(code, line));
+        match taker {
+            Some(waiver) => waiver.taken = waiver.taken.saturating_add(1),
+            None => kept.push(finding),
+        }
+    }
+
+    inline.sort_by(|left, right| (left.line, &left.code).cmp(&(right.line, &right.code)));
+    per_path.sort_by(|left, right| (&left.pattern, &left.code).cmp(&(&right.pattern, &right.code)));
+
+    let records = inline
+        .into_iter()
+        .chain(per_path)
+        .map(|waiver| waiver.into_record(path))
+        .collect();
+    (kept, records)
 }
 
 #[cfg(test)]

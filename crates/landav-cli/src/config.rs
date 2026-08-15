@@ -28,6 +28,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use landav_python::PathWaiver;
 use toml::{Table, Value};
 
 use crate::diagnostic::ToolError;
@@ -37,6 +38,17 @@ const PYPROJECT: &str = "pyproject.toml";
 
 /// The section within it. Not `pycost`.
 const SECTION: &str = "tool.landav";
+
+/// The only key `[tool.landav]` understands: `LAN-66` criterion 2.
+const SUPPRESS: &str = "suppress";
+
+/// The keys one `[[tool.landav.suppress]]` entry understands.
+///
+/// `E-001` adds `expires` and `approved-by` on the paid side. When it does,
+/// this crate learns to *carry* them, not to enforce them — recording an
+/// expiry date is bookkeeping, and refusing to run when it has passed is
+/// governance. `docs/EDITIONS.md` puts the second half in `landav-ee`.
+const WAIVER_KEYS: [&str; 3] = ["path", "rules", "reason"];
 
 /// Where a run's configuration came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,23 +73,32 @@ impl fmt::Display for Source {
 
 /// The effective configuration for one run.
 ///
-/// # No settings yet
+/// # One setting
 ///
-/// The key schema for `[tool.landav]` has not been decided, so this carries
-/// none. That is *not* the same as not reading the section: an unusable
-/// section is refused by [`section_of`], and any key at all is refused by
-/// [`reject_unknown_keys`], because a key landav accepts today and ignores is
-/// a key the user believes is in effect.
+/// `suppress` — `LAN-66` criterion 2 — and nothing else. Every other key is
+/// still refused by [`reject_unknown_keys`], because a key landav accepts
+/// today and ignores is a key the user believes is in effect.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Where the configuration came from, for the run summary.
     source: Source,
+    /// Per-path waivers, in the order they were written.
+    waivers: Vec<PathWaiver>,
 }
 
 impl Config {
     /// Where this configuration came from.
     pub const fn source(&self) -> &Source {
         &self.source
+    }
+
+    /// The per-path waivers this run is operating under.
+    ///
+    /// Order is the order they were written in the file: the report names them
+    /// back to the author, and reordering them would make a config diff and a
+    /// report diff disagree.
+    pub fn waivers(&self) -> &[PathWaiver] {
+        &self.waivers
     }
 }
 
@@ -95,6 +116,7 @@ pub fn load(target: &Path, explicit: Option<&Path>) -> Result<Config, ToolError>
             Some(path) => load_pyproject(&path),
             None => Ok(Config {
                 source: Source::Defaults,
+                waivers: Vec::new(),
             }),
         },
     }
@@ -125,6 +147,7 @@ fn load_explicit(path: &Path) -> Result<Config, ToolError> {
 
     Ok(Config {
         source: Source::Explicit(path.to_path_buf()),
+        waivers: waivers_of(path, &section)?,
     })
 }
 
@@ -154,6 +177,7 @@ fn load_pyproject(path: &Path) -> Result<Config, ToolError> {
 
     Ok(Config {
         source: Source::PyProject(path.to_path_buf()),
+        waivers: waivers_of(path, &section)?,
     })
 }
 
@@ -231,23 +255,181 @@ fn section_of(path: &Path, document: &Table) -> Result<Table, ToolError> {
     }
 }
 
-/// Refuse any key, naming it.
+/// Refuse any key that is not `suppress`, naming it.
 ///
-/// No setting is defined yet. Accepting a key and ignoring it would let a user
-/// write `[tool.landav] fail-on-partial = true`, watch the run report clean,
-/// and believe the flag was honoured.
+/// Accepting a key and ignoring it would let a user write
+/// `[tool.landav] fail-on-partial = true`, watch the run report clean, and
+/// believe the flag was honoured.
 fn reject_unknown_keys(path: &Path, section: &Table) -> Result<(), ToolError> {
-    match section.keys().next() {
+    match section.keys().find(|key| key.as_str() != SUPPRESS) {
         None => Ok(()),
         Some(key) => Err(ToolError::at_path(
             path,
             format!(
-                "[{SECTION}] sets `{key}`, which landav does not understand; no \
-                 settings are defined yet, and a setting that is accepted and \
-                 ignored is worse than one that is refused"
+                "[{SECTION}] sets `{key}`, which landav does not understand; the only \
+                 setting is `{SUPPRESS}`, and a setting that is accepted and ignored is \
+                 worse than one that is refused"
             ),
         )),
     }
+}
+
+/// Reads `[[tool.landav.suppress]]` — `LAN-66` criterion 2.
+///
+/// ```toml
+/// [[tool.landav.suppress]]
+/// path = "tests/**"
+/// rules = ["LAV003"]
+/// reason = "fixtures build strings the slow way on purpose"
+/// ```
+///
+/// An array of tables rather than a `{ glob = [codes] }` map, because the
+/// entry has to have room for a sentence — and, later, for the approver and
+/// the expiry date `E-001` adds. A map keyed by glob has nowhere to put them
+/// and would need a migration the day governance ships.
+///
+/// # Every malformed entry is refused by name
+///
+/// A waiver the tool cannot read is the one kind of configuration error that
+/// silently *widens* what is suppressed if it is guessed at, and silently
+/// narrows it if it is skipped. Both are worse than refusing to run.
+fn waivers_of(path: &Path, section: &Table) -> Result<Vec<PathWaiver>, ToolError> {
+    let Some(value) = section.get(SUPPRESS) else {
+        return Ok(Vec::new());
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(ToolError::at_path(
+            path,
+            format!(
+                "[{SECTION}] `{SUPPRESS}` must be a list of waivers written as \
+                 [[{SECTION}.{SUPPRESS}]] tables, found {}",
+                type_name(value)
+            ),
+        ));
+    };
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| waiver_of(path, index, entry))
+        .collect()
+}
+
+/// Reads one `[[tool.landav.suppress]]` entry.
+fn waiver_of(path: &Path, index: usize, entry: &Value) -> Result<PathWaiver, ToolError> {
+    // 1-based, because the author counts their entries from one.
+    let ordinal = index + 1;
+    let Some(table) = entry.as_table() else {
+        return Err(waiver_error(
+            path,
+            ordinal,
+            format!(
+                "must be a table with `path`, `rules` and `reason`, found {}",
+                type_name(entry)
+            ),
+        ));
+    };
+
+    if let Some(key) = table
+        .keys()
+        .find(|key| !WAIVER_KEYS.contains(&key.as_str()))
+    {
+        return Err(waiver_error(
+            path,
+            ordinal,
+            format!("sets `{key}`, which landav does not understand"),
+        ));
+    }
+
+    let pattern = required_string(path, ordinal, table, "path")?;
+    let reason = required_string(path, ordinal, table, "reason")?;
+    let rules = required_rules(path, ordinal, table)?;
+
+    Ok(PathWaiver::new(pattern, rules, reason))
+}
+
+/// A non-empty string value, or a diagnostic naming the entry and the key.
+fn required_string(
+    path: &Path,
+    ordinal: usize,
+    table: &Table,
+    key: &str,
+) -> Result<String, ToolError> {
+    // `reason` is required, unlike an inline one. A per-path waiver covers
+    // files that do not exist yet and is approved once by somebody who will
+    // not be in the room when it is next read; a sentence is the only thing a
+    // later auditor — or `E-001` — has to work with.
+    let Some(value) = table.get(key) else {
+        return Err(waiver_error(path, ordinal, format!("has no `{key}`")));
+    };
+    match value.as_str() {
+        Some(text) if !text.trim().is_empty() => Ok(text.to_owned()),
+        Some(_) => Err(waiver_error(path, ordinal, format!("has an empty `{key}`"))),
+        None => Err(waiver_error(
+            path,
+            ordinal,
+            format!("`{key}` must be a string, found {}", type_name(value)),
+        )),
+    }
+}
+
+/// A non-empty list of rule codes, or a diagnostic naming the entry.
+///
+/// The codes are **not** checked against the registry here. A waiver naming a
+/// retired or misspelled code is a fact worth reporting rather than a reason
+/// to refuse the whole run — the run would then fail on a stale waiver while
+/// saying nothing about the code it was actually protecting. The report says
+/// so instead, per waiver, every run.
+fn required_rules(path: &Path, ordinal: usize, table: &Table) -> Result<Vec<String>, ToolError> {
+    let Some(value) = table.get("rules") else {
+        return Err(waiver_error(
+            path,
+            ordinal,
+            "has no `rules`; a waiver has to name what it waives, because there is no \
+             spelling that means all of them"
+                .to_owned(),
+        ));
+    };
+    let Some(items) = value.as_array() else {
+        return Err(waiver_error(
+            path,
+            ordinal,
+            format!(
+                "`rules` must be a list of rule codes, found {}",
+                type_name(value)
+            ),
+        ));
+    };
+    if items.is_empty() {
+        return Err(waiver_error(
+            path,
+            ordinal,
+            "has an empty `rules`, so it waives nothing and hides that it does".to_owned(),
+        ));
+    }
+
+    items
+        .iter()
+        .map(|item| match item.as_str() {
+            Some(code) if !code.trim().is_empty() => Ok(code.trim().to_owned()),
+            _ => Err(waiver_error(
+                path,
+                ordinal,
+                format!(
+                    "`rules` lists {} where a rule code such as \"LAV003\" belongs",
+                    type_name(item)
+                ),
+            )),
+        })
+        .collect()
+}
+
+/// A diagnostic naming the configuration file and which waiver is at fault.
+fn waiver_error(path: &Path, ordinal: usize, detail: String) -> ToolError {
+    ToolError::at_path(
+        path,
+        format!("[[{SECTION}.{SUPPRESS}]] entry {ordinal} {detail}"),
+    )
 }
 
 /// The TOML type of `value`, for a diagnostic.
@@ -324,12 +506,18 @@ fn discovery_root(target: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{reject_unknown_keys, section_of};
+    use super::{reject_unknown_keys, section_of, waivers_of};
     use std::path::Path;
     use toml::Table;
 
     fn parse(text: &str) -> Table {
         text.parse::<Table>().unwrap_or_default()
+    }
+
+    /// `[[tool.landav.suppress]]` inside a `pyproject.toml` is nested one
+    /// level down; the tests below write the section body directly.
+    fn waivers(text: &str) -> Result<Vec<landav_python::PathWaiver>, String> {
+        waivers_of(Path::new("pyproject.toml"), &parse(text)).map_err(|error| error.to_string())
     }
 
     #[test]
@@ -383,5 +571,129 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("fail-on-partial"), "{err}");
+    }
+
+    /// `suppress` is the one key that is understood, and understanding it must
+    /// not open the door to any other.
+    #[test]
+    fn suppress_is_accepted_and_nothing_else_is() {
+        let good = parse("[[suppress]]\npath = \"a/**\"\nrules = [\"LAV003\"]\nreason = \"r\"\n");
+        assert!(reject_unknown_keys(Path::new("pyproject.toml"), &good).is_ok());
+
+        let bad = parse("suppressions = []\n");
+        let err = reject_unknown_keys(Path::new("pyproject.toml"), &bad)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("suppressions"), "{err}");
+    }
+
+    #[test]
+    fn no_suppress_key_means_no_waivers() {
+        assert_eq!(waivers("").map(|w| w.len()), Ok(0));
+    }
+
+    #[test]
+    fn a_well_formed_waiver_is_read_whole() {
+        let parsed = waivers(
+            "[[suppress]]\npath = \"tests/**\"\nrules = [\"LAV003\", \"LAV002\"]\n\
+             reason = \"fixtures are deliberately slow\"\n",
+        );
+        let one = parsed.as_ref().ok().and_then(|list| list.first());
+        assert_eq!(one.map(super::PathWaiver::pattern), Some("tests/**"));
+        assert_eq!(
+            one.map(super::PathWaiver::rules),
+            Some(["LAV003".to_owned(), "LAV002".to_owned()].as_slice())
+        );
+        assert_eq!(
+            one.map(super::PathWaiver::reason),
+            Some("fixtures are deliberately slow")
+        );
+    }
+
+    /// Waivers keep the order they were written in, so a configuration diff
+    /// and a report diff line up.
+    #[test]
+    fn waivers_keep_the_order_they_were_written_in() {
+        let parsed = waivers(
+            "[[suppress]]\npath = \"b/**\"\nrules = [\"LAV003\"]\nreason = \"r\"\n\
+             [[suppress]]\npath = \"a/**\"\nrules = [\"LAV003\"]\nreason = \"r\"\n",
+        );
+        let patterns: Vec<String> = parsed
+            .unwrap_or_default()
+            .iter()
+            .map(|waiver| waiver.pattern().to_owned())
+            .collect();
+        assert_eq!(patterns, ["b/**", "a/**"]);
+    }
+
+    /// Each way of writing an unusable waiver is refused, and the diagnostic
+    /// names the entry and the key so the author can find it.
+    #[test]
+    fn every_malformed_waiver_is_refused_and_named() {
+        let cases = [
+            ("suppress = \"tests/**\"\n", "suppress"),
+            ("suppress = [\"tests/**\"]\n", "entry 1"),
+            (
+                "[[suppress]]\nrules = [\"LAV003\"]\nreason = \"r\"\n",
+                "path",
+            ),
+            ("[[suppress]]\npath = \"a\"\nreason = \"r\"\n", "rules"),
+            (
+                "[[suppress]]\npath = \"a\"\nrules = [\"LAV003\"]\n",
+                "reason",
+            ),
+            (
+                "[[suppress]]\npath = \"a\"\nrules = []\nreason = \"r\"\n",
+                "rules",
+            ),
+            (
+                "[[suppress]]\npath = \"\"\nrules = [\"LAV003\"]\nreason = \"r\"\n",
+                "path",
+            ),
+            (
+                "[[suppress]]\npath = \"a\"\nrules = [\"LAV003\"]\nreason = \"   \"\n",
+                "reason",
+            ),
+            (
+                "[[suppress]]\npath = 7\nrules = [\"LAV003\"]\nreason = \"r\"\n",
+                "path",
+            ),
+            (
+                "[[suppress]]\npath = \"a\"\nrules = \"LAV003\"\nreason = \"r\"\n",
+                "rules",
+            ),
+            (
+                "[[suppress]]\npath = \"a\"\nrules = [7]\nreason = \"r\"\n",
+                "rules",
+            ),
+            (
+                "[[suppress]]\npath = \"a\"\nrules = [\"LAV003\"]\nreason = \"r\"\nexpires = \"x\"\n",
+                "expires",
+            ),
+        ];
+
+        for (config, named) in cases {
+            let err = waivers(config).err().unwrap_or_default();
+            assert!(
+                err.contains(named),
+                "`{config}` must be refused with a diagnostic naming `{named}`, got `{err}`"
+            );
+        }
+    }
+
+    /// A waiver naming a code that does not exist is a fact to report, not a
+    /// reason to refuse the run: refusing would fail the build over a stale
+    /// waiver while saying nothing about the code it was protecting.
+    #[test]
+    fn a_waiver_may_name_a_code_the_registry_does_not_have() {
+        let parsed = waivers(
+            "[[suppress]]\npath = \"a\"\nrules = [\"LAV010\", \"LAV999\"]\nreason = \"r\"\n",
+        );
+        assert_eq!(
+            parsed.map(|list| list.len()),
+            Ok(1),
+            "an unknown code must not stop the run"
+        );
     }
 }

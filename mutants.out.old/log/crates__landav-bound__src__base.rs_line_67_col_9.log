@@ -1,0 +1,343 @@
+
+*** crates/landav-bound/src/base.rs:67:9: replace <impl Canonical for Base>::write_canonical with ()
+
+*** mutation diff:
+--- crates/landav-bound/src/base.rs
++++ replace <impl Canonical for Base>::write_canonical with ()
+@@ -59,11 +59,11 @@
+ }
+ 
+ impl Canonical for Base {
+     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
+         self.0.cmp(&other.0)
+     }
+ 
+     fn write_canonical(&self, out: &mut Vec<u8>) {
+-        out.extend_from_slice(&self.0.to_be_bytes());
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ }
+
+
+*** /home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=landav-bound@0.0.0
+       Fresh libc v0.2.189
+       Fresh cfg-if v1.0.4
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh syn v3.0.3
+       Fresh getrandom v0.3.4
+       Fresh rand_core v0.9.5
+       Fresh bitflags v2.13.1
+       Fresh linux-raw-sys v0.12.1
+       Fresh autocfg v1.5.1
+       Fresh rustix v1.1.4
+       Fresh getrandom v0.4.3
+       Fresh zerocopy v0.8.56
+       Fresh fastrand v2.5.0
+       Fresh once_cell v1.21.4
+       Fresh tempfile v3.27.0
+       Fresh ppv-lite86 v0.2.21
+       Fresh serde_core v1.0.229
+       Fresh thiserror-impl v2.0.20
+       Fresh serde_derive v1.0.229
+       Fresh wait-timeout v0.2.1
+       Fresh bit-vec v0.8.0
+       Fresh fnv v1.0.7
+       Fresh quick-error v1.2.3
+       Fresh rusty-fork v0.3.1
+       Fresh bit-set v0.8.0
+       Fresh serde v1.0.229
+       Fresh thiserror v2.0.20
+       Fresh num-traits v0.2.19
+       Fresh rand_chacha v0.9.0
+       Fresh rand v0.9.5
+       Fresh rand_xorshift v0.4.0
+       Fresh regex-syntax v0.8.11
+       Fresh unarray v0.1.4
+       Fresh proptest v1.11.0
+       Dirty landav-bound v0.0.0 (/tmp/cargo-mutants-landav-core-8nLWJU.tmp/crates/landav-bound): the file `crates/landav-bound/src/base.rs` has changed (1786292141.095496697s, 5s after last build at 1786292136.626507696s)
+   Compiling landav-bound v0.0.0 (/tmp/cargo-mutants-landav-core-8nLWJU.tmp/crates/landav-bound)
+     Running `/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name landav_bound --edition=2024 crates/landav-bound/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::unwrap_used' --forbid=unsafe_code '--warn=clippy::panic' --warn=missing_docs '--warn=clippy::expect_used' '--deny=clippy::cast_sign_loss' '--deny=clippy::cast_possible_truncation' --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "laws"))' -C metadata=870e1f92fe15bfae -C extra-filename=-92eae8267b625b90 --out-dir /tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps --extern serde=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libserde-19069e741e4dec19.rmeta --extern thiserror=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libthiserror-0095ebf214e71f49.rmeta`
+warning: unused variable: `out`
+  --> crates/landav-bound/src/base.rs:66:31
+   |
+66 |     fn write_canonical(&self, out: &mut Vec<u8>) {
+   |                               ^^^ help: if this is intentional, prefix it with an underscore: `_out`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `landav-bound` (lib) generated 1 warning (run `cargo fix --lib -p landav-bound` to apply 1 suggestion)
+     Running `/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name frozen_invariants --edition=2024 crates/landav-bound/tests/frozen_invariants.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::unwrap_used' --forbid=unsafe_code '--warn=clippy::panic' --warn=missing_docs '--warn=clippy::expect_used' '--deny=clippy::cast_sign_loss' '--deny=clippy::cast_possible_truncation' --test --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "laws"))' -C metadata=173ab37a75e61381 -C extra-filename=-4fc74f03a650452c --out-dir /tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps --extern landav_bound=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/liblandav_bound-92eae8267b625b90.rlib --extern proptest=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libproptest-42639fde807c5120.rlib --extern serde=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libserde-19069e741e4dec19.rlib --extern thiserror=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libthiserror-0095ebf214e71f49.rlib`
+     Running `/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name properties --edition=2024 crates/landav-bound/tests/properties/main.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::unwrap_used' --forbid=unsafe_code '--warn=clippy::panic' --warn=missing_docs '--warn=clippy::expect_used' '--deny=clippy::cast_sign_loss' '--deny=clippy::cast_possible_truncation' --test --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "laws"))' -C metadata=a032fa1dc989b775 -C extra-filename=-1136f4ba376d21d6 --out-dir /tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps --extern landav_bound=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/liblandav_bound-92eae8267b625b90.rlib --extern proptest=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libproptest-42639fde807c5120.rlib --extern serde=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libserde-19069e741e4dec19.rlib --extern thiserror=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libthiserror-0095ebf214e71f49.rlib`
+     Running `/home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name landav_bound --edition=2024 crates/landav-bound/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::unwrap_used' --forbid=unsafe_code '--warn=clippy::panic' --warn=missing_docs '--warn=clippy::expect_used' '--deny=clippy::cast_sign_loss' '--deny=clippy::cast_possible_truncation' --test --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "laws"))' -C metadata=3a5ed246955abad5 -C extra-filename=-64e2655cb73b6c2f --out-dir /tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps --extern proptest=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libproptest-42639fde807c5120.rlib --extern serde=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libserde-19069e741e4dec19.rlib --extern thiserror=/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/libthiserror-0095ebf214e71f49.rlib`
+warning: `landav-bound` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.25s
+  Executable `/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/landav_bound-64e2655cb73b6c2f`
+  Executable `/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/frozen_invariants-4fc74f03a650452c`
+  Executable `/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/properties-1136f4ba376d21d6`
+
+*** result: Success
+
+*** /home/snoodleboot/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/cargo test --verbose --package=landav-bound@0.0.0
+       Fresh libc v0.2.189
+       Fresh cfg-if v1.0.4
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh syn v3.0.3
+       Fresh getrandom v0.3.4
+       Fresh rand_core v0.9.5
+       Fresh autocfg v1.5.1
+       Fresh linux-raw-sys v0.12.1
+       Fresh bitflags v2.13.1
+       Fresh rustix v1.1.4
+       Fresh zerocopy v0.8.56
+       Fresh getrandom v0.4.3
+       Fresh fastrand v2.5.0
+       Fresh once_cell v1.21.4
+       Fresh tempfile v3.27.0
+       Fresh ppv-lite86 v0.2.21
+       Fresh serde_core v1.0.229
+       Fresh serde_derive v1.0.229
+       Fresh thiserror-impl v2.0.20
+       Fresh wait-timeout v0.2.1
+       Fresh bit-vec v0.8.0
+       Fresh fnv v1.0.7
+       Fresh quick-error v1.2.3
+       Fresh rusty-fork v0.3.1
+       Fresh bit-set v0.8.0
+       Fresh thiserror v2.0.20
+       Fresh serde v1.0.229
+       Fresh num-traits v0.2.19
+       Fresh rand_chacha v0.9.0
+       Fresh rand v0.9.5
+       Fresh rand_xorshift v0.4.0
+       Fresh unarray v0.1.4
+       Fresh regex-syntax v0.8.11
+       Fresh proptest v1.11.0
+warning: unused variable: `out`
+  --> crates/landav-bound/src/base.rs:66:31
+   |
+66 |     fn write_canonical(&self, out: &mut Vec<u8>) {
+   |                               ^^^ help: if this is intentional, prefix it with an underscore: `_out`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `landav-bound` (lib) generated 1 warning (run `cargo fix --lib -p landav-bound` to apply 1 suggestion)
+       Fresh landav-bound v0.0.0 (/tmp/cargo-mutants-landav-core-8nLWJU.tmp/crates/landav-bound)
+warning: `landav-bound` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running `/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/landav_bound-64e2655cb73b6c2f`
+
+running 2 tests
+test registry::frozen_registry::resource_surface_is_pinned ... ok
+test bound_shape::frozen_tags::tags_are_pinned ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/frozen_invariants-4fc74f03a650452c`
+
+running 7 tests
+test a_validated_base_reports_the_value_it_was_validated_from ... ok
+test base_refuses_every_value_that_would_make_ceil_log_diverge ... ok
+test operand_count_is_reported_honestly ... ok
+test structural_equality_holds_on_the_shape_that_needs_it ... ok
+test an_n_ary_node_is_never_empty ... ok
+test the_base_constants_agree_with_the_checked_path ... ok
+test leaf_equality_separates_the_meaning_critical_values ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running `/tmp/cargo-mutants-landav-core-8nLWJU.tmp/target/debug/deps/properties-1136f4ba376d21d6`
+
+running 113 tests
+test adversary::a_closed_product_denoting_zero_is_proved_zero ... ok
+test adversary::a_hand_built_wire_document_cannot_smuggle_in_an_unobservable_term ... ok
+test adversary::ceil_log_matches_a_u128_reference_at_every_edge ... ok
+test adversary::a_saturating_subgroup_still_defeats_an_enclosing_zero ... ok
+test adversary::exp_of_never_wraps_or_truncates_the_exponent ... ok
+test adversary::observers_must_be_polynomial_in_the_dag ... ok
+test adversary::prod_keeps_only_the_zero_beside_a_symbolic_operand ... ok
+test canonical_order::a_frontend_name_survives_every_route_back_out ... ok
+test adversary::the_beyond_reference_is_a_lower_bound_not_the_denotation ... ok
+test canonical_order::bound_kind_satisfies_the_canonical_contract ... FAILED
+test canonical_order::bound_satisfies_the_canonical_contract ... FAILED
+test canonical_order::built_terms_satisfy_the_canonical_invariants ... ok
+test canonical_order::canonical_cmp_agrees_with_eq ... ok
+test canonical_order::canonical_bytes_separate_exactly_the_distinct_values ... ok
+test canonical_order::canonical_cmp_is_reflexive_and_stable ... ok
+test canonical_order::canonical_order_across_shapes_follows_the_pinned_tags ... ok
+test canonical_order::canonical_order_is_content_derived ... ok
+test canonical_order::hash_agrees_with_equality ... ok
+test canonical_order::lifted_nat_is_ord_and_bottom_is_least ... ok
+test canonical_order::canonical_cmp_is_antisymmetric ... ok
+test canonical_order::nat_magnitude_order_is_written_out_and_puts_omega_on_top ... ok
+test canonical_order::near_miss_pairs_are_separated_by_the_canonical_bytes ... FAILED
+test canonical_order::canonical_cmp_is_transitive ... ok
+test canonical_order::lifting_preserves_the_canonical_order ... ok
+test canonical_order::the_dag_encoding_separates_terms_that_differ_only_in_their_wiring ... ok
+test canonical_order::the_fingerprint_separates_distinct_terms ... ok
+test canonical_order::the_kind_order_agrees_with_the_term_order ... ok
+test canonical_order::the_leaf_payloads_satisfy_the_canonical_contract ... FAILED
+test canonical_order::the_lifted_carrier_satisfies_the_canonical_contract ... ok
+test canonical_order::the_operand_payloads_satisfy_the_canonical_contract ... ok
+test canonical_order::the_shape_names_are_pinned_and_reach_the_diagnostics ... ok
+test denotation::all_six_constructors_are_reachable_and_observable ... ok
+test canonical_order::operand_order_does_not_reach_the_term ... ok
+test canonical_order::sorting_is_permutation_independent ... ok
+test denotation::depth_is_derived_and_bounded ... ok
+test denotation::display_renders_each_shape_exactly ... ok
+test denotation::display_uses_canonical_operand_order ... ok
+test denotation::denotation_is_exact_when_nothing_saturates ... ok
+test denotation::denotation_is_bounded_at_the_top_of_the_lattice ... ok
+test adversary::nary_arity_must_be_budgeted ... ok
+test denotation::omega_in_the_recipe_survives_into_the_term ... ok
+test denotation::empty_and_singleton_nodes_collapse_as_documented ... ok
+test denotation::flattening_a_product_preserves_soundness ... ok
+test denotation::substitution_of_an_absent_variable_is_the_identity ... ok
+test denotation::max_denotes_the_join_of_its_operands ... ok
+test adversary::the_small_generator_really_cannot_saturate ... ok
+test denotation::smart_constructors_never_under_approximate ... ok
+test denotation::the_free_variable_summary_discriminates_between_names ... ok
+test denotation::the_reference_semantics_is_itself_correct ... ok
+test denotation::substitution_over_approximates_the_composed_denotation ... ok
+test denotation::sum_denotes_the_fold_of_its_operands ... ok
+test denotation::zero_one_and_omega_are_distinct_meaning_critical_values ... ok
+test limits::the_depth_limit_is_exact_at_the_n_ary_constructors ... ok
+test limits::the_depth_limit_is_exact_at_the_transcendental_constructor ... ok
+test denotation::prod_over_approximates_the_denotation_of_its_operands ... ok
+test limits::the_tree_size_limit_is_exact_on_ingest ... ok
+test limits::the_wire_version_guard_is_exact ... ok
+test limits::to_wire_accepts_a_term_far_inside_the_node_budget ... ok
+test denotation::wire_round_trip_rebuilds_the_same_term ... ok
+test log_edges::ceil_log_at_the_named_edges ... ok
+test log_edges::ceil_log_base_ten_edges ... ok
+test log_edges::ceil_log_base_two_is_the_ceiling_not_the_floor ... ok
+test log_edges::bound_log_constant_folds ... ok
+test log_edges::ceil_log_is_monotone_in_the_argument ... ok
+test denotation::vars_is_sorted_deduplicated_and_contained ... ok
+test log_edges::ceil_log_is_the_least_exponent_that_reaches_the_argument ... ok
+test log_edges::ceil_log_near_u64_max ... ok
+test log_edges::ceil_log_is_anti_monotone_in_the_base ... ok
+test log_edges::ceil_log_of_omega_is_omega ... ok
+test log_edges::koat_case_x_times_log2_x_plus_two ... ok
+test log_edges::pow_undoes_log_upwards ... ok
+test monotonicity::bases_below_two_are_unrepresentable ... ok
+test log_edges::ceil_log_of_a_finite_argument_is_finite_and_small ... ok
+test log_edges::ceil_log_never_under_reports ... ok
+test denotation::substitution_with_a_dominating_replacement_over_approximates ... ok
+test monotonicity::eval_is_monotone_under_pointwise_increase ... ok
+test monotonicity::ordered_valuation_pairs_really_are_ordered ... ok
+test monotonicity::the_five_nat_methods_are_monotone ... ok
+test monotonicity::the_omega_valuation_dominates_every_finite_one ... ok
+test omega_totality::arithmetic_saturates_to_omega_not_to_u64_max ... ok
+test monotonicity::every_operand_taking_constructor_is_monotone_in_its_operands ... ok
+test monotonicity::every_constructor_is_monotone ... ok
+test monotonicity::substitution_preserves_monotonicity ... ok
+test omega_totality::eval_is_total_at_the_omega_valuation ... ok
+test omega_totality::nat_operators_are_total_on_omega ... ok
+test omega_totality::omega_is_a_const_not_a_seventh_constructor ... ok
+test omega_totality::omega_absorbs_unconditionally ... ok
+test omega_totality::every_constructor_is_total_on_omega ... ok
+test omega_totality::pow_saturates_rather_than_truncating_the_exponent ... ok
+test omega_totality::zero_times_unbound_variable_is_omega_not_a_proved_zero ... ok
+test verdict_blame::a_ledger_can_never_be_empty ... ok
+test verdict_blame::a_publishable_verdict_reports_the_bound_it_was_classified_from ... ok
+test verdict_blame::a_zero_trip_loop_with_an_unanalysed_body_is_not_proved_zero ... ok
+test omega_totality::prod_does_not_fold_zero_times_a_symbolic_operand ... ok
+test verdict_blame::an_origin_carries_the_frontend_string_back_out_unchanged ... ok
+test verdict_blame::an_unblamed_omega_is_refused ... ok
+test verdict_blame::bottom_with_no_blame_is_unreachable_never_a_proved_zero ... ok
+test omega_totality::overflow_saturates_to_omega_never_to_u64_max ... ok
+test verdict_blame::caller_misuse_and_blame_are_different_channels ... ok
+test verdict_blame::blame_order_is_content_determined ... ok
+test verdict_blame::merging_ledgers_agrees_with_inserting ... ok
+test verdict_blame::classification_follows_the_frozen_table ... ok
+test verdict_blame::partial_reports_clean_unless_fail_on_partial_is_set ... ok
+test verdict_blame::require_total_names_the_least_absent_variable ... ok
+test verdict_blame::saturating_valuations_send_absent_variables_to_omega ... ok
+test verdict_blame::with_default_uses_the_supplied_default ... ok
+test verdict_blame::finite_bound_accepts_exactly_the_omega_free_terms ... ok
+test omega_totality::constant_folding_stays_within_its_bounds ... ok
+test verdict_blame::no_verdict_publishes_an_unblamed_omega ... ok
+test limits::the_ingest_node_budget_is_exact ... ok
+test adversary::eval_dominates_the_ideal_semantics_of_its_own_term ... ok
+test adversary::saturating_products_with_zeros_never_under_approximate ... ok
+test adversary::substitution_stays_monotone_over_edge_magnitudes ... ok
+
+failures:
+
+---- canonical_order::bound_kind_satisfies_the_canonical_contract stdout ----
+
+thread 'canonical_order::bound_kind_satisfies_the_canonical_contract' (1419442) panicked at crates/landav-bound/tests/properties/canonical_order.rs:78:13:
+assertion `left == right` failed: BoundKind: Trans { kind: Log, base: Base(2), arg: Bound(Node { kind: Var(VarId(Symbol("x0"))), depth: 1, vars: VarSet(9007199254740992), fingerprint: 13624243797978174058, tree_size: 1 }) } and Trans { kind: Log, base: Base(10), arg: Bound(Node { kind: Var(VarId(Symbol("x0"))), depth: 1, vars: VarSet(9007199254740992), fingerprint: 13624243797978174058, tree_size: 1 }) } share an encoding
+  left: true
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- canonical_order::bound_satisfies_the_canonical_contract stdout ----
+
+thread 'canonical_order::bound_satisfies_the_canonical_contract' (1419443) panicked at crates/landav-bound/tests/properties/canonical_order.rs:78:13:
+assertion `left == right` failed: Bound: Bound(Node { kind: Trans { kind: Log, base: Base(2), arg: Bound(Node { kind: Var(VarId(Symbol("x0"))), depth: 1, vars: VarSet(9007199254740992), fingerprint: 13624243797978174058, tree_size: 1 }) }, depth: 2, vars: VarSet(9007199254740992), fingerprint: 10444088183895808263, tree_size: 2 }) and Bound(Node { kind: Trans { kind: Log, base: Base(10), arg: Bound(Node { kind: Var(VarId(Symbol("x0"))), depth: 1, vars: VarSet(9007199254740992), fingerprint: 13624243797978174058, tree_size: 1 }) }, depth: 2, vars: VarSet(9007199254740992), fingerprint: 762987738640691855, tree_size: 2 }) share an encoding
+  left: true
+ right: false
+
+---- canonical_order::near_miss_pairs_are_separated_by_the_canonical_bytes stdout ----
+proptest: Saving this and future failures in /tmp/cargo-mutants-landav-core-8nLWJU.tmp/crates/landav-bound/tests/proptest-regressions/canonical_order.txt
+proptest: If this test was run on a CI system, you may wish to add the following line to your copy of the file. (You may need to create it.)
+cc caba365fbb464db043a583c07bcc4e788ad92bda2b6a66e8d90ede47916d96b7
+
+thread 'canonical_order::near_miss_pairs_are_separated_by_the_canonical_bytes' (1419559) panicked at crates/landav-bound/tests/properties/canonical_order.rs:97:1:
+Test failed: assertion failed: `(left == right)` 
+  left: `true`, 
+ right: `false`: BumpBase produced 3^(x0) from 2^(x0): canonical_bytes and Eq disagree at crates/landav-bound/tests/properties/canonical_order.rs:220.
+minimal failing input: spec = Trans {
+    log: false,
+    base: 2,
+    arg: Sum(
+        [
+            Max(
+                [
+                    Const(
+                        Some(
+                            0,
+                        ),
+                    ),
+                    Var(
+                        0,
+                    ),
+                ],
+            ),
+            Const(
+                Some(
+                    0,
+                ),
+            ),
+        ],
+    ),
+}, how = BumpBase
+	successes: 8
+	local rejects: 0
+	global rejects: 0
+
+
+---- canonical_order::the_leaf_payloads_satisfy_the_canonical_contract stdout ----
+
+thread 'canonical_order::the_leaf_payloads_satisfy_the_canonical_contract' (1419735) panicked at crates/landav-bound/tests/properties/canonical_order.rs:78:13:
+assertion `left == right` failed: Base: Base(2) and Base(3) share an encoding
+  left: true
+ right: false
+
+
+failures:
+    canonical_order::bound_kind_satisfies_the_canonical_contract
+    canonical_order::bound_satisfies_the_canonical_contract
+    canonical_order::near_miss_pairs_are_separated_by_the_canonical_bytes
+    canonical_order::the_leaf_payloads_satisfy_the_canonical_contract
+
+test result: FAILED. 109 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.81s
+
+error: test failed, to rerun pass `-p landav-bound --test properties`
+
+*** result: Failure(101)

@@ -17,7 +17,6 @@ landav-bound = { workspace = true }
 landav-calibrate = { workspace = true }
 landav-python = { workspace = true }
 landav-solvers = { workspace = true }
-anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

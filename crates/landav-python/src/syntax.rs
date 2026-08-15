@@ -220,7 +220,13 @@ fn push_indent(indents: &mut Vec<usize>, indent: usize, offset: usize) -> Option
 }
 
 /// Offset just past the string literal starting at `index`.
-fn skip_string(bytes: &[u8], index: usize) -> usize {
+///
+/// Shared with [`crate::noqa`], which has the same question to answer for the
+/// opposite reason: the depth guard must not count a bracket inside a literal,
+/// and the suppression scanner must not read a `#` inside one as a comment.
+/// Two scanners disagreeing about where a literal ends is exactly how
+/// `SEPARATOR = "# noqa: LAV003"` would become a waiver.
+pub(crate) fn skip_string(bytes: &[u8], index: usize) -> usize {
     let quote = bytes[index];
     let triple = bytes.get(index + 1) == Some(&quote) && bytes.get(index + 2) == Some(&quote);
     let width = if triple { 3 } else { 1 };

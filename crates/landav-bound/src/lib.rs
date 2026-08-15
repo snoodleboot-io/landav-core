@@ -76,6 +76,7 @@ pub mod lifted;
 pub mod max_plus;
 pub mod max_terms;
 pub mod nat;
+pub mod normalise;
 pub mod normaliser_budget;
 pub mod origin;
 pub mod partial_bound;
@@ -83,6 +84,7 @@ pub mod registry;
 pub mod resource_descriptor;
 pub mod resource_id;
 pub mod semiring_id;
+pub mod subst;
 pub mod symbol;
 pub mod terms;
 pub mod total_valuation;
@@ -114,6 +116,7 @@ pub use crate::{
     max_plus::MaxPlus,
     max_terms::MaxTerms,
     nat::Nat,
+    normalise::{NormalForm, NormaliserStop, normalise, normalise_with, rewrite_rule_names},
     normaliser_budget::NormaliserBudget,
     origin::Origin,
     partial_bound::PartialBound,
@@ -121,6 +124,7 @@ pub use crate::{
     resource_descriptor::ResourceDescriptor,
     resource_id::ResourceId,
     semiring_id::SemiringId,
+    subst::Substitution,
     symbol::Symbol,
     terms::Terms,
     total_valuation::TotalValuation,
@@ -166,7 +170,7 @@ pub const MAX_NODES: u32 = 1 << 20;
 /// [`CacheKeyMaterial`], so bumping it invalidates every persisted F-008 cache
 /// entry - which is the correct and only sound response to a normal-form
 /// change.
-pub const NORMAL_FORM_VERSION: u32 = 1;
+pub const NORMAL_FORM_VERSION: u32 = 2;
 
 /// The version tag carried by [`BoundWire`].
 ///

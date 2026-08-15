@@ -1,0 +1,21 @@
+--- crates/landav-bound/src/base.rs
++++ replace Base::get -> u32 with 1
+@@ -41,17 +41,17 @@
+             return Err(BoundError::BaseTooSmall { got: k });
+         }
+         Ok(Self(k))
+     }
+ 
+     /// The validated base, always `>= 2`.
+     #[must_use]
+     pub const fn get(self) -> u32 {
+-        self.0
++        1 /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ impl TryFrom<u32> for Base {
+     type Error = BoundError;
+ 
+     fn try_from(k: u32) -> Result<Self, Self::Error> {
+         Self::new(k)

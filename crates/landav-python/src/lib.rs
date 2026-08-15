@@ -66,6 +66,17 @@
 //! precisely so that a rule which cannot be made precise can be withdrawn
 //! rather than shipped noisy. Its fixture directory is left in place: deleting
 //! it needs the test author's sign-off, not the implementer's.
+//!
+//! # Suppression (`LAN-66`)
+//!
+//! A rule set nobody can silence is a rule set that gets switched off whole,
+//! so [`analyze_module_with`] honours `# noqa: LAV003` comments and the
+//! per-path [`PathWaiver`]s a driver hands it. What makes this more than a
+//! filter is [`ModuleAnalysis::suppressions`]: every waiver produces a
+//! [`Suppression`] record — including the ones that suppressed nothing and the
+//! ones naming a code that does not exist — so a waiver can never go quiet.
+//! [`suppression`] explains the record's shape and the `E-001` seam it was
+//! designed against.
 
 #![doc(html_root_url = "https://docs.rs/landav-python")]
 #![forbid(unsafe_code)]
@@ -81,23 +92,30 @@ pub mod python_error;
 pub mod registry;
 pub mod rule;
 pub mod rule_code;
+pub mod suppression;
 
 // Internal, and deliberately not `pub`. Everything below is a detail of *how*
 // the rules are decided; publishing it would make the parser choice part of the
 // crate's contract, and F-043 has to be able to swap it at R3 without a
 // breaking change.
+//
+// `noqa` is here for the same reason: the *record* a waiver produces is public
+// because a driver has to report it, but the comment syntax it was written in
+// is a Python fact and stays behind the frontend boundary.
 mod context;
+mod noqa;
 mod patterns;
 mod syntax;
 
 pub use crate::{
-    analysis::{ModuleAnalysis, analyze_module, analyze_source},
+    analysis::{ModuleAnalysis, analyze_module, analyze_module_with, analyze_source},
     finding::Finding,
     location::Location,
     python_error::PythonError,
-    registry::{registry, rule, rule_for_code},
+    registry::{RETIRED_CODES, is_retired_code, registry, rule, rule_for_code},
     rule::Rule,
     rule_code::RuleCode,
+    suppression::{PathWaiver, Suppression, SuppressionOrigin, SuppressionStatus, path_matches},
 };
 
 /// The lowest rule count `F-005` may ship with.

@@ -15,6 +15,16 @@
 //! A `_ => ExitCode::Clean` fallback would turn that compile error into a
 //! green build for an outcome nobody classified, which is the exact failure
 //! mode the criterion exists to prevent.
+//!
+//! # This is the only mapping onto [`ExitCode`], anywhere
+//!
+//! [`landav_bound`] declares the code space and, since LAN-61, prices nothing
+//! with it: `Verdict::exit_code` used to answer the same question this module
+//! answers - what is "analysed, but no conclusion reached" worth? - and
+//! answered it differently, with `Clean` or `ToolError` against this module's
+//! `Findings`. Two mappings for one state is not a mapping. The library keeps
+//! the *fact* (`Verdict::is_conclusive`, `Verdict::blames`); the price is set
+//! here, and here only, because this is the layer that has a process to exit.
 
 use landav_bound::ExitCode;
 

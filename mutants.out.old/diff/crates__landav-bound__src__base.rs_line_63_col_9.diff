@@ -1,0 +1,19 @@
+--- crates/landav-bound/src/base.rs
++++ replace <impl Canonical for Base>::canonical_cmp -> core::cmp::Ordering with Default::default()
+@@ -55,15 +55,15 @@
+ 
+     fn try_from(k: u32) -> Result<Self, Self::Error> {
+         Self::new(k)
+     }
+ }
+ 
+ impl Canonical for Base {
+     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
+-        self.0.cmp(&other.0)
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn write_canonical(&self, out: &mut Vec<u8>) {
+         out.extend_from_slice(&self.0.to_be_bytes());
+     }
+ }

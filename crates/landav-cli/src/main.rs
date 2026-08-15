@@ -39,6 +39,7 @@ mod cli;
 mod config;
 mod diagnostic;
 mod outcome;
+mod resource;
 mod sources;
 
 use landav_bound::ExitCode;

@@ -51,7 +51,12 @@ design. See [`docs/EDITIONS.md`](docs/EDITIONS.md).
 
 - Rust 1.95+, edition 2024, `rustfmt` and `clippy` clean
 - `snake_case` files, `PascalCase` types, `UPPER_SNAKE` constants
-- Errors via `thiserror` in libraries, `anyhow` in the binary
+- Errors via `thiserror`, in the libraries **and** in the binary. `landav-cli`
+  carries a typed, blame-carrying `ToolError` by design: non-negotiable 3 says
+  a failure must name its subject and the reason it failed, and `ToolError` has
+  no constructor that omits either — a blameless error is unrepresentable.
+  `anyhow::Error` accepts any string and so cannot enforce that, which is why
+  the binary does not depend on it
 - Group imports: `std` → third-party → internal, blank line between groups
 - Prefer borrowing over cloning; prefer traits over concrete types
 - Flag any new dependency explicitly in the PR description

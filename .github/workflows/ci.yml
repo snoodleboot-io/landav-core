@@ -36,6 +36,17 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # `dioid_laws`, `law` and `law_failure` are gated behind
+      # `cfg(any(test, feature = "laws"))`. The feature exists so a `Dioid`
+      # instance defined in another crate inherits this crate's conformance
+      # suite unchanged -- and that path was never compiled here, so the
+      # mechanism could have rotted without anything going red.
+      - name: Clippy (laws feature)
+        run: cargo clippy -p landav-bound --features laws --all-targets -- -D warnings
+
+      - name: Test (laws feature)
+        run: cargo test -p landav-bound --features laws
+
       - name: Docs
         run: cargo doc --workspace --no-deps
 

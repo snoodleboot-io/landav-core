@@ -255,13 +255,20 @@ proptest! {
     /// these generators:
     ///
     /// ```text
-    /// b = Prod[Const(2), Var(x0)]    r = Prod[Const(0), Var(x0)]    x0 = u64::MAX
+    /// b = Prod[Const(0), Var(x0)]    image(x0) = Prod[Const(2^40), Var(x1)]
+    ///                                            at x1 = 2^40
     ///
-    /// r.eval          = 0        non-zero factors {u64::MAX} fit, a zero is present
-    /// b.eval(x0 := 0) = 0        non-zero factors {2} fit, a zero is present
-    /// b.subst(x0, r)  = Prod[Const(0), Const(2), Var(x0)]        (flattened)
-    ///                 = omega    non-zero factors {2, u64::MAX} overflow
+    /// subst(b)               = Prod[Const(0), Var(x1)]   the zero decides the literals
+    /// subst(b).eval          = 0                         exact: the product is zero
+    ///
+    /// image.eval             = omega                     2^40 * 2^40 leaves u64
+    /// b.eval(x0 := omega)    = omega                     omega absorbs (LAN-73)
     /// ```
+    ///
+    /// `0 != omega`, the full width of the lattice. Rebinding routes the
+    /// image's value through a saturating magnitude *before* the enclosing zero
+    /// is consulted; substituting keeps the zero and the image in one term,
+    /// where the zero wins. Both are sound; only the substitution is tight.
     ///
     /// `subst` rebuilds through the smart constructors, which flatten, and
     /// flattening regroups the factors of a non-associative product. Every

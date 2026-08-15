@@ -133,10 +133,10 @@ proptest! {
             Verdict::Proved(finite) => {
                 prop_assert!(finite.get().is_finite(), "Proved must be omega-free");
                 prop_assert_eq!(verdict.blames(), None);
-                prop_assert_eq!(verdict.exit_code(false), ExitCode::Clean);
-                prop_assert_eq!(verdict.exit_code(true), ExitCode::Clean);
+                prop_assert!(verdict.is_conclusive(), "Proved is a conclusion");
             }
             Verdict::Partial(_) => {
+                prop_assert!(!verdict.is_conclusive(), "Partial is not a conclusion");
                 match verdict.blames() {
                     Some(blames) => {
                         prop_assert!(!blames.is_empty());
@@ -255,8 +255,10 @@ fn bottom_with_no_blame_is_unreachable_never_a_proved_zero() {
     if let Ok(verdict) = got {
         assert_eq!(verdict.bound(), None, "Unreachable reports no cost, not 0");
         assert_eq!(verdict.blames(), None);
-        assert_eq!(verdict.exit_code(false), ExitCode::Clean);
-        assert_eq!(verdict.exit_code(true), ExitCode::Clean);
+        assert!(
+            verdict.is_conclusive(),
+            "Unreachable is a conclusion: nothing was left unaccounted for"
+        );
     }
 }
 
@@ -311,29 +313,39 @@ fn a_ledger_can_never_be_empty() {
     assert_eq!(deduplicated.len(), 1);
 }
 
-/// `--fail-on-partial` must exist, and the default must be documented rather
-/// than assumed: without the flag, a file where every function came back
-/// `Partial` **with blame** reports clean.
+/// **A `Partial` is never a conclusion**, and the three status bytes are
+/// frozen.
 ///
-/// `ExitCode::Findings` is unreachable in M0 (it needs semantic domination,
-/// which is F-018), so the only code left for "we could not look" is
-/// `ToolError`.
+/// This test was `partial_reports_clean_unless_fail_on_partial_is_set`, and it
+/// pinned a `--fail-on-partial` default through `Verdict::exit_code`. That
+/// function is gone (LAN-61): it priced "analysed, no conclusion reached" as
+/// `Clean`, or as `ToolError` under the flag, while `landav-cli` priced the
+/// same state as `Findings`. One state, three codes - and pricing is the
+/// CLI's decision, not this crate's.
+///
+/// The requirement it was reaching for - **the flag must exist and its default
+/// must be documented rather than assumed** - is not dropped. It is asserted
+/// where it is currently true: `landav_cli::config` *refuses*
+/// `[tool.landav] fail-on-partial` by name rather than accepting and ignoring
+/// it, so nobody can set it and believe it was honoured. What survives here is
+/// what this crate owns - a blamed bound is not a conclusion - and the frozen
+/// bytes themselves.
 #[test]
-fn partial_reports_clean_unless_fail_on_partial_is_set() -> Result<(), BoundError> {
+fn partial_is_never_a_conclusion_and_the_status_bytes_are_frozen() -> Result<(), BoundError> {
     let verdict = Verdict::classify(
         Lifted::Elem(Bound::omega()),
         Origin::new("cli.rs:1"),
         Some(one_blame()),
     )?;
 
-    assert_eq!(verdict.exit_code(false), ExitCode::Clean);
-    assert_ne!(verdict.exit_code(true), ExitCode::Clean);
-    assert_ne!(
-        verdict.exit_code(true),
-        ExitCode::Findings,
-        "Findings is unreachable until F-018 lands"
+    assert!(
+        !verdict.is_conclusive(),
+        "a bound reached with blame is not a conclusion, whatever it is priced at"
     );
-    assert_eq!(verdict.exit_code(true), ExitCode::ToolError);
+    assert!(
+        verdict.blames().is_some(),
+        "and the blame is what a caller prices it from"
+    );
 
     assert_eq!(ExitCode::Clean.as_i32(), 0);
     assert_eq!(ExitCode::Findings.as_i32(), 1);
@@ -439,7 +451,7 @@ fn a_publishable_verdict_reports_the_bound_it_was_classified_from() {
             "Proved must report the bound it proved"
         );
         assert_eq!(verdict.blames(), None);
-        assert_eq!(verdict.exit_code(true), ExitCode::Clean);
+        assert!(verdict.is_conclusive(), "Proved is a conclusion");
     }
 
     let loose = Bound::max_of([Bound::var("n"), Bound::omega()]);
@@ -455,8 +467,7 @@ fn a_publishable_verdict_reports_the_bound_it_was_classified_from() {
             "Partial must report the bound it over-approximated with"
         );
         assert_eq!(verdict.blames(), Some(&one_blame()));
-        assert_eq!(verdict.exit_code(false), ExitCode::Clean);
-        assert_eq!(verdict.exit_code(true), ExitCode::ToolError);
+        assert!(!verdict.is_conclusive(), "Partial is not a conclusion");
     }
 
     // `Bottom` with blame is a `Partial` over `omega`, so it reports a cost

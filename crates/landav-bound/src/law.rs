@@ -73,3 +73,66 @@ impl core::fmt::Display for Law {
         f.write_str(self.tag())
     }
 }
+
+#[cfg(test)]
+mod frozen_numbering {
+    use super::Law;
+
+    /// The whole point of this enum is that no document can renumber the laws.
+    /// Pinned one at a time, because a `zip` of two lists that both moved
+    /// would pass.
+    #[test]
+    fn tags_are_pinned() {
+        assert_eq!(Law::PlusMonoid.tag(), "L1");
+        assert_eq!(Law::TimesMonoid.tag(), "L2");
+        assert_eq!(Law::Distributivity.tag(), "L3");
+        assert_eq!(Law::Annihilation.tag(), "L4");
+        assert_eq!(Law::StarUnfolding.tag(), "L5");
+        assert_eq!(Law::ZeroSumFreedom.tag(), "L6");
+        assert_eq!(Law::Antisymmetry.tag(), "L7");
+        assert_eq!(Law::NonDegeneracy.tag(), "L8");
+        assert_eq!(Law::StarAtZero.tag(), "L9");
+        assert_eq!(Law::StarMonotonicity.tag(), "L10");
+        assert_eq!(Law::Idempotence.tag(), "L11");
+    }
+
+    /// `ALL` is in numbering order, complete, and duplicate free. The law
+    /// suite iterates it to build its per-law report, so a missing or repeated
+    /// entry silently loses or double counts a law's coverage.
+    #[test]
+    fn all_is_complete_ordered_and_duplicate_free() {
+        assert_eq!(Law::ALL.len(), 11);
+        assert_eq!(
+            Law::ALL,
+            [
+                Law::PlusMonoid,
+                Law::TimesMonoid,
+                Law::Distributivity,
+                Law::Annihilation,
+                Law::StarUnfolding,
+                Law::ZeroSumFreedom,
+                Law::Antisymmetry,
+                Law::NonDegeneracy,
+                Law::StarAtZero,
+                Law::StarMonotonicity,
+                Law::Idempotence,
+            ]
+        );
+        let mut sorted: Vec<Law> = Law::ALL.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 11, "ALL must not repeat a law");
+    }
+
+    /// `Display` is the tag, so a failure message names the law by number.
+    /// `L10` and `L11` are the ones a `tag()` written with a `&tag[..2]`
+    /// slice would truncate.
+    #[test]
+    fn display_is_the_tag() {
+        for law in Law::ALL {
+            assert_eq!(law.to_string(), law.tag());
+        }
+        assert_eq!(Law::StarMonotonicity.to_string(), "L10");
+        assert_eq!(Law::Idempotence.to_string(), "L11");
+    }
+}

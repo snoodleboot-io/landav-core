@@ -1,8 +1,32 @@
 //! [`Verdict`] - the only sanctioned way to publish a derivation result.
+//!
+//! # There is deliberately no `Verdict::exit_code`
+//!
+//! A [`Verdict`] states a **fact** about a derivation: a bound was proved, a
+//! bound was reached with something unaccounted for, or no execution gets
+//! there. A process exit code puts a **price** on that fact, and pricing is
+//! policy. This crate declares the code space ([`crate::exit_code::ExitCode`])
+//! so the CLI cannot invent one, and stops there - the same line it draws at
+//! [`Bound`] implementing no [`Ord`].
+//!
+//! The mapping is therefore decided in exactly one place,
+//! `landav_cli::outcome::Outcome::exit_code`. A `Verdict::exit_code` alongside
+//! it (LAN-61) priced [`Verdict::Partial`] as `Clean`, or as `ToolError` under
+//! a `--fail-on-partial` flag, while the CLI priced the same state - analysed,
+//! no conclusion reached - as `Findings`. One semantic state, three codes,
+//! and no caller: nothing outside its own tests ever invoked it.
+//!
+//! Its `fail_on_partial` parameter was the tell. `landav-cli`'s configuration
+//! loader *refuses* `[tool.landav] fail-on-partial`, on the stated grounds
+//! that "a setting that is accepted and ignored is worse than one that is
+//! refused". A function whose result turns on a flag the product refuses is
+//! that same setting, one layer down. The question it answered belongs to
+//! whoever ships the flag; until then, [`Verdict::blames`] is the fact a
+//! caller needs, and the price is the CLI's to set.
 
 use crate::{
-    blames::Blames, bound::Bound, bound_error::BoundError, exit_code::ExitCode,
-    finite_bound::FiniteBound, lifted::Lifted, origin::Origin, partial_bound::PartialBound,
+    blames::Blames, bound::Bound, bound_error::BoundError, finite_bound::FiniteBound,
+    lifted::Lifted, origin::Origin, partial_bound::PartialBound,
 };
 
 /// The result of a derivation. None of the outcomes is "unknown".
@@ -92,26 +116,17 @@ impl Verdict {
         }
     }
 
-    /// The process exit code.
+    /// Whether the derivation reached a conclusion.
     ///
-    /// `fail_on_partial` corresponds to the `--fail-on-partial` flag.
-    /// **Without it, a file where every function came back `Partial` with
-    /// blame reports clean**, because "we could not look" has no code of its
-    /// own - so the flag must exist and the default must be documented rather
-    /// than assumed.
+    /// True for [`Verdict::Proved`] and [`Verdict::Unreachable`], false for
+    /// [`Verdict::Partial`]. This is the **fact** a caller deciding an exit
+    /// code needs; see the module documentation for why the decision itself is
+    /// not made here.
     #[must_use]
-    pub fn exit_code(&self, fail_on_partial: bool) -> ExitCode {
+    pub const fn is_conclusive(&self) -> bool {
         match self {
-            Self::Proved(_) | Self::Unreachable(_) => ExitCode::Clean,
-            // `Findings` needs semantic domination (F-018), so the only code
-            // left for "we could not look" is `ToolError`.
-            Self::Partial(_) => {
-                if fail_on_partial {
-                    ExitCode::ToolError
-                } else {
-                    ExitCode::Clean
-                }
-            }
+            Self::Proved(_) | Self::Unreachable(_) => true,
+            Self::Partial(_) => false,
         }
     }
 }

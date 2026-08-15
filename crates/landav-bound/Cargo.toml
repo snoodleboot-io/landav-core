@@ -19,6 +19,19 @@ laws = []
 serde = { workspace = true }
 thiserror = { workspace = true }
 
+# LAN-58. `features = ["deterministic"]` is **not** optional: without it egg's
+# internal maps are `hashbrown` behind a fixed-seed `FxBuildHasher`, so
+# iteration order is a function of hashbrown's bucket layout and the hasher's
+# constants - both of which move within semver. The feature swaps them for
+# `IndexMap`/`IndexSet`, which iterate in insertion order.
+#
+# This is also the crate that pulls `egg` and its whole transitive tree into
+# the committed `Cargo.lock`; the workspace pin is `=0.11.0` and nothing
+# depended on it before now. A `cargo update` that moves `egg`, `hashbrown`,
+# `indexmap`, `rustc-hash` or `symbol_table` requires re-running the golden
+# and cross-process determinism gates in `tests/normalisation.rs`.
+egg = { workspace = true, features = ["deterministic"] }
+
 # The LAN-56 acceptance criteria are property tests (`tests/properties/`), not
 # example tests: weak monotonicity and composition-by-substitution soundness
 # are properties, and a handful of examples will not catch a violation.

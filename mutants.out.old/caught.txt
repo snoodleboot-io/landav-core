@@ -1,0 +1,3 @@
+crates/landav-bound/src/base.rs:49:9: replace Base::get -> u32 with 0
+crates/landav-bound/src/base.rs:67:9: replace <impl Canonical for Base>::write_canonical with ()
+crates/landav-bound/src/base.rs:49:9: replace Base::get -> u32 with 1

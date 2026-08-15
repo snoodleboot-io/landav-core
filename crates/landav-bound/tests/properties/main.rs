@@ -17,6 +17,14 @@
 //! | 3. monotonicity under pointwise argument increase | `monotonicity` |
 //! | 4. no panics on `omega` in any operator | `omega_totality` |
 //!
+//! and LAN-57's, which build on the same harness:
+//!
+//! | LAN-57 AC | file |
+//! |---|---|
+//! | 1. `subst(bound, var, bound)` is total | `substitution` |
+//! | 2. composition of two bounds is a bound (closed) | `substitution` |
+//! | 3. KoAT's worked example, up to canonical form | `substitution` |
+//!
 //! plus the decisions the design panel and the three adversaries settled,
 //! which are acceptance criteria in everything but numbering: unconditional
 //! `omega` absorption including `0 * omega`, saturation rather than
@@ -44,5 +52,7 @@ mod denotation;
 mod limits;
 mod log_edges;
 mod monotonicity;
+mod normal_form;
 mod omega_totality;
+mod substitution;
 mod verdict_blame;

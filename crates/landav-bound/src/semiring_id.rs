@@ -24,3 +24,33 @@ impl SemiringId {
         self.0
     }
 }
+
+#[cfg(test)]
+mod identity {
+    use super::SemiringId;
+    use crate::{b::B, dioid::Dioid, max_plus::MaxPlus};
+
+    /// `as_str` round-trips the name exactly.
+    #[test]
+    fn the_name_round_trips_byte_for_byte() {
+        assert_eq!(SemiringId::new("additive").as_str(), "additive");
+        assert_eq!(SemiringId::new("peak").as_str(), "peak");
+        assert_eq!(SemiringId::new("").as_str(), "");
+    }
+
+    /// The two shipped algebras are distinct, and their names are frozen: they
+    /// appear in every [`crate::LawFailure`] a future instance produces.
+    #[test]
+    fn the_shipped_algebras_are_named_and_distinct() {
+        assert_eq!(B::SEMIRING.as_str(), "additive");
+        assert_eq!(MaxPlus::SEMIRING.as_str(), "peak");
+        assert_ne!(B::SEMIRING, MaxPlus::SEMIRING);
+    }
+
+    /// `new` is `const`, so it can be an associated const on a `Dioid`.
+    #[test]
+    fn new_is_usable_in_a_const_context() {
+        const ADDITIVE: SemiringId = SemiringId::new("additive");
+        assert_eq!(ADDITIVE, B::SEMIRING);
+    }
+}

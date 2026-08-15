@@ -24,6 +24,27 @@ pub fn rule(code: RuleCode) -> Option<&'static Rule> {
     rule_for_code(code.as_str())
 }
 
+/// Codes that were issued, shipped, and then withdrawn.
+///
+/// Burned, never reassigned — `tests/rule_registry.rs::retired_codes_are_not_reused`
+/// holds the line, and `tests/deferred/` holds the fixtures. The list is
+/// published rather than kept in a test because a *suppression comment* names
+/// a code: without it, a `# noqa: LAV010` written while the rule was live
+/// would be reported years later as a typo, when the truth is that the author
+/// spelled it correctly and the rule beneath it was withdrawn. Those two need
+/// different edits, and only this list can tell them apart. See
+/// [`crate::SuppressionStatus::Retired`].
+pub const RETIRED_CODES: [&str; 1] = ["LAV010"];
+
+/// Whether `code` names a rule that was issued and later withdrawn.
+///
+/// Compared verbatim: `lav010` is a typo, not a retired code, and reporting it
+/// as retired would tell the author their spelling was fine.
+#[must_use]
+pub fn is_retired_code(code: &str) -> bool {
+    RETIRED_CODES.contains(&code)
+}
+
 pub(crate) const LAV001: RuleCode = RuleCode::new("LAV001");
 pub(crate) const LAV002: RuleCode = RuleCode::new("LAV002");
 pub(crate) const LAV003: RuleCode = RuleCode::new("LAV003");

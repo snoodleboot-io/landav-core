@@ -43,11 +43,33 @@
 //! It maps to `Inconclusive` rather than to a tool error on purpose. The tool
 //! completed; what it has to report is a fact about the file, and the person
 //! who can act on it is the person who owns the file.
+//!
+//! # A waived finding is not a finding, and the waiver is
+//!
+//! `LAN-66` lets an author waive a rule they have judged acceptable, inline or
+//! per path, and a waived finding does **not** raise the exit code. That is
+//! the point of the feature: a gate that fails anyway would be answered by
+//! deleting the rule, or by deleting the gate.
+//!
+//! What the exit code stops carrying, the report starts carrying. Every
+//! waiver is printed — the ones that fired, the ones that fired for nothing,
+//! and the ones naming a code no build has ever issued — and the run summary
+//! counts them. None of them changes the exit code either: a stale waiver is
+//! not a defect in the code under analysis, the run that would fail on it
+//! depends on which subset of the tree was named, and failing on one punishes
+//! whoever fixed the underlying problem and left the comment behind.
+//!
+//! Escalating any of that to a build failure is a *policy* decision — whose
+//! waiver, approved by whom, expiring when — and `docs/EDITIONS.md` puts
+//! policy governance (`E-001`) on the paid side. This crate records; it does
+//! not govern, and it contains no entitlement logic of any kind.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::Path;
 
-use landav_python::{ModuleAnalysis, PythonError};
+use landav_bound::ResourceKind;
+use landav_python::{ModuleAnalysis, PythonError, Suppression, SuppressionStatus};
 
 use crate::config::{self, Config};
 use crate::diagnostic::ToolError;
@@ -55,8 +77,12 @@ use crate::outcome::Outcome;
 use crate::sources::Target;
 
 /// Run `check` over `target`, reporting to stdout and stderr.
-pub fn run(target: &Path, explicit_config: Option<&Path>) -> Outcome {
-    match analyse(target, explicit_config) {
+pub fn run(
+    target: &Path,
+    explicit_config: Option<&Path>,
+    resource: Option<ResourceKind>,
+) -> Outcome {
+    match analyse(target, explicit_config, resource) {
         Ok(outcome) => outcome,
         Err(error) => {
             report_failure(&error);
@@ -66,13 +92,18 @@ pub fn run(target: &Path, explicit_config: Option<&Path>) -> Outcome {
 }
 
 /// The run proper. Every failure is a [`ToolError`] carrying blame.
-fn analyse(target: &Path, explicit_config: Option<&Path>) -> Result<Outcome, ToolError> {
+fn analyse(
+    target: &Path,
+    explicit_config: Option<&Path>,
+    resource: Option<ResourceKind>,
+) -> Result<Outcome, ToolError> {
     let config = config::load(target, explicit_config)?;
     let (kind, mut walk) = crate::sources::collect(target)?;
 
     let mut findings = 0usize;
     let mut inconclusive = 0usize;
     let mut statements = 0usize;
+    let mut waived = Tally::default();
     let mut report = Report::new(std::io::stdout().lock());
 
     for path in &walk.sources {
@@ -86,11 +117,12 @@ fn analyse(target: &Path, explicit_config: Option<&Path>) -> Result<Outcome, Too
                 continue;
             }
         };
-        match landav_python::analyze_module(path, &text) {
+        match landav_python::analyze_module_with(path, &text, config.waivers()) {
             Ok(module) => {
                 statements += module.statements();
                 findings += module.findings().len();
                 publish(&mut report, &module);
+                waived.absorb(&mut report, &module);
             }
             Err(PythonError::Parse {
                 line,
@@ -115,13 +147,32 @@ fn analyse(target: &Path, explicit_config: Option<&Path>) -> Result<Outcome, Too
         }
     }
 
+    // Configured waivers are decided once and applied to many files, so they
+    // are folded and reported after the walk rather than once per file. This
+    // is also what names a waiver whose glob matched nothing at all, which no
+    // per-file record could.
+    waived.publish_configured(&mut report, config.waivers());
+
+    // A resource was asked about and this build derives no bound for any of
+    // them, so the run has nothing to say about the question it was asked.
+    // Reported before the summary, on its own line, so that it reads like the
+    // other inconclusive results — which is what it is.
+    let unaccounted = resource_unaccounted(resource, statements);
+    if let Some(kind) = resource
+        && unaccounted
+    {
+        report.line(format_args!("{}", crate::resource::unaccounted(kind)));
+    }
+
     summarise(
         &mut report,
         target,
         &config,
         &walk.sources,
         findings,
+        &waived,
         inconclusive,
+        resource,
     );
     // A report that never reached the operator is not a report, so a stream
     // that could not be written is a reason the run did not complete — and
@@ -132,7 +183,14 @@ fn analyse(target: &Path, explicit_config: Option<&Path>) -> Result<Outcome, Too
     }
 
     let outcome = if walk.problems.is_empty() {
-        classify(kind, walk.sources.len(), statements, findings, inconclusive)
+        classify(
+            kind,
+            walk.sources.len(),
+            statements,
+            findings,
+            inconclusive,
+            unaccounted,
+        )
     } else {
         Outcome::Failed
     };
@@ -164,6 +222,133 @@ fn publish<W: std::io::Write>(report: &mut Report<W>, module: &ModuleAnalysis) {
             finding.rule(),
             finding.explanation()
         ));
+    }
+}
+
+/// What the run learned about its waivers.
+///
+/// Inline waivers are printed as they are met, beside the file they are in.
+/// Configured ones are folded here and printed once at the end: a glob over a
+/// thousand-file tree is one waiver the author wrote, not a thousand.
+#[derive(Debug, Default)]
+struct Tally {
+    /// Findings removed by a waiver, of either kind.
+    suppressed: usize,
+    /// Waivers that removed nothing: unused, retired, or naming no rule.
+    stale: usize,
+    /// Findings credited to each `(pattern, rule code)`.
+    credited: BTreeMap<(String, String), usize>,
+}
+
+impl Tally {
+    /// Records one module's waivers, printing the inline ones.
+    fn absorb<W: std::io::Write>(&mut self, report: &mut Report<W>, module: &ModuleAnalysis) {
+        for record in module.suppressions() {
+            self.suppressed += record.suppressed();
+            match record.origin().pattern() {
+                // A configured waiver's verdict is not final until every file
+                // has been walked, so it is counted and not yet judged.
+                Some(pattern) => {
+                    *self
+                        .credited
+                        .entry((pattern.to_owned(), record.code().to_owned()))
+                        .or_default() += record.suppressed();
+                }
+                None => {
+                    if record.is_stale() {
+                        self.stale += 1;
+                    }
+                    report.line(format_args!(
+                        "{}:{}: suppressed: {}: {}",
+                        record
+                            .origin()
+                            .file()
+                            .unwrap_or_else(|| Path::new("<unknown>"))
+                            .display(),
+                        record.origin().line().unwrap_or_default(),
+                        record.code(),
+                        describe(record)
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Prints one line per configured waiver, in the order they were written.
+    ///
+    /// Driven from the configuration rather than from what the files produced,
+    /// so a glob that matched no file at all — the stale path that a directory
+    /// move leaves behind — is named instead of vanishing.
+    fn publish_configured<W: std::io::Write>(
+        &mut self,
+        report: &mut Report<W>,
+        waivers: &[landav_python::PathWaiver],
+    ) {
+        let mut seen = BTreeSet::new();
+        for waiver in waivers {
+            for code in waiver.rules() {
+                let key = (waiver.pattern().to_owned(), code.clone());
+                if !seen.insert(key.clone()) {
+                    // Two entries waiving the same code over the same glob are
+                    // one waiver as far as the findings are concerned;
+                    // reporting the credit twice would double-count it.
+                    continue;
+                }
+                // Declared with nothing to its name, then credited with what
+                // the walk found. Folding through the record rather than
+                // summing beside it is what keeps the status derived rather
+                // than asserted: a waiver that fired in the last file of the
+                // tree comes out applied, not stale.
+                let record = Suppression::per_path(
+                    code.clone(),
+                    waiver.pattern().to_owned(),
+                    Some(waiver.reason().to_owned()),
+                    0,
+                )
+                .crediting(self.credited.get(&key).copied().unwrap_or_default());
+                if record.is_stale() {
+                    self.stale += 1;
+                }
+                report.line(format_args!(
+                    "{}: suppressed: {}: {}",
+                    waiver.pattern(),
+                    record.code(),
+                    describe(&record)
+                ));
+            }
+        }
+    }
+}
+
+/// The half of a suppression line that says what the waiver did.
+///
+/// Written as an exhaustive match with no wildcard arm: a fifth
+/// [`SuppressionStatus`] is a compile error here until somebody decides what
+/// the operator is told about it, which is the same reasoning
+/// [`crate::outcome`] uses for the exit codes.
+fn describe(record: &Suppression) -> String {
+    let scope = match record.origin().pattern() {
+        Some(_) => "waived by configuration",
+        None => "waived inline",
+    };
+    match record.status() {
+        SuppressionStatus::Applied => format!(
+            "{} {scope}: {}",
+            plural(record.suppressed(), "finding"),
+            record.reason().unwrap_or("no reason given")
+        ),
+        SuppressionStatus::Unused => format!(
+            "{scope}, but the rule did not fire in the code this covers; the waiver \
+             is doing nothing and can be removed"
+        ),
+        SuppressionStatus::Retired => format!(
+            "{scope}, but this code was issued and then withdrawn; it is never \
+             reported and never reused, so the waiver has no effect"
+        ),
+        SuppressionStatus::Unknown => format!(
+            "{scope}, but no landav rule has ever carried this code; nothing is \
+             waived by it, so check the spelling"
+        ),
     }
 }
 
@@ -218,6 +403,22 @@ impl<W: std::io::Write> Report<W> {
     }
 }
 
+/// Whether the run owes the operator an unaccounted-for-resource result.
+///
+/// True when a resource was named and there was code to account for it in.
+///
+/// The `statements` qualification is the whole content of this function, and it
+/// is why it is a function rather than an expression inline in [`analyse`]: a
+/// run that analysed no code at all has a stronger and more actionable thing to
+/// say about itself, and [`classify`] says it. Announcing that a resource was
+/// left unaccounted for over a tree that held no code buries "this path matches
+/// nothing" — a stale glob the caller can fix today — under a milestone
+/// limitation that will be equally true of every run until bound inference
+/// lands.
+const fn resource_unaccounted(resource: Option<ResourceKind>, statements: usize) -> bool {
+    resource.is_some() && statements > 0
+}
+
 /// Turn the counts into exactly one outcome.
 ///
 /// Order matters, and it is the order of how much a claim would be worth. A
@@ -244,12 +445,31 @@ impl<W: std::io::Write> Report<W> {
 /// So the rule is scoped to directory targets, which is exactly where its
 /// justification applies, and leaves the acceptance suite's empty-directory
 /// assertion intact.
+///
+/// # Where a selected resource sits in that order, and why it is last
+///
+/// `unaccounted` is LAN-60: a resource was named and no bound for it was
+/// derived. It ranks **below** everything the run established about the code
+/// and below the emptiness check, and above clean.
+///
+/// Below the emptiness check because the two answers compete and one of them is
+/// worth more. "This target holds no code" is a fact about the caller's
+/// invocation that they can act on today — a path that has stopped matching
+/// after a directory move — while "no bound was derived" is a fact about this
+/// milestone that will be equally true of every run until the analysis tier
+/// lands. Letting the milestone limitation win would mask the stale path with a
+/// message nobody can do anything about, and turn a `2` into a `1`.
+///
+/// Above clean because exit `0` claims analysis ran and every bound held. There
+/// is no bound and it did not hold; saying so is the difference between a
+/// verdict and a fabrication.
 const fn classify(
     target: Target,
     files: usize,
     statements: usize,
     findings: usize,
     inconclusive: usize,
+    unaccounted: bool,
 ) -> Outcome {
     if findings > 0 {
         return Outcome::Findings;
@@ -262,6 +482,9 @@ const fn classify(
             Target::Directory => Outcome::NothingAnalysed,
             Target::File => Outcome::Clean,
         };
+    }
+    if unaccounted {
+        return Outcome::Inconclusive;
     }
     Outcome::Clean
 }
@@ -283,22 +506,58 @@ fn nothing_to_analyse(target: &Path, files: usize) -> ToolError {
 }
 
 /// The one-line summary every run ends with.
+///
+/// The suppression counts are printed on **every** run, including the runs
+/// with none, because that is what makes them greppable: a CI job that watches
+/// the number can only notice it going up if the number is always there.
+/// `LAN-66` criterion 3 is this line — a waiver that never appears in a
+/// summary is a waiver nobody will ever revisit.
+/// The selected resource is named here on **every** run that named one,
+/// including the runs that found nothing to analyse and so print no
+/// unaccounted-for line. A summary that does not say which resource was asked
+/// about cannot be filed against the invocation that produced it, and
+/// `--resource ops` and `--resource alloc` share an algebra, so the algebra
+/// alone would not tell them apart — see [`crate::resource`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the summary is a projection of the run's counts; bundling them \
+              into a struct would put a constructor between each count and the \
+              line it appears on"
+)]
 fn summarise<W: std::io::Write>(
     report: &mut Report<W>,
     target: &Path,
     config: &Config,
     sources: &[std::path::PathBuf],
     findings: usize,
+    waived: &Tally,
     inconclusive: usize,
+    resource: Option<ResourceKind>,
 ) {
     report.line(format_args!(
-        "landav: {} analysed under {} — {} finding(s), {} inconclusive; configuration: {}",
+        "landav: {} analysed under {} — {} finding(s), {} suppressed, {}, {} inconclusive; \
+         resource: {}; configuration: {}",
         plural(sources.len(), "file"),
         target.display(),
         findings,
+        waived.suppressed,
+        plural(waived.stale, "stale waiver"),
         inconclusive,
+        describe_resource(resource),
         config.source()
     ));
+}
+
+/// The summary's resource clause.
+///
+/// Printed even when no resource was selected, for the same reason the
+/// suppression counts are printed on runs with none: a number a CI job watches
+/// can only be seen to change if it is always there.
+fn describe_resource(resource: Option<ResourceKind>) -> String {
+    match resource {
+        Some(kind) => crate::resource::selected(kind),
+        None => "none selected".to_owned(),
+    }
 }
 
 /// `1 file` / `2 files`, so the summary reads as English.
@@ -341,9 +600,10 @@ fn report_failure(error: &ToolError) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Report, classify, plural};
+    use super::{Report, classify, describe_resource, plural, resource_unaccounted};
     use crate::outcome::Outcome;
     use crate::sources::Target;
+    use landav_bound::ResourceKind;
 
     /// A writer that fails the way a closed pipe does.
     struct BrokenPipe;
@@ -387,18 +647,21 @@ mod tests {
     /// strongest thing the run learned would read as the weakest.
     #[test]
     fn an_unparsable_file_is_inconclusive_rather_than_nothing_analysed() {
-        assert_eq!(classify(Target::File, 1, 0, 0, 1), Outcome::Inconclusive);
         assert_eq!(
-            classify(Target::Directory, 1, 0, 0, 1),
+            classify(Target::File, 1, 0, 0, 1, false),
             Outcome::Inconclusive
         );
-        assert_ne!(classify(Target::File, 1, 0, 0, 1), Outcome::Clean);
+        assert_eq!(
+            classify(Target::Directory, 1, 0, 0, 1, false),
+            Outcome::Inconclusive
+        );
+        assert_ne!(classify(Target::File, 1, 0, 0, 1, false), Outcome::Clean);
     }
 
     #[test]
     fn a_directory_with_no_files_is_never_clean() {
         assert_eq!(
-            classify(Target::Directory, 0, 0, 0, 0),
+            classify(Target::Directory, 0, 0, 0, 0, false),
             Outcome::NothingAnalysed
         );
     }
@@ -406,7 +669,7 @@ mod tests {
     #[test]
     fn a_directory_of_files_with_no_statements_is_never_clean() {
         assert_eq!(
-            classify(Target::Directory, 3, 0, 0, 0),
+            classify(Target::Directory, 3, 0, 0, 0, false),
             Outcome::NothingAnalysed
         );
     }
@@ -415,26 +678,113 @@ mod tests {
     /// matching, so an empty `__init__.py` is not "the tool could not look".
     #[test]
     fn a_named_file_with_no_statements_is_not_a_tool_error() {
-        assert_eq!(classify(Target::File, 1, 0, 0, 0), Outcome::Clean);
+        assert_eq!(classify(Target::File, 1, 0, 0, 0, false), Outcome::Clean);
     }
 
     #[test]
     fn an_inconclusive_unit_is_not_absorbed_by_clean_neighbours() {
         assert_eq!(
-            classify(Target::Directory, 2, 40, 0, 1),
+            classify(Target::Directory, 2, 40, 0, 1, false),
             Outcome::Inconclusive
         );
-        assert_ne!(classify(Target::Directory, 2, 40, 0, 1), Outcome::Clean);
+        assert_ne!(
+            classify(Target::Directory, 2, 40, 0, 1, false),
+            Outcome::Clean
+        );
     }
 
     #[test]
     fn a_proven_run_is_clean() {
-        assert_eq!(classify(Target::File, 1, 6, 0, 0), Outcome::Clean);
+        assert_eq!(classify(Target::File, 1, 6, 0, 0, false), Outcome::Clean);
     }
 
     #[test]
     fn findings_outrank_inconclusive_in_what_is_reported() {
-        assert_eq!(classify(Target::Directory, 2, 40, 1, 1), Outcome::Findings);
+        assert_eq!(
+            classify(Target::Directory, 2, 40, 1, 1, false),
+            Outcome::Findings
+        );
+    }
+
+    /// LAN-60. A resource was named, no bound for it was derived, and the run
+    /// analysed real code: exit `0` would claim a bound held that was never
+    /// computed.
+    #[test]
+    fn a_resource_nothing_could_bound_is_never_clean() {
+        assert_eq!(
+            classify(Target::File, 1, 6, 0, 0, true),
+            Outcome::Inconclusive
+        );
+        assert_eq!(
+            classify(Target::Directory, 2, 40, 0, 0, true),
+            Outcome::Inconclusive
+        );
+        // The control: the same run without a resource selected is clean, so
+        // the outcome is a consequence of the question asked.
+        assert_eq!(classify(Target::File, 1, 6, 0, 0, false), Outcome::Clean);
+    }
+
+    /// "This target holds no code" outranks "no bound was derived for the
+    /// resource you named". The first is a fact about the caller's invocation
+    /// that they can act on today; the second is true of every run in this
+    /// milestone, and letting it win would mask a path that has stopped
+    /// matching behind a limitation nobody can do anything about.
+    #[test]
+    fn nothing_analysed_outranks_an_unbounded_resource() {
+        assert_eq!(
+            classify(Target::Directory, 0, 0, 0, 0, true),
+            Outcome::NothingAnalysed
+        );
+        assert_eq!(
+            classify(Target::Directory, 3, 0, 0, 0, true),
+            Outcome::NothingAnalysed
+        );
+    }
+
+    /// Everything the run established about the code outranks it too: a
+    /// finding and an unreadable file are results, and a milestone limitation
+    /// is not.
+    #[test]
+    fn established_results_outrank_an_unbounded_resource() {
+        assert_eq!(
+            classify(Target::Directory, 2, 40, 1, 0, true),
+            Outcome::Findings
+        );
+        assert_eq!(
+            classify(Target::Directory, 2, 40, 0, 1, true),
+            Outcome::Inconclusive
+        );
+    }
+
+    /// The unaccounted-for-resource result is owed only when there was code to
+    /// account for. A run over a tree that held nothing has "this target holds
+    /// no code" to report, and that must not be buried under a caveat that is
+    /// true of every run in this milestone.
+    #[test]
+    fn a_run_that_analysed_nothing_is_owed_no_resource_result() {
+        assert!(!resource_unaccounted(Some(ResourceKind::Ops), 0));
+        assert!(!resource_unaccounted(None, 40));
+        assert!(!resource_unaccounted(None, 0));
+        assert!(resource_unaccounted(Some(ResourceKind::Ops), 1));
+        assert!(resource_unaccounted(Some(ResourceKind::PeakMem), 40));
+    }
+
+    /// The summary names the selected resource, and says so plainly when there
+    /// is none — the clause is on every run so that a CI job watching it can
+    /// see it change.
+    #[test]
+    fn the_summary_names_the_resource_it_was_asked_about() {
+        assert_eq!(describe_resource(None), "none selected");
+        assert_eq!(
+            describe_resource(Some(ResourceKind::Ops)),
+            crate::resource::selected(ResourceKind::Ops)
+        );
+        // Two resources over one algebra must not summarise identically; see
+        // `crate::resource` and `landav_bound::CacheKeyMaterial`.
+        assert_ne!(
+            describe_resource(Some(ResourceKind::Ops)),
+            describe_resource(Some(ResourceKind::Alloc))
+        );
     }
 
     #[test]
