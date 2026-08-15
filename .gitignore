@@ -3,6 +3,12 @@
 **/*.rs.bk
 *.pdb
 
+# Python fixture byte-code. `python3 -m py_compile` over
+# crates/landav-python/tests/fixtures/ is part of the verification loop; its
+# output is not.
+__pycache__/
+*.py[cod]
+
 # Coverage
 /coverage/
 *.profraw

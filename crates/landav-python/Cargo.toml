@@ -14,5 +14,21 @@ landav-fdk = { workspace = true }
 landav-its = { workspace = true }
 thiserror = { workspace = true }
 
+# The Python 3 parser behind `analyze_source`.
+#
+# Declared here rather than in the workspace manifest: `[workspace.dependencies]`
+# is written by several live M0 lanes at once, and this is the only crate that
+# may know anything about Python (F-005's frontend boundary).
+#
+# `rustpython-parser` over `ruff_python_parser` because the latter is published
+# to crates.io only as a long-stale `0.0.8` placeholder of Ruff's internal
+# crate, so depending on it means depending on a git revision. This one is a
+# maintained, self-contained release with byte-offset ranges on every node,
+# which is exactly what `Location`'s byte-column contract needs.
+#
+# `all-nodes-with-ranges` is not default: without it some nodes carry no range
+# and a finding would have nowhere to point.
+rustpython-parser = { version = "0.4.0", features = ["all-nodes-with-ranges"] }
+
 [lints]
 workspace = true
