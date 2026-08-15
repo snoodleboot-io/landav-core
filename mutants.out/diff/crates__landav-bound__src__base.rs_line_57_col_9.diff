@@ -1,0 +1,21 @@
+--- crates/landav-bound/src/base.rs
++++ replace <impl TryFrom<u32> for Base>::try_from -> Result<Self, Self::Error> with Ok(Default::default())
+@@ -49,17 +49,17 @@
+         self.0
+     }
+ }
+ 
+ impl TryFrom<u32> for Base {
+     type Error = BoundError;
+ 
+     fn try_from(k: u32) -> Result<Self, Self::Error> {
+-        Self::new(k)
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ impl Canonical for Base {
+     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
+         self.0.cmp(&other.0)
+     }
+ 

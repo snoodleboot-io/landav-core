@@ -1,0 +1,15 @@
+--- crates/landav-bound/src/base.rs
++++ replace <impl Canonical for Base>::write_canonical with ()
+@@ -59,11 +59,11 @@
+ }
+ 
+ impl Canonical for Base {
+     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
+         self.0.cmp(&other.0)
+     }
+ 
+     fn write_canonical(&self, out: &mut Vec<u8>) {
+-        out.extend_from_slice(&self.0.to_be_bytes());
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ }

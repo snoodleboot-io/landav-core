@@ -38,7 +38,7 @@ impl Dioid for B {
     }
 
     /// `Bottom` is the unit; otherwise `Bound::sum([a, b])`.
-    fn plus(a: &Self::Carrier, b: &Self::Carrier) -> Self::Carrier {
+    fn plus(_a: &Self::Carrier, _b: &Self::Carrier) -> Self::Carrier {
         todo!()
     }
 
@@ -46,7 +46,7 @@ impl Dioid for B {
     ///
     /// L4 holds through `Bottom`, which is why [`crate::Nat::times`] is free
     /// to let `omega` absorb `0`.
-    fn times(a: &Self::Carrier, b: &Self::Carrier) -> Self::Carrier {
+    fn times(_a: &Self::Carrier, _b: &Self::Carrier) -> Self::Carrier {
         todo!()
     }
 
@@ -59,7 +59,7 @@ impl Dioid for B {
     /// denotation rather than of the spelling. Without that folding,
     /// `star(log2(Const(1)))` and `star(Const(0))` would give two different
     /// sound answers for one denotation - a determinism hazard no law catches.
-    fn star(a: &Self::Carrier) -> Self::Carrier {
+    fn star(_a: &Self::Carrier) -> Self::Carrier {
         todo!()
     }
 }
@@ -86,8 +86,8 @@ impl crate::dioid_laws::DioidLaws for B {
     }
 
     fn denote(
-        value: &Self::Carrier,
-        at: &crate::total_valuation::TotalValuation,
+        _value: &Self::Carrier,
+        _at: &crate::total_valuation::TotalValuation,
     ) -> Lifted<crate::nat::Nat> {
         todo!()
     }

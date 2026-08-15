@@ -53,19 +53,19 @@ impl Dioid for MaxPlus {
 
     /// `Bound::max_of([a, b])`, with `Bottom` as the unit. Idempotent, because
     /// [`crate::MaxTerms`] deduplicates at the type level.
-    fn plus(a: &Self::Carrier, b: &Self::Carrier) -> Self::Carrier {
+    fn plus(_a: &Self::Carrier, _b: &Self::Carrier) -> Self::Carrier {
         todo!()
     }
 
     /// `Bound::sum([a, b])`, with `Bottom` absorbing - L4. "Unreachable then
     /// unbounded" is unreachable.
-    fn times(a: &Self::Carrier, b: &Self::Carrier) -> Self::Carrier {
+    fn times(_a: &Self::Carrier, _b: &Self::Carrier) -> Self::Carrier {
         todo!()
     }
 
     /// `one` for `Bottom` (L9) and for `Elem(Const(0))`; `Elem(omega)`
     /// otherwise.
-    fn star(a: &Self::Carrier) -> Self::Carrier {
+    fn star(_a: &Self::Carrier) -> Self::Carrier {
         todo!()
     }
 }
@@ -88,8 +88,8 @@ impl crate::dioid_laws::DioidLaws for MaxPlus {
     }
 
     fn denote(
-        value: &Self::Carrier,
-        at: &crate::total_valuation::TotalValuation,
+        _value: &Self::Carrier,
+        _at: &crate::total_valuation::TotalValuation,
     ) -> Lifted<crate::nat::Nat> {
         todo!()
     }

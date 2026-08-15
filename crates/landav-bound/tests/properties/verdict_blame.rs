@@ -415,3 +415,94 @@ fn a_zero_trip_loop_with_an_unanalysed_body_is_not_proved_zero() {
     let spec = BoundSpec::Prod(vec![BoundSpec::Const(Some(0)), BoundSpec::Const(None)]);
     assert_eq!(build(&spec), Bound::omega());
 }
+
+/// The two publishable arms **report the bound they were classified from**.
+///
+/// `Verdict::bound` is the accessor a caller prints, and the only assertion on
+/// it was that `Unreachable` reports `None` - which a `bound()` returning
+/// `None` unconditionally also satisfies. A verdict whose cost cannot be read
+/// back is a report with no number in it.
+#[test]
+fn a_publishable_verdict_reports_the_bound_it_was_classified_from() {
+    let finite = Bound::sum([Bound::var("n"), Bound::constant(4)]);
+    let at = Origin::new("publish.rs:1");
+
+    let proved = Verdict::classify(Lifted::Elem(finite.clone()), at.clone(), None);
+    assert!(
+        proved.is_ok(),
+        "an omega-free bound with no blame must be Proved: {proved:?}"
+    );
+    if let Ok(verdict) = &proved {
+        assert_eq!(
+            verdict.bound(),
+            Some(&finite),
+            "Proved must report the bound it proved"
+        );
+        assert_eq!(verdict.blames(), None);
+        assert_eq!(verdict.exit_code(true), ExitCode::Clean);
+    }
+
+    let loose = Bound::max_of([Bound::var("n"), Bound::omega()]);
+    let partial = Verdict::classify(Lifted::Elem(loose.clone()), at.clone(), Some(one_blame()));
+    assert!(
+        partial.is_ok(),
+        "a blamed omega must be publishable as Partial: {partial:?}"
+    );
+    if let Ok(verdict) = &partial {
+        assert_eq!(
+            verdict.bound(),
+            Some(&loose),
+            "Partial must report the bound it over-approximated with"
+        );
+        assert_eq!(verdict.blames(), Some(&one_blame()));
+        assert_eq!(verdict.exit_code(false), ExitCode::Clean);
+        assert_eq!(verdict.exit_code(true), ExitCode::ToolError);
+    }
+
+    // `Bottom` with blame is a `Partial` over `omega`, so it reports a cost
+    // too - the only arm that does not is `Unreachable`.
+    let from_bottom = Verdict::classify(Lifted::Bottom, at, Some(one_blame()));
+    assert_eq!(
+        from_bottom.as_ref().ok().and_then(Verdict::bound),
+        Some(&Bound::omega()),
+        "Bottom with blame must be a Partial over omega: {from_bottom:?}"
+    );
+}
+
+/// [`Origin`] is an opaque frontend-supplied location: core attaches no
+/// meaning to it, and its entire contract is that whatever went in comes back
+/// out unchanged, through the accessor and through `Display` alike.
+///
+/// That is a low bar and it is the whole point - `Origin` is what a user reads
+/// to find the line the blame is about, so an accessor returning a constant
+/// sends every report to the same place.
+#[test]
+fn an_origin_carries_the_frontend_string_back_out_unchanged() {
+    for location in ["main.c:12", "", "a/b/c.rs:3:14", "no line number at all"] {
+        let origin = Origin::new(location);
+        assert_eq!(origin.as_str(), location, "Origin altered its payload");
+        assert_eq!(
+            origin.to_string(),
+            location,
+            "Display and as_str must agree"
+        );
+    }
+
+    // Distinct locations stay distinct, and the order is content derived -
+    // `Blames` sorts by it, and that order reaches the report text.
+    let (first, second) = (Origin::new("a.rs:1"), Origin::new("a.rs:2"));
+    assert_ne!(first, second);
+    assert!(first < second);
+    assert_eq!(first, Origin::new("a.rs:1"));
+
+    // And the blame ledger really is non-empty and reports its own size.
+    let mut ledger = one_blame();
+    assert!(!ledger.is_empty());
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger.as_slice().len(), ledger.len());
+    ledger.insert(blame(1));
+    assert_eq!(ledger.len(), 2, "a distinct record must be added");
+    assert_eq!(ledger.as_slice().len(), ledger.len());
+    ledger.insert(blame(1));
+    assert_eq!(ledger.len(), 2, "a duplicate record must not be added");
+}

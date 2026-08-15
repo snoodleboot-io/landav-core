@@ -14,7 +14,7 @@ use proptest::prelude::*;
 
 use crate::support::{
     BoundSpec, Env, Ref, arb_base_u32, arb_env_pair, arb_ordered_refs, arb_ref, arb_spec, base_of,
-    build, nat_ref, ref_le, ref_nat, spec_of_shape,
+    build, nat_ref, ref_le, ref_nat, shape_takes_operands, spec_of_shape,
 };
 
 /// `Bound::eval` at two valuations, ordered without touching `Nat: Ord`.
@@ -74,7 +74,7 @@ proptest! {
     /// pointwise argument increase" - the argument-wise reading, where the
     /// *operands* grow and the valuation is held fixed.
     #[test]
-    fn every_constructor_is_monotone_in_its_operands(
+    fn every_operand_taking_constructor_is_monotone_in_its_operands(
         (small, large) in arb_ordered_refs(),
         other in arb_spec(),
         base in arb_base_u32(),
@@ -82,7 +82,9 @@ proptest! {
         env in crate::support::arb_env(),
     ) {
         let valuation = env.valuation();
-        for shape in BoundShape::ALL {
+        let mut exercised = 0usize;
+        for shape in BoundShape::ALL.into_iter().filter(|s| shape_takes_operands(*s)) {
+            exercised += 1;
             let lesser = build(&spec_of_shape(
                 shape,
                 BoundSpec::Const(small),
@@ -105,6 +107,9 @@ proptest! {
                  {at_lesser:?} to {at_greater:?}"
             );
         }
+        // `Const` and `Var` take no operands, so the loop skips them. Pinned
+        // so the skip cannot silently grow and hollow the property out.
+        prop_assert_eq!(exercised, 4, "the operand-taking constructors are Sum, Max, Prod, Trans");
     }
 
     /// All argument-wise monotonicity lives in five `Nat` methods. If they are
@@ -202,7 +207,15 @@ fn the_omega_valuation_dominates_every_finite_one() {
     };
     let top = Env::all_omega();
     assert!(finite.le(&top));
+    // `ref_le(_, None)` is true for every left-hand side, so asserting it
+    // proves nothing. The value is pinned instead:
+    // `x0 * (x1 + log2(x0))` at `x0 = 5, x1 = 7` is `5 * (7 + 3) = 50`,
+    // because `ceil(log2(5))` is 3.
     let at_finite = nat_ref(bound.eval(&finite.valuation()));
+    assert_eq!(at_finite, Some(50), "the finite valuation must be exact");
     assert_eq!(bound.eval(&top.valuation()), Nat::OMEGA);
-    assert!(ref_le(at_finite, None));
+    assert!(
+        ref_le(at_finite, nat_ref(bound.eval(&top.valuation()))) && at_finite.is_some(),
+        "the omega valuation must strictly dominate a finite one here"
+    );
 }

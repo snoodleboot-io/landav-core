@@ -317,28 +317,35 @@ fn a_path_containing_a_newline_still_produces_a_sanctioned_code() -> io::Result<
 // Counterexamples: these fail, and the reason is the bug
 // ---------------------------------------------------------------------------
 
-/// BLOCKER. A `.py` file that is not Python at all exits `0`.
+/// A `.py` file that is not Python must not exit `0`.
 ///
-/// The M0 scan is a line- and indentation-oriented pass, not a parser, so a
-/// file it cannot make sense of produces no observations and lands in
-/// [`Outcome::Clean`] — which the contract defines as "analysis ran over at
-/// least one unit and every bound held". Nothing held; nothing was even
-/// parsed. `0` is the one code that is both silent and trusted, and this is
-/// the input class most likely to reach it in practice: a template file, a
-/// Python 2 module, a `.py` that is actually generated JSON.
+/// Written as a blocker against the M0 line-and-indentation scanner, which
+/// produced no observations for a file it could not make sense of and landed
+/// it in [`Outcome::Clean`] — the one code that is both silent and trusted.
+/// Now fixed: the frontend parses, and a file that does not parse is
+/// `PythonError::Parse` → `Outcome::Inconclusive` → exit `1`, with the
+/// position named.
 ///
-/// The fix does not require a real parser — refusing to claim `Clean` for a
-/// file that does not tokenise as Python is enough. Reporting `Inconclusive`
-/// for it would be exactly right: analysed, no conclusion, exit `1`.
+/// # One case was dropped, deliberately
+///
+/// This test used to include `actually_json.py`, holding
+/// `{"this": "is json", "not": "python"}`. Against a real parser that is a
+/// dict display expression statement — **valid Python** — so the assertion's
+/// stated reason, that the file "was never parsed", became false, and keeping
+/// it would have meant a test passing for a reason its own message denied.
+///
+/// The instinct behind it survives the case: a `.py` whose entire body is one
+/// collection display is almost certainly a renamed data file, and calling it
+/// clean is a weak claim. But that is a judgement about Python, and
+/// `CONTRIBUTING.md` non-negotiable 4 puts every language fact behind the
+/// frontend. It belongs in `landav-python` as a rule with a corpus behind it,
+/// not as an assertion in the CLI acceptance suite, and it has been routed
+/// there as a proposal. Nothing in this suite depends on the answer.
 #[test]
 fn a_file_that_is_not_python_must_not_report_clean() -> io::Result<()> {
     let project = Project::new()?;
-    let cases: [(&str, &str); 3] = [
+    let cases: [(&str, &str); 2] = [
         ("syntax_error.py", "def f(:\n    return ]]] @@@\n"),
-        (
-            "actually_json.py",
-            "{\"this\": \"is json\", \"not\": \"python\"}\n",
-        ),
         ("prose.py", "This file is a README that someone renamed.\n"),
     ];
 
@@ -573,29 +580,34 @@ fn the_directory_walk_is_not_cubic_in_depth() -> io::Result<()> {
     Ok(())
 }
 
-/// RISK. A line continuation hides a finding, and the file exits `0`.
+/// A line continuation must not hide a finding.
 ///
-/// `analysis::scan` reads physical lines, so `if x \` and `in ys:` are two
-/// unrelated statements and neither matches `membership-test-in-loop`. The
-/// module notes this and argues it is safe because it only makes the scan
-/// *less* likely to fire. That is the right direction for a false-positive
-/// budget, but the exit code does not have a "probably clean" value: the file
-/// below contains both rule violations the tool exists to catch, and the run
-/// reports the strongest claim available.
+/// Written as a blocker against the M0 line-oriented scanner, which read
+/// physical lines: `if x \` and `in known:` were two unrelated fragments and
+/// neither matched the membership rule, so a file with both quadratic shapes
+/// in it exited `0`. The module notes argued the direction was safe because it
+/// only made the scan *less* likely to fire — the right instinct for a
+/// false-positive budget, but the exit code has no "probably clean" value.
 ///
-/// Joining continued lines before scanning is a small change and closes it.
+/// A real parser makes this structural rather than lexical, so the test now
+/// guards a regression rather than reporting a defect: whatever tokenises the
+/// source, the *logical* line is what a rule sees. The body is
+/// `common::FINDINGS_PY` with continuations inserted at the two points that
+/// used to break it, so this test and `exit_codes::file_with_findings_exits_one`
+/// disagree only about whitespace.
 #[test]
 fn a_line_continuation_must_not_hide_a_finding() -> io::Result<()> {
     let project = Project::new()?;
     let target = project.write(
         "continued.py",
-        "def intersect(xs, ys):\n\
-         \x20   out = []\n\
-         \x20   for x in xs:\n\
-         \x20       if x \\\n\
-         \x20          in ys:\n\
-         \x20           out = out \\\n\
-         \x20               + [x]\n\
+        "def summarise(rows, allowed):\n\
+         \x20   known = list(allowed)\n\
+         \x20   out = \"\"\n\
+         \x20   for row in rows:\n\
+         \x20       if row \\\n\
+         \x20          in known:\n\
+         \x20           out \\\n\
+         \x20               += str(row)\n\
          \x20   return out\n",
     )?;
 

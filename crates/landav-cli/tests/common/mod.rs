@@ -56,32 +56,61 @@ def total(items):
     return acc
 ";
 
-/// Quadratic anti-patterns from the `F-005` PERF/RUF rule set: a membership
-/// test against a list inside a loop, and list concatenation inside a loop.
-/// This is the shape that is meant to produce a *finding*, not a tool error.
-pub const FINDINGS_PY: &str = r"
-def intersect(xs, ys):
-    out = []
-    for x in xs:
-        if x in ys:
-            out = out + [x]
+/// Two quadratic shapes from the `F-005` rule set, verified against the
+/// frontend: `LAV002` at the membership test, `LAV003` at the accumulation.
+///
+/// **Two rules on purpose.** An earlier version of this fixture leaned on a
+/// single shape: `x in ys` against an unannotated parameter, plus a list
+/// rebuilt by concatenation. Both went silent when the line-oriented scanner
+/// was replaced by the real parser — `LAV002` correctly wants evidence the
+/// container is a list, and no list-concatenation rule survived at all
+/// (`LAV003` is string concatenation only, and `LAV010` was withdrawn).
+/// That left the whole "findings exit 1" criterion resting on rules that had
+/// quietly stopped firing. `known = list(allowed)` supplies the evidence
+/// `LAV002` asks for, and the string accumulator is `LAV003`'s canonical
+/// shape; one rule can be retired without silently disarming the criterion.
+pub const FINDINGS_PY: &str = r#"
+def summarise(rows, allowed):
+    known = list(allowed)
+    out = ""
+    for row in rows:
+        if row in known:
+            out += str(row)
     return out
-";
+"#;
 
-/// Analysable, but no bound can be concluded: the loop trip count depends on
-/// a value the analyser cannot constrain, so termination is not established.
-/// The whole of criterion 3 hangs on this case not reporting clean.
-pub const INCONCLUSIVE_PY: &str = r"
-def collatz_steps(n):
-    steps = 0
-    while n != 1:
-        if n % 2 == 0:
-            n = n // 2
-        else:
-            n = 3 * n + 1
-        steps += 1
-    return steps
-";
+/// A Python 2 module: the bytes were read, and they are not Python 3.
+///
+/// This reaches [`Outcome::Inconclusive`] through
+/// `landav_python::PythonError::Parse` — the frontend could not read the file,
+/// so nothing was derived from it and it is not covered by the run's verdict.
+///
+/// **It is not the case criterion 3 was written about**, and the tests that
+/// use it say so. See the module documentation of `outcome_space.rs` for the
+/// coverage that is missing and why it cannot be written at M0.
+///
+/// Chosen over a merely malformed file because it is stable: Python 2 print
+/// syntax will never start parsing as Python 3, so this fixture cannot quietly
+/// change what it tests.
+pub const UNREADABLE_AS_PYTHON_PY: &str = r#"
+print "this module was written for Python 2"
+"#;
+
+/// Valid Python 3.12 that the pinned `rustpython-parser` predates: PEP 701
+/// allows the same quote character inside an f-string replacement field.
+///
+/// A different class from [`UNREADABLE_AS_PYTHON_PY`] and worth its own case —
+/// here the *file* is fine and the *frontend* is behind, which is the failure
+/// mode most likely to appear on a modern codebase.
+///
+/// This fixture is expected to stop being unparsable when the parser is
+/// upgraded. When that happens this test fails, which is correct: somebody has
+/// to decide what replaces it rather than discovering later that the case
+/// silently became a clean run.
+pub const PEP701_FSTRING_PY: &str = r#"
+def show(row):
+    print(f"{row["name"]}")
+"#;
 
 /// A `pyproject.toml` that is valid TOML and says nothing about landav.
 pub const PYPROJECT_NO_LANDAV: &str = r#"

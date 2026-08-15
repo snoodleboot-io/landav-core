@@ -49,11 +49,6 @@
 //! must use to keep e-graph extraction reproducible.
 
 #![forbid(unsafe_code)]
-// SKELETON ONLY. Every body in this crate is `todo!()`, so every parameter and
-// every private field is unused by construction. These two allows exist to
-// prove the *signatures* compile clean under the workspace lint table; they
-// must be deleted by the first commit that fills in a body.
-#![allow(unused_variables, dead_code)]
 
 pub mod assumption;
 pub mod b;

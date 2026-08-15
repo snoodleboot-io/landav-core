@@ -34,7 +34,6 @@
 //! [`F-004`]: https://linear.app/snoodleboot/issue/LAN-3
 //! [`F-041`]: https://linear.app/snoodleboot/issue/LAN-24
 
-mod analysis;
 mod check;
 mod cli;
 mod config;
@@ -44,10 +43,17 @@ mod sources;
 
 use landav_bound::ExitCode;
 
-/// The largest code the contract permits, and the code any impossible
-/// conversion falls back to. Failing towards "the tool could not complete" is
-/// the only safe direction: the alternative reports clean.
-const FALLBACK: u8 = 2;
+/// The status byte for "the tool could not complete", and the largest code the
+/// contract permits.
+///
+/// It is named rather than written inline so that the three arms of
+/// [`as_status`] read as the table they are. There is deliberately **no**
+/// wildcard arm falling back to it: [`as_status`] matches every [`ExitCode`]
+/// variant explicitly, so a fourth variant is a compile error until somebody
+/// decides which status byte it earns. A `_ => TOOL_ERROR_STATUS` would turn
+/// that compile error into a green build — the same argument `crate::outcome`
+/// makes one level up, where the wrong default would be `0` instead of `2`.
+const TOOL_ERROR_STATUS: u8 = 2;
 
 fn main() -> std::process::ExitCode {
     let code = cli::dispatch().exit_code();
@@ -63,7 +69,7 @@ const fn as_status(code: ExitCode) -> u8 {
     match code {
         ExitCode::Clean => 0,
         ExitCode::Findings => 1,
-        ExitCode::ToolError => FALLBACK,
+        ExitCode::ToolError => TOOL_ERROR_STATUS,
     }
 }
 
