@@ -100,6 +100,32 @@ pub trait DioidLaws: Dioid {
     /// `Nat` because the carriers have a bottom element, and because
     /// `Lifted<Nat>` **is** `Ord` (unlike `Lifted<Bound>`), which is what lets
     /// the suite check the ordering laws directly.
+    ///
+    /// # This is the suite's trust boundary
+    ///
+    /// Every law is checked *through* this function, so what
+    /// [`check_dioid_laws`] certifies is the **quotient of the carrier by
+    /// `denote`** — not the carrier. Nothing here can require `denote` to be
+    /// injective, a homomorphism, or the semantics you actually meant, and a
+    /// sufficiently coarse one makes the whole suite vacuous.
+    ///
+    /// The Gate 2 algebra adversary demonstrated it: take this module's own
+    /// `NotAntisymmetric` parity quotient, leave the operations byte-identical,
+    /// and collapse `denote` so that three distinct elements share one
+    /// denotation. **All eleven laws pass**, and the instance is still not a
+    /// dioid — `Odd ≼ Even` and `Even ≼ Odd` with `Odd ≠ Even`, exactly the
+    /// structure L7 exists to reject. All four shipped counterexamples supply a
+    /// faithful `denote`, which is precisely why none of them could find it.
+    ///
+    /// Injectivity is **not** the fix, and must not be added as a law: two
+    /// structurally distinct bounds are often legitimately extensionally equal,
+    /// and this crate ships witness pairs that are.
+    ///
+    /// What is available is visibility. [`LawCoverage::collapsed`] reports how
+    /// many distinct grid elements share a denotation, so a suspiciously coarse
+    /// `denote` shows up as a number rather than as a silent pass. Read it when
+    /// adding an instance; a high value means the laws below are being checked
+    /// against fewer distinct values than the grid appears to offer.
     fn denote(value: &Self::Carrier, at: &TotalValuation) -> Lifted<Nat>;
 }
 
@@ -144,6 +170,7 @@ pub struct LawCoverage {
     informative: u64,
     guards: u64,
     fired: u64,
+    collapsed: u64,
 }
 
 impl LawCoverage {
@@ -151,6 +178,22 @@ impl LawCoverage {
     #[must_use]
     pub const fn assertions(self) -> u64 {
         self.assertions
+    }
+
+    /// How many **pairs of distinct grid elements share a denotation**.
+    ///
+    /// The suite certifies the quotient of the carrier by
+    /// [`DioidLaws::denote`], so this is the size of the blind spot. A coarse
+    /// `denote` collapses elements the laws would otherwise separate, and the
+    /// laws then pass on a structure that does not satisfy them -- a real
+    /// counterexample exists and is described on `denote`.
+    ///
+    /// Some collapsing is correct: structurally distinct bounds are often
+    /// legitimately extensionally equal. A *large* number on a grid chosen to
+    /// be diverse is the signal, not any number at all.
+    #[must_use]
+    pub const fn collapsed(self) -> u64 {
+        self.collapsed
     }
 
     /// The assertions whose two sides were **distinct carrier values**, so
@@ -218,6 +261,14 @@ impl LawCoverage {
             informative: self.informative.saturating_add(other.informative),
             guards: self.guards.saturating_add(other.guards),
             fired: self.fired.saturating_add(other.fired),
+            // Not summed: collapsing is a property of the *grid* under
+            // `denote`, identical for every law, so adding it across eleven
+            // laws would report eleven times the real blind spot.
+            collapsed: if self.collapsed > other.collapsed {
+                self.collapsed
+            } else {
+                other.collapsed
+            },
         }
     }
 }
@@ -321,10 +372,42 @@ impl<D: DioidLaws> Suite<D> {
         }
     }
 
-    fn into_report(self) -> LawReport {
+    fn into_report(mut self) -> LawReport {
+        let collapsed = self.collapsed_pairs();
+        for (_, coverage) in &mut self.coverage {
+            coverage.collapsed = collapsed;
+        }
         LawReport {
             entries: self.coverage,
         }
+    }
+
+    /// Pairs of **distinct grid elements that agree at every valuation**.
+    ///
+    /// This is the size of the suite's blind spot, not a defect on its own:
+    /// every law is checked through [`DioidLaws::denote`], so two elements the
+    /// denotation cannot separate are two elements no law can separate either.
+    /// A `denote` coarse enough to collapse the grid passes all eleven laws on
+    /// a structure that does not satisfy them — see the trust-boundary note on
+    /// `denote` for the worked counterexample.
+    ///
+    /// Some collapsing is correct, because structurally distinct bounds are
+    /// often legitimately extensionally equal. The number is here to be read,
+    /// not to be asserted at zero.
+    fn collapsed_pairs(&self) -> u64 {
+        let mut collapsed = 0u64;
+        for (index, left) in self.grid.iter().enumerate() {
+            for right in &self.grid[index + 1..] {
+                let agrees_everywhere = self
+                    .valuations
+                    .iter()
+                    .all(|at| D::denote(left, at) == D::denote(right, at));
+                if agrees_everywhere {
+                    collapsed = collapsed.saturating_add(1);
+                }
+            }
+        }
+        collapsed
     }
 
     /// L1 through L11, in the frozen numbering order.
@@ -979,6 +1062,89 @@ mod apparatus {
         }
     }
 
+    /// The same carrier and the same operations, with a **coarse** denotation.
+    ///
+    /// `Odd` and `Even` are distinct carrier values that `denote` cannot tell
+    /// apart, which is exactly the structure L7 exists to reject -- and with
+    /// this denotation L7 cannot see it, because every law is checked *through*
+    /// `denote`. This instance passes all eleven laws and is not a dioid.
+    struct CoarselyDenoted;
+
+    impl Dioid for CoarselyDenoted {
+        type Carrier = Parity;
+        const SEMIRING: SemiringId = <NotAntisymmetric as Dioid>::SEMIRING;
+        // `true`, where the faithful instance says `false`. Under a denotation
+        // that merges `Odd`, `Even` and `Top`, `plus(a, a)` agrees with `a`
+        // everywhere -- so the coarse instance must claim idempotence to pass
+        // L11, and would fail it for claiming otherwise. Which laws an instance
+        // can even satisfy depends on the denotation it supplies, which is the
+        // sharpest statement of why this is a trust boundary rather than a
+        // detail.
+        const PLUS_IDEMPOTENT: bool = true;
+        fn zero() -> Self::Carrier {
+            <NotAntisymmetric as Dioid>::zero()
+        }
+        fn one() -> Self::Carrier {
+            <NotAntisymmetric as Dioid>::one()
+        }
+        fn plus(a: &Self::Carrier, b: &Self::Carrier) -> Self::Carrier {
+            <NotAntisymmetric as Dioid>::plus(a, b)
+        }
+        fn times(a: &Self::Carrier, b: &Self::Carrier) -> Self::Carrier {
+            <NotAntisymmetric as Dioid>::times(a, b)
+        }
+        fn star(a: &Self::Carrier) -> Self::Carrier {
+            <NotAntisymmetric as Dioid>::star(a)
+        }
+    }
+
+    impl DioidLaws for CoarselyDenoted {
+        fn grid() -> Vec<Self::Carrier> {
+            <NotAntisymmetric as DioidLaws>::grid()
+        }
+        fn valuations() -> Vec<TotalValuation> {
+            trivial_valuations()
+        }
+        fn denote(value: &Self::Carrier, _at: &TotalValuation) -> Lifted<Nat> {
+            // The whole point: `Odd` and `Even` collapse onto one denotation.
+            match value {
+                Parity::Nil => Lifted::Bottom,
+                Parity::Odd | Parity::Even | Parity::Top => Lifted::Elem(Nat::Fin(1)),
+            }
+        }
+    }
+
+    /// **The suite's trust boundary, made visible.**
+    ///
+    /// `denote` is instance-supplied and cannot be constrained: requiring
+    /// injectivity would be wrong, because structurally distinct bounds are
+    /// often legitimately extensionally equal. So a coarse denotation defeats
+    /// every law, and the only defence is that the blind spot is *reported*.
+    ///
+    /// This pins both halves: the collapse is real (the laws pass on a
+    /// non-dioid), and the metric sees it where the faithful instance reads
+    /// zero.
+    #[test]
+    fn a_coarse_denotation_defeats_the_laws_and_shows_up_in_the_coverage() {
+        let coarse = measure_dioid_laws::<CoarselyDenoted>();
+        assert!(
+            coarse.is_ok(),
+            "a coarse denotation hides the L7 violation, so every law should pass: {:?}",
+            coarse.as_ref().err()
+        );
+        let collapsed = coarse.map_or(0, |report| report.total().collapsed());
+        assert!(
+            collapsed > 0,
+            "the collapse metric must see a denotation that merges distinct elements"
+        );
+
+        let faithful = measure_dioid_laws::<NotAntisymmetric>();
+        assert!(
+            faithful.is_err(),
+            "the same operations under an injective denotation must still fail L7"
+        );
+    }
+
     /// **AC5, half two.** Antisymmetry does not follow from zero-sum-freeness.
     ///
     /// The failure must be reported against L7 specifically: if it were
@@ -1236,12 +1402,14 @@ mod apparatus {
             informative: 6,
             guards: 5,
             fired: 1,
+            collapsed: 3,
         };
         assert_eq!(coverage.assertions(), 8);
         assert_eq!(coverage.discriminating(), 2);
         assert_eq!(coverage.informative(), 6);
         assert_eq!(coverage.guards(), 5);
         assert_eq!(coverage.fired(), 1);
+        assert_eq!(coverage.collapsed(), 3);
         assert_eq!(coverage.discriminating_permille(), 250);
         assert_eq!(coverage.informative_permille(), 750);
         assert_eq!(coverage.fired_permille(), 200);
@@ -1259,6 +1427,7 @@ mod apparatus {
             informative: 5,
             guards: 3,
             fired: 4,
+            collapsed: 0,
         };
         let right = LawCoverage {
             assertions: 10,
@@ -1266,6 +1435,7 @@ mod apparatus {
             informative: 50,
             guards: 30,
             fired: 40,
+            collapsed: 0,
         };
         let merged = left.merge(right);
         assert_eq!(merged.assertions(), 11);
@@ -1280,6 +1450,7 @@ mod apparatus {
             informative: u64::MAX,
             guards: u64::MAX,
             fired: u64::MAX,
+            collapsed: 0,
         };
         assert_eq!(huge.merge(huge), huge, "counters saturate, never wrap");
     }

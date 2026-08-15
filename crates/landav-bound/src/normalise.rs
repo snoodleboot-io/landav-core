@@ -604,10 +604,33 @@ type RuleEntry = (&'static str, fn() -> Box<Pat>, fn() -> Box<Pat>);
 
 /// The frozen rewrite set, in the order it is applied.
 ///
-/// **Every rule is an exact identity of the algebra**, so extraction is
-/// choosing between terms that denote the same function and the cost function
-/// is not a soundness surface. The two rules the algebra would *not* survive
-/// are called out here because their absence is load bearing:
+/// **Every rule preserves the ideal value**, so extraction is choosing between
+/// terms that over-approximate the same true cost, and the cost function is not
+/// a soundness surface.
+///
+/// It is tempting to state that more strongly — that every rule is an *exact
+/// identity* — and that stronger claim stood here until the Gate 2 algebra
+/// adversary disproved it in both directions:
+///
+/// ```text
+/// widening:   a*b + a*c  ->  a*(b + c)     at a=0, b=c=2^63:  Fin(0) -> Omega
+/// narrowing:  0*(x+z)*(z+z) -> 0*z*(x+z)   at x=0, z=2^63:    Omega -> Fin(0)
+/// ```
+///
+/// Both directions occur because saturating arithmetic is neither associative
+/// nor distributive once a value leaves `u64`, and `Bound::eval` cannot tell
+/// "no finite bound" from "a finite magnitude left the carrier" — both are
+/// `omega`. Rewriting therefore moves *between over-approximations*, and can
+/// land on a tighter one or a looser one.
+///
+/// The conclusion survives on the weaker premise, which is the one that
+/// actually matters: no rule takes a term below its ideal value, so no
+/// extraction can report a bound the program exceeds. Verified over a grid that
+/// deliberately leaves the exact regime — see
+/// `tests/gate2_algebra_adversary.rs`.
+///
+/// The two rules the algebra would *not* survive are called out here because
+/// their absence is load bearing:
 ///
 /// * **`?a * 0 -> 0` is unsound.** Variables range over `N u {omega}` and
 ///   `omega` absorbs unconditionally, so the product is `omega` at
