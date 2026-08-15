@@ -20,35 +20,41 @@ impl Blames {
     /// A ledger containing exactly `first`.
     #[must_use]
     pub fn new(first: Blame) -> Self {
-        todo!()
+        Self(vec![first])
     }
 
     /// Inserts `next`, keeping the collection sorted and deduplicated.
     pub fn insert(&mut self, next: Blame) {
-        todo!()
+        // Sorted and deduplicated on insertion, so the published order is
+        // content determined rather than push determined.
+        if let Err(at) = self.0.binary_search(&next) {
+            self.0.insert(at, next);
+        }
     }
 
     /// Merges `other` into this ledger.
     pub fn merge(&mut self, other: Self) {
-        todo!()
+        for record in other.0 {
+            self.insert(record);
+        }
     }
 
     /// The records, sorted and deduplicated. Always at least one.
     #[must_use]
     pub fn as_slice(&self) -> &[Blame] {
-        todo!()
+        &self.0
     }
 
     /// The number of records. Always at least one.
     #[must_use]
     pub fn len(&self) -> usize {
-        todo!()
+        self.0.len()
     }
 
     /// Always `false`. Present because clippy requires it alongside
     /// [`Self::len`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.0.is_empty()
     }
 }

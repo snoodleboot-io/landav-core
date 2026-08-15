@@ -15,28 +15,28 @@ impl VarId {
     /// Wraps a frontend-supplied name.
     #[must_use]
     pub fn new(name: impl Into<Symbol>) -> Self {
-        todo!()
+        Self(name.into())
     }
 
     /// The underlying name.
     #[must_use]
     pub fn symbol(&self) -> &Symbol {
-        todo!()
+        &self.0
     }
 }
 
 impl core::fmt::Display for VarId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        todo!()
+        core::fmt::Display::fmt(&self.0, f)
     }
 }
 
 impl Canonical for VarId {
     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
-        todo!()
+        self.0.canonical_cmp(&other.0)
     }
 
     fn write_canonical(&self, out: &mut Vec<u8>) {
-        todo!()
+        self.0.write_canonical(out);
     }
 }

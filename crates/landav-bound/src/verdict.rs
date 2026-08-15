@@ -52,20 +52,44 @@ impl Verdict {
         at: Origin,
         ledger: Option<Blames>,
     ) -> Result<Self, BoundError> {
-        todo!()
+        match (cost, ledger) {
+            // No execution reaches here, and nothing was left unaccounted for.
+            (Lifted::Bottom, None) => Ok(Self::Unreachable(at)),
+            // Reachability was not established *and* something was
+            // unaccounted for: a partial over `omega`, never `Unreachable`.
+            (Lifted::Bottom, Some(blames)) => {
+                Ok(Self::Partial(PartialBound::new(Bound::omega(), blames)))
+            }
+            (Lifted::Elem(bound), Some(blames)) => {
+                Ok(Self::Partial(PartialBound::new(bound, blames)))
+            }
+            // `omega`-freeness is necessary but not sufficient: the empty
+            // ledger is what makes this publishable at all.
+            (Lifted::Elem(bound), None) => match FiniteBound::try_new(bound) {
+                Ok(finite) => Ok(Self::Proved(finite)),
+                Err(_) => Err(BoundError::UnblamedOmega),
+            },
+        }
     }
 
     /// The reported bound, sound in every case it exists.
     /// `None` for [`Verdict::Unreachable`], which has no cost to report.
     #[must_use]
     pub fn bound(&self) -> Option<&Bound> {
-        todo!()
+        match self {
+            Self::Proved(finite) => Some(finite.get()),
+            Self::Partial(partial) => Some(partial.bound()),
+            Self::Unreachable(_) => None,
+        }
     }
 
     /// The blame ledger, if the result is partial.
     #[must_use]
     pub fn blames(&self) -> Option<&Blames> {
-        todo!()
+        match self {
+            Self::Partial(partial) => Some(partial.blames()),
+            Self::Proved(_) | Self::Unreachable(_) => None,
+        }
     }
 
     /// The process exit code.
@@ -77,6 +101,17 @@ impl Verdict {
     /// than assumed.
     #[must_use]
     pub fn exit_code(&self, fail_on_partial: bool) -> ExitCode {
-        todo!()
+        match self {
+            Self::Proved(_) | Self::Unreachable(_) => ExitCode::Clean,
+            // `Findings` needs semantic domination (F-018), so the only code
+            // left for "we could not look" is `ToolError`.
+            Self::Partial(_) => {
+                if fail_on_partial {
+                    ExitCode::ToolError
+                } else {
+                    ExitCode::Clean
+                }
+            }
+        }
     }
 }

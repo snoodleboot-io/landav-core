@@ -37,13 +37,16 @@ impl Base {
     ///
     /// [`BoundError::BaseTooSmall`] if `k < 2`.
     pub fn new(k: u32) -> Result<Self, BoundError> {
-        todo!()
+        if k < 2 {
+            return Err(BoundError::BaseTooSmall { got: k });
+        }
+        Ok(Self(k))
     }
 
     /// The validated base, always `>= 2`.
     #[must_use]
     pub const fn get(self) -> u32 {
-        todo!()
+        self.0
     }
 }
 
@@ -51,16 +54,16 @@ impl TryFrom<u32> for Base {
     type Error = BoundError;
 
     fn try_from(k: u32) -> Result<Self, Self::Error> {
-        todo!()
+        Self::new(k)
     }
 }
 
 impl Canonical for Base {
     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
-        todo!()
+        self.0.cmp(&other.0)
     }
 
     fn write_canonical(&self, out: &mut Vec<u8>) {
-        todo!()
+        out.extend_from_slice(&self.0.to_be_bytes());
     }
 }

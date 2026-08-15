@@ -27,34 +27,41 @@ impl Symbol {
     /// The name as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        todo!()
+        &self.0
     }
 }
 
 impl From<&str> for Symbol {
     fn from(value: &str) -> Self {
-        todo!()
+        Self(Arc::from(value))
     }
 }
 
 impl From<String> for Symbol {
     fn from(value: String) -> Self {
-        todo!()
+        Self(Arc::from(value))
     }
 }
 
 impl core::fmt::Display for Symbol {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        todo!()
+        f.write_str(self.as_str())
     }
 }
 
 impl Canonical for Symbol {
     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
-        todo!()
+        // `str::cmp` is content derived, so the order is identical in every
+        // process and on every toolchain.
+        self.as_str().cmp(other.as_str())
     }
 
     fn write_canonical(&self, out: &mut Vec<u8>) {
-        todo!()
+        let bytes = self.as_str().as_bytes();
+        // Length prefixed, so the encoding is self-delimiting and no two
+        // distinct names can produce the same byte run.
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(bytes);
     }
 }

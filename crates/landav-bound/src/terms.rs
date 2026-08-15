@@ -29,32 +29,40 @@ use crate::{bound::Bound, canonical::Canonical};
 pub struct Terms(Vec<Bound>);
 
 impl Terms {
+    /// Wraps operands that the caller has already flattened, folded, sorted
+    /// (and, for [`MaxTerms`], deduplicated) into canonical order.
+    ///
+    /// Crate private: the invariants are maintained by the smart constructors
+    /// on [`Bound`], which are the only code that can reach this.
+    pub(crate) fn from_canonical(operands: Vec<Bound>) -> Self {
+        Self(operands)
+    }
     /// The operands, in canonical order. Always at least two.
     #[must_use]
     pub fn as_slice(&self) -> &[Bound] {
-        todo!()
+        &self.0
     }
 
     /// The number of operands. Always at least two.
     #[must_use]
     pub fn len(&self) -> usize {
-        todo!()
+        self.0.len()
     }
 
     /// Always `false`; the arity invariant is `>= 2`. Present because clippy
     /// requires it alongside [`Self::len`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.0.is_empty()
     }
 }
 
 impl Canonical for Terms {
     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
-        todo!()
+        crate::bound::compare_operands(&self.0, &other.0)
     }
 
     fn write_canonical(&self, out: &mut Vec<u8>) {
-        todo!()
+        crate::bound::write_operands(&self.0, out);
     }
 }

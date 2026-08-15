@@ -23,25 +23,25 @@ impl CanonicalBytes {
     /// Wraps an already-canonical encoding.
     #[must_use]
     pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
-        todo!()
+        Self(bytes)
     }
 
     /// The encoding.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        todo!()
+        &self.0
     }
 
     /// The encoding's length in bytes.
     #[must_use]
     pub fn len(&self) -> usize {
-        todo!()
+        self.0.len()
     }
 
     /// Always `false` - a canonical encoding always carries at least a version
     /// tag. Present because clippy requires it alongside [`Self::len`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.0.is_empty()
     }
 }

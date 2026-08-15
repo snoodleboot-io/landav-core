@@ -22,7 +22,10 @@ impl TotalValuation {
     /// caller also supplies a blame ledger.
     #[must_use]
     pub fn saturating(known: BTreeMap<VarId, Nat>) -> Self {
-        todo!()
+        Self {
+            known,
+            absent: Nat::OMEGA,
+        }
     }
 
     /// Absent variables evaluate to `default`.
@@ -33,7 +36,10 @@ impl TotalValuation {
     /// point* on a grid rather than an over-approximation of an unknown.
     #[must_use]
     pub fn with_default(known: BTreeMap<VarId, Nat>, default: Nat) -> Self {
-        todo!()
+        Self {
+            known,
+            absent: default,
+        }
     }
 
     /// Requires every variable in `vars` to have an explicit value.
@@ -45,12 +51,27 @@ impl TotalValuation {
     /// differs between two runs of the same binary, and this message reaches a
     /// user-visible diagnostic and a CI log diff.
     pub fn require_total(self, vars: impl IntoIterator<Item = VarId>) -> Result<Self, BoundError> {
-        todo!()
+        // The **least** absent variable, not the first one offered: the
+        // caller's iteration order reaches a user-visible message otherwise.
+        let mut least: Option<VarId> = None;
+        for var in vars {
+            if self.known.contains_key(&var) {
+                continue;
+            }
+            least = match least {
+                Some(current) if current <= var => Some(current),
+                _ => Some(var),
+            };
+        }
+        match least {
+            Some(var) => Err(BoundError::UnboundVariable { var }),
+            None => Ok(self),
+        }
     }
 }
 
 impl Valuation for TotalValuation {
     fn value_of(&self, var: &VarId) -> Nat {
-        todo!()
+        self.known.get(var).copied().unwrap_or(self.absent)
     }
 }

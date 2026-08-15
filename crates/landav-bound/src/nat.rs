@@ -50,7 +50,7 @@ impl Nat {
     /// `true` iff this is not `omega`.
     #[must_use]
     pub const fn is_finite(self) -> bool {
-        todo!()
+        matches!(self, Self::Fin(_))
     }
 
     /// The semantic magnitude order: `Fin(a) < Fin(b)` iff `a < b`, and
@@ -60,7 +60,14 @@ impl Nat {
     /// a silent semantic change.
     #[must_use]
     pub fn magnitude_cmp(self, other: Self) -> core::cmp::Ordering {
-        todo!()
+        use core::cmp::Ordering;
+
+        match (self, other) {
+            (Self::Fin(a), Self::Fin(b)) => a.cmp(&b),
+            (Self::Fin(_), Self::Omega) => Ordering::Less,
+            (Self::Omega, Self::Fin(_)) => Ordering::Greater,
+            (Self::Omega, Self::Omega) => Ordering::Equal,
+        }
     }
 
     /// Addition. `x + omega == omega`.
@@ -71,7 +78,14 @@ impl Nat {
     /// published as `Proved` while under-reporting the truth.
     #[must_use]
     pub fn plus(self, rhs: Self) -> Self {
-        todo!()
+        match (self, rhs) {
+            (Self::Fin(a), Self::Fin(b)) => match a.checked_add(b) {
+                Some(sum) => Self::Fin(sum),
+                // Saturate to the top of the lattice, never to `u64::MAX`.
+                None => Self::OMEGA,
+            },
+            _ => Self::OMEGA,
+        }
     }
 
     /// Multiplication. **`omega` absorbs unconditionally, including against
@@ -99,13 +113,23 @@ impl Nat {
     /// **Never `saturating_mul`.**
     #[must_use]
     pub fn times(self, rhs: Self) -> Self {
-        todo!()
+        match (self, rhs) {
+            (Self::Fin(a), Self::Fin(b)) => match a.checked_mul(b) {
+                Some(product) => Self::Fin(product),
+                None => Self::OMEGA,
+            },
+            // `omega` absorbs unconditionally, including `0 * omega`.
+            _ => Self::OMEGA,
+        }
     }
 
     /// Lattice join. `max(x, omega) == omega`.
     #[must_use]
     pub fn join(self, rhs: Self) -> Self {
-        todo!()
+        match (self, rhs) {
+            (Self::Fin(a), Self::Fin(b)) => Self::Fin(a.max(b)),
+            _ => Self::OMEGA,
+        }
     }
 
     /// `base ^ self`. `base ^ omega == omega`; `base ^ 0 == 1`.
@@ -117,7 +141,21 @@ impl Nat {
     /// exponents, which satisfies "never panic" only vacuously.
     #[must_use]
     pub fn exp_of(self, base: Base) -> Self {
-        todo!()
+        let Self::Fin(exponent) = self else {
+            return Self::OMEGA;
+        };
+        // Tested **before** narrowing: `4294967296u64 as u32` is `0`, which
+        // made `pow(2, 2^32)` report `1`.
+        if exponent >= Self::MAX_FINITE_EXPONENT {
+            return Self::OMEGA;
+        }
+        let Ok(narrowed) = u32::try_from(exponent) else {
+            return Self::OMEGA;
+        };
+        match u64::from(base.get()).checked_pow(narrowed) {
+            Some(value) => Self::Fin(value),
+            None => Self::OMEGA,
+        }
     }
 
     /// `ceil(log_base(max(1, self)))`.
@@ -139,7 +177,26 @@ impl Nat {
     /// and `b = 1`.
     #[must_use]
     pub fn ceil_log(self, base: Base) -> Self {
-        todo!()
+        let Self::Fin(value) = self else {
+            return Self::OMEGA;
+        };
+        // `max(1, .)` removes the `log(0)` pole; `Base >= 2` removes the
+        // `base < 2` pole. Integer multiplication only - no floating point,
+        // and no `ilog`, whose floor variant under-reports.
+        let target = value.max(1);
+        let k = u64::from(base.get());
+        let mut reached: u64 = 1;
+        let mut exponent: u64 = 0;
+        while reached < target {
+            exponent = exponent.saturating_add(1);
+            match reached.checked_mul(k) {
+                Some(next) => reached = next,
+                // `base^exponent` exceeded `u64::MAX`, so it certainly
+                // reached the target. Never under-report.
+                None => return Self::Fin(exponent),
+            }
+        }
+        Self::Fin(exponent)
     }
 }
 
@@ -163,10 +220,16 @@ impl PartialOrd for Nat {
 
 impl Canonical for Nat {
     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
-        todo!()
+        self.magnitude_cmp(*other)
     }
 
     fn write_canonical(&self, out: &mut Vec<u8>) {
-        todo!()
+        match self {
+            Self::Fin(value) => {
+                out.push(0);
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            Self::Omega => out.push(1),
+        }
     }
 }

@@ -71,12 +71,74 @@ pub enum BoundKind {
     },
 }
 
+impl BoundKind {
+    /// The fieldless constructor tag.
+    pub(crate) const fn shape(&self) -> crate::bound_shape::BoundShape {
+        use crate::bound_shape::BoundShape;
+
+        match self {
+            Self::Const(_) => BoundShape::Const,
+            Self::Var(_) => BoundShape::Var,
+            Self::Sum(_) => BoundShape::Sum,
+            Self::Max(_) => BoundShape::Max,
+            Self::Prod(_) => BoundShape::Prod,
+            Self::Trans { .. } => BoundShape::Trans,
+        }
+    }
+}
+
 impl Canonical for BoundKind {
     fn canonical_cmp(&self, other: &Self) -> core::cmp::Ordering {
-        todo!()
+        use core::cmp::Ordering;
+
+        // Shapes order by the **explicitly written** canonical tag, never by
+        // Rust declaration order.
+        let tags = self
+            .shape()
+            .canonical_tag()
+            .cmp(&other.shape().canonical_tag());
+        if tags != Ordering::Equal {
+            return tags;
+        }
+        match (self, other) {
+            (Self::Const(left), Self::Const(right)) => left.canonical_cmp(right),
+            (Self::Var(left), Self::Var(right)) => left.canonical_cmp(right),
+            (Self::Sum(left), Self::Sum(right)) | (Self::Prod(left), Self::Prod(right)) => {
+                left.canonical_cmp(right)
+            }
+            (Self::Max(left), Self::Max(right)) => left.canonical_cmp(right),
+            (
+                Self::Trans {
+                    kind: left_kind,
+                    base: left_base,
+                    arg: left_arg,
+                },
+                Self::Trans {
+                    kind: right_kind,
+                    base: right_base,
+                    arg: right_arg,
+                },
+            ) => left_kind
+                .canonical_cmp(right_kind)
+                .then_with(|| left_base.canonical_cmp(right_base))
+                .then_with(|| left_arg.canonical_cmp(right_arg)),
+            // Unreachable: the tags above already agree, so the shapes do.
+            _ => Ordering::Equal,
+        }
     }
 
     fn write_canonical(&self, out: &mut Vec<u8>) {
-        todo!()
+        out.push(self.shape().canonical_tag());
+        match self {
+            Self::Const(magnitude) => magnitude.write_canonical(out),
+            Self::Var(var) => var.write_canonical(out),
+            Self::Sum(terms) | Self::Prod(terms) => terms.write_canonical(out),
+            Self::Max(terms) => terms.write_canonical(out),
+            Self::Trans { kind, base, arg } => {
+                kind.write_canonical(out);
+                base.write_canonical(out);
+                arg.write_canonical(out);
+            }
+        }
     }
 }
