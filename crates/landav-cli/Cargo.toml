@@ -18,7 +18,21 @@ landav-calibrate = { workspace = true }
 landav-python = { workspace = true }
 landav-solvers = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# Configuration is read from `pyproject.toml`, which is TOML, so a TOML reader
+# is not optional. Declared here rather than in `[workspace.dependencies]`
+# because no other crate parses configuration; promote it centrally the moment
+# a second one does, so two lanes cannot resolve different versions.
+toml = "0.9"
+
+[dev-dependencies]
+# Test-only. The acceptance tests build throwaway project trees (config files,
+# symlink loops, unreadable files) and must not leave them behind when a test
+# fails, so the scratch directory owns its own cleanup.
+tempfile = "3.27"
 
 [lints]
 workspace = true
