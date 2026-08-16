@@ -36,6 +36,8 @@
 
 pub mod analyse;
 pub mod expr_bound;
+pub mod rational;
+pub mod summation;
 pub mod trip_count;
 
 pub use crate::{analyse::cost, trip_count::TripCount};

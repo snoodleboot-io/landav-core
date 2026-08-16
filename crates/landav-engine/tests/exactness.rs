@@ -354,44 +354,84 @@ fn a_loop_counter_never_escapes_into_the_bound() {
     );
 }
 
-/// Substituting the trip count for the counter is an over-approximation, so
-/// the claim must be weakened to match. Reporting this as exact is the specific
-/// defect above.
+/// Triangular nesting is **exact**, and the exactness comes from summing the
+/// body's cost over the counter rather than multiplying by a dominating value.
+///
+/// `sum over i < n of (1 + 2i)` = `n^2`. The approximation this replaced gave
+/// `n * (1 + 2n)` = `2n^2 + n` - right shape, about twice too large.
 #[test]
-fn triangular_nesting_is_a_bound_and_says_so() {
+fn triangular_nesting_is_exact() {
     assert!(
-        matches!(cost(&triangular()), TripCount::AtMost(_)),
-        "triangular nesting is approximated, and must not claim exactness"
+        matches!(cost(&triangular()), TripCount::Exact(_)),
+        "the definite sum closes for triangular nesting, so the answer is exact"
     );
 }
 
-/// Soundness of the approximation, checked against the truth rather than
-/// against the implementation.
+/// Checked against the truth rather than against the implementation: the
+/// engine's bound must equal the brute-force cost at every point, not merely
+/// dominate it.
 ///
-/// The exact cost is `sum over i < n of (1 + 2i)` = `n^2`. The engine reports
-/// `n * (1 + 2n)` = `2n^2 + n`, which dominates it everywhere - right shape,
-/// about twice too large.
-///
-/// Worth recording that `n^2` **is** expressible in the current bound algebra,
-/// so closing this gap does not depend on the frozen-API change: the
-/// intermediate sum needs rational arithmetic, but the answer does not.
+/// Worth noting that `n^2` needs neither subtraction nor division to write
+/// down. The intermediate Faulhaber sum has both - `n(n-1)/2` - but the
+/// coefficient `2` clears the denominator and the negative term cancels
+/// against the constant one. The rationals never leave the summation.
 #[test]
-fn the_triangular_approximation_dominates_the_truth() {
+fn the_triangular_bound_equals_the_truth() {
     let bound = cost(&triangular())
         .bound()
         .expect("triangular nesting has a bound")
         .clone();
     for n in [0_u64, 1, 2, 3, 4, 8, 32] {
         let truth: u64 = (0..n).map(|i| 1 + 2 * i).sum();
-        let reported = at(&bound, "n", n);
         assert_eq!(
             truth,
             n * n,
             "the arithmetic in this test is wrong, not the engine"
         );
-        assert!(
-            reported.magnitude_cmp(landav_bound::Nat::Fin(truth)) != std::cmp::Ordering::Less,
-            "the reported bound {reported:?} is below the true cost {truth} at n = {n}"
+        assert_eq!(
+            at(&bound, "n", n),
+            landav_bound::Nat::Fin(truth),
+            "the engine disagreed with the true cost at n = {n}"
         );
     }
+}
+
+/// A descending or strided loop has the same *trip count* as an ascending unit
+/// one but a different *sequence* of counter values, and Faulhaber's formulae
+/// are over `0, 1, 2, ...`. Summing one as if it were the other would be
+/// silently wrong, so those fall back to the approximation.
+#[test]
+fn a_strided_loop_body_that_reads_its_counter_is_not_summed() {
+    let mut build = SourceProgramBuilder::new("strided", here(), vec![VarName::new("n")]);
+    let three = NonZeroI64::new(3).expect("3 is non-zero");
+    let one = NonZeroI64::new(1).expect("1 is non-zero");
+
+    let inner_start = build.int(0, here());
+    let inner_stop = build.var(VarName::new("i"), here());
+    let value = build.int(0, here());
+    let assign = build.assign(VarName::new("x"), value, here());
+    let inner = build.for_range(
+        VarName::new("j"),
+        RangeSpec::new(inner_start, inner_stop, one),
+        vec![assign],
+        here(),
+    );
+
+    // The outer loop strides by three, so its counter is 0, 3, 6, ... and the
+    // trip count alone does not determine the sum.
+    let outer_start = build.int(0, here());
+    let outer_stop = build.int(30, here());
+    let outer = build.for_range(
+        VarName::new("i"),
+        RangeSpec::new(outer_start, outer_stop, three),
+        vec![inner],
+        here(),
+    );
+    let program = build.build(vec![outer]);
+
+    let result = cost(&program);
+    assert!(
+        matches!(result, TripCount::AtMost(_)),
+        "a strided counter must not be summed as if it stepped by one, got {result:?}"
+    );
 }

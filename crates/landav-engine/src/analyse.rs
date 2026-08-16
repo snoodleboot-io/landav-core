@@ -3,7 +3,7 @@
 use landav_bound::{Bound, VarId};
 use landav_its::{RangeSpec, SourceExpr, SourceProgram, SourceStmt, StmtId, VarName};
 
-use crate::{expr_bound, trip_count::TripCount};
+use crate::{expr_bound, summation, trip_count::TripCount};
 
 /// What the program costs, in **source steps**: one per statement executed,
 /// plus one per loop iteration for the loop's own test and increment.
@@ -71,8 +71,7 @@ fn stmt_cost(program: &SourceProgram, id: StmtId) -> TripCount {
             body,
         } => {
             let count = count_of(program, *range);
-            let body = close_over_counter(target, &count, body_cost(program, body));
-            count.iterating(body)
+            loop_cost(program, target, *range, body, count)
         }
 
         // Lowering refuses these outright, so a program containing one never
@@ -126,6 +125,65 @@ fn close_over_counter(target: &VarName, count: &TripCount, body: TripCount) -> T
         return TripCount::Unknown;
     };
     TripCount::AtMost(body_bound.subst(&counter, ceiling))
+}
+
+/// The whole cost of a counted loop, summed exactly where that is possible.
+///
+/// # Two routes, and why the exact one is tried first
+///
+/// The cost of the loop is the definite sum of the body's cost over the values
+/// the counter takes. Where that sum has a closed form the bound algebra can
+/// hold, it is the answer and it is exact.
+///
+/// Where it does not - the body is not a polynomial in the counter, or the
+/// closed form keeps a denominator or a negative coefficient - the fallback
+/// substitutes the trip count for the counter and multiplies, which
+/// over-approximates and says so.
+///
+/// The difference is not small. Triangular nesting sums to `n^2` and
+/// approximates to `2n^2 + n`.
+///
+/// # Both routes stay sound
+///
+/// The summation is only taken when it is exact, so it never trades soundness
+/// for tightness. The fallback is sound because the counter of an ascending
+/// loop from zero is dominated by its trip count and [`Bound`] is weakly
+/// monotone by construction.
+fn loop_cost(
+    program: &SourceProgram,
+    target: &VarName,
+    range: RangeSpec,
+    body: &[StmtId],
+    count: TripCount,
+) -> TripCount {
+    let body = body_cost(program, body);
+    let counter = VarId::new(target.symbol().clone());
+
+    // The summation is only valid for the counter this engine can reason about
+    // - ascending from zero in unit steps - because that is the progression
+    // Faulhaber's formulae are over. A descending or strided loop has the same
+    // trip count but a different sequence of counter values.
+    let summable = range.ascending()
+        && range.step.get() == 1
+        && matches!(
+            program.expr(range.start),
+            Some(SourceExpr::Int { value: 0 })
+        );
+
+    if let (true, TripCount::Exact(trip), TripCount::Exact(per_iteration)) =
+        (summable, &count, &body)
+    {
+        {
+            // One step of loop overhead per iteration, inside the sum.
+            let charged = Bound::sum([per_iteration.clone(), Bound::one()]);
+            if let Some(total) = summation::sum_over_counter(&charged, &counter, trip) {
+                return TripCount::Exact(total);
+            }
+        }
+    }
+
+    let approximated = close_over_counter(target, &count, body);
+    count.iterating(approximated)
 }
 
 /// How many times a counted loop runs.
