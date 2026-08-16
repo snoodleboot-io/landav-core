@@ -164,6 +164,7 @@ pub mod compare_op;
 pub mod cond_id;
 pub mod constraint;
 pub mod construct;
+pub mod cost;
 pub mod coverage;
 pub mod expr_id;
 pub mod guard;
@@ -192,7 +193,7 @@ pub mod var_name;
 
 pub use crate::{
     arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId, constraint::Constraint,
-    construct::Construct, coverage::Coverage, expr_id::ExprId, guard::Guard, its::Its,
+    construct::Construct, cost::Cost, coverage::Coverage, expr_id::ExprId, guard::Guard, its::Its,
     its_var::ItsVar, location::Location, location_id::LocationId, lowering::lower,
     lowering_error::LoweringError, monomial::Monomial, polynomial::Polynomial,
     range_spec::RangeSpec, refusals::Refusals, relation::Relation, source_cond::SourceCond,

@@ -1,0 +1,28 @@
+[package]
+name = "landav-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Native worst-case bound analysis over landav's structured source fragment."
+
+[dependencies]
+landav-bound = { workspace = true }
+# The structured program this engine reads. It deliberately does **not** read
+# the `Its`: the whole thesis is that lowering to a flat transition system
+# discards the structure that makes a counted loop's trip count exact, so an
+# engine that reads the lowered form has already thrown away its advantage.
+landav-its = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The differential check runs the external solver over the same program and
+# compares. Only a dev-dependency: the shipped engine must never need a solver
+# on PATH, which is the whole point of it being native.
+landav-solvers = { workspace = true }

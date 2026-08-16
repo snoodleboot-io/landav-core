@@ -50,6 +50,52 @@ jobs:
       - name: Docs
         run: cargo doc --workspace --no-deps
 
+  # The native engine and KoAT2 analyse the same programs by entirely different
+  # routes -- one reads the source structure, the other a flat transition system
+  # -- so where they disagree, one of them is wrong. That makes the external
+  # solver a free oracle for the engine, and the engine a free oracle for the
+  # lowering's cost model.
+  #
+  # It is a separate job because it needs a solver on PATH, and the shipped
+  # engine must never need one. `LANDAV_REQUIRE_SOLVERS=1` turns the tests'
+  # own "solver missing, skipping" path into a failure: without it a broken
+  # install would report green for a comparison that never ran.
+  differential:
+    name: native engine vs. KoAT2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the version; this action honours it.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The release publishes a zstd-compressed static binary, not a bare one.
+      # `koat2_static.zst` rather than `koat2`: the latter 404s, which is how
+      # this job failed the first time it ran.
+      - name: Install KoAT2
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq zstd
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/koat2.zst \
+            https://github.com/aprove-developers/KoAT2-Releases/releases/latest/download/koat2_static.zst
+          zstd -d -f /tmp/koat2.zst -o "$HOME/.local/bin/koat2"
+          chmod +x "$HOME/.local/bin/koat2"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Fail the job here rather than let a broken install turn into a skipped
+      # comparison further down. The test's own skip path is loud, but a job
+      # whose whole purpose is the cross-check should not reach it at all.
+      - name: Confirm the solver is usable
+        run: koat2 --help > /dev/null
+
+      - name: Cross-check the two engines
+        env:
+          LANDAV_REQUIRE_SOLVERS: "1"
+        run: cargo test -p landav-engine --test differential
+
   edition-boundary:
     name: no entitlement logic in core
     runs-on: ubuntu-latest

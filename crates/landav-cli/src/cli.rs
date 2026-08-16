@@ -110,6 +110,24 @@ struct CheckArgs {
                      without this flag."
     )]
     coverage: bool,
+
+    /// Print the derived bound for each function that lowered.
+    ///
+    /// Separate from `--coverage`, which answers "what was skipped". This
+    /// answers "what did the analysis conclude about what was not".
+    #[arg(
+        long,
+        long_help = "Print the derived bound for each function that lowered.\n\n\
+                     A bound is reported as Theta when it is an equality and O when \
+                     it is only an upper bound. The distinction is not cosmetic: \
+                     Theta means the analysis derived the cost exactly, and O means \
+                     the true cost may be lower than the number shown.\n\n\
+                     Functions the analysis could not bound are listed too, saying \
+                     so. Silence about a function would read as a bound of zero.\n\n\
+                     This reports the native engine only, so it needs no solver \
+                     installed."
+    )]
+    bounds: bool,
 }
 
 /// Parse `argv` and run, returning the outcome to be mapped to an exit code.
@@ -124,6 +142,7 @@ pub fn dispatch() -> Outcome {
                 args.config.as_deref(),
                 args.resource,
                 args.coverage,
+                args.bounds,
             ),
         },
         Err(error) => usage(&error),

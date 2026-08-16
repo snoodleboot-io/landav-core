@@ -31,12 +31,12 @@ use landav_bound::{Origin, Symbol};
 
 use crate::{
     MAX_DNF_CLAUSES, arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId,
-    constraint::Constraint, construct::Construct, expr_id::ExprId, guard::Guard, its::Its,
-    its_var::ItsVar, location::Location, location_id::LocationId, lowering_error::LoweringError,
-    polynomial::Polynomial, refusals::Refusals, relation::Relation, source_cond::SourceCond,
-    source_expr::SourceExpr, source_program::SourceProgram, source_stmt::SourceStmt,
-    stmt_id::StmtId, transition::Transition, unsupported::Unsupported, update::Update,
-    var_name::VarName,
+    constraint::Constraint, construct::Construct, cost::Cost, expr_id::ExprId, guard::Guard,
+    its::Its, its_var::ItsVar, location::Location, location_id::LocationId,
+    lowering_error::LoweringError, polynomial::Polynomial, refusals::Refusals, relation::Relation,
+    source_cond::SourceCond, source_expr::SourceExpr, source_program::SourceProgram,
+    source_stmt::SourceStmt, stmt_id::StmtId, transition::Transition, unsupported::Unsupported,
+    update::Update, var_name::VarName,
 };
 
 /// A condition in disjunctive normal form: a disjunction of conjunctions.
@@ -127,6 +127,10 @@ impl<'a> Lowering<'a> {
                     job.exit,
                     Guard::always(),
                     Update::identity(),
+                    // An empty block. This edge exists only because a location
+                    // with no way out would look like non-termination; the
+                    // program does nothing here, so it costs nothing.
+                    Cost::free(),
                     program.origin().clone(),
                 );
                 continue;
@@ -243,6 +247,8 @@ impl<'a> Lowering<'a> {
                     to,
                     Guard::always(),
                     Update::new([(ItsVar::from(target), polynomial)]),
+                    // A source statement executed.
+                    Cost::step(),
                     origin,
                 );
             }
@@ -255,8 +261,25 @@ impl<'a> Lowering<'a> {
                 let (positive, negative) = self.cond_dnf(*cond);
                 let then_entry = self.new_location("if.then");
                 let else_entry = self.new_location("if.else");
-                self.emit_dnf(&positive, from, then_entry, &Update::identity(), &origin);
-                self.emit_dnf(&negative, from, else_entry, &Update::identity(), &origin);
+                // The test itself, charged once whichever arm is taken. Both
+                // arms carry it because exactly one of them fires.
+                let test = Cost::step();
+                self.emit_dnf(
+                    &positive,
+                    from,
+                    then_entry,
+                    &Update::identity(),
+                    &test,
+                    &origin,
+                );
+                self.emit_dnf(
+                    &negative,
+                    from,
+                    else_entry,
+                    &Update::identity(),
+                    &test,
+                    &origin,
+                );
                 self.push_job(work, id, then_body, then_entry, to);
                 self.push_job(work, id, else_body, else_entry, to);
             }
@@ -268,12 +291,33 @@ impl<'a> Lowering<'a> {
                     head,
                     Guard::always(),
                     Update::identity(),
+                    // Entering the loop is bookkeeping - this edge exists so
+                    // the back edge has a target, not because the program did
+                    // anything.
+                    Cost::free(),
                     origin.clone(),
                 );
                 let (positive, negative) = self.cond_dnf(*cond);
                 let body_entry = self.new_location("while.body");
-                self.emit_dnf(&positive, head, body_entry, &Update::identity(), &origin);
-                self.emit_dnf(&negative, head, to, &Update::identity(), &origin);
+                self.emit_dnf(
+                    &positive,
+                    head,
+                    body_entry,
+                    &Update::identity(),
+                    // The per-iteration test.
+                    &Cost::step(),
+                    &origin,
+                );
+                self.emit_dnf(
+                    &negative,
+                    head,
+                    to,
+                    &Update::identity(),
+                    // The failing test that ends the loop. Free, so a loop
+                    // running `n` times costs `n` tests rather than `n + 1`.
+                    &Cost::free(),
+                    &origin,
+                );
                 // The body's exit is the head, which is what makes the loop a
                 // loop: the back edge is the block's fall-through.
                 self.push_job(work, id, body, body_entry, head);
@@ -294,7 +338,15 @@ impl<'a> Lowering<'a> {
                 // They are still traversed, so a refusal inside them is still
                 // reported.
                 let exit = self.exit;
-                self.emit(from, exit, Guard::always(), Update::identity(), origin);
+                self.emit(
+                    from,
+                    exit,
+                    Guard::always(),
+                    Update::identity(),
+                    // A source statement executed.
+                    Cost::step(),
+                    origin,
+                );
             }
 
             // Recorded by `refuse_every_unsupported_node`, not here. Doing it
@@ -351,6 +403,10 @@ impl<'a> Lowering<'a> {
             head,
             Guard::always(),
             Update::new([(counter.clone(), start), (limit.clone(), stop)]),
+            // Snapshotting the endpoints into fresh variables is this
+            // lowering's own device for making "evaluated once" true in the
+            // emitted system. The source did not ask for it.
+            Cost::free(),
             origin.clone(),
         );
 
@@ -370,6 +426,10 @@ impl<'a> Lowering<'a> {
             body_entry,
             Guard::new([Constraint::new(progress, Relation::Gt)]),
             Update::new([(ItsVar::from(target), counter_poly.clone())]),
+            // The per-iteration test, and the binding of the loop variable
+            // that goes with it. This is the one step a counted loop costs
+            // beyond its body.
+            Cost::step(),
             origin.clone(),
         );
         self.emit(
@@ -377,6 +437,9 @@ impl<'a> Lowering<'a> {
             to,
             Guard::new([Constraint::new(exhausted, Relation::Ge)]),
             Update::identity(),
+            // The failing test that ends the loop, taken once. Free, so
+            // `range(n)` costs `n` rather than `n + 1`.
+            Cost::free(),
             origin.clone(),
         );
 
@@ -387,6 +450,9 @@ impl<'a> Lowering<'a> {
             head,
             Guard::always(),
             Update::new([(counter, advanced)]),
+            // Advancing the counter is bookkeeping on a variable this lowering
+            // introduced. Charging it would double every counted loop.
+            Cost::free(),
             origin.clone(),
         );
 
@@ -669,19 +735,62 @@ impl<'a> Lowering<'a> {
 
     // -- emission -----------------------------------------------------------
 
+    /// One transition, charged what its execution is worth.
+    ///
+    /// # The unit is a *source* step, not a transition
+    ///
+    /// Charging every transition one unit is the obvious choice and it is the
+    /// wrong one, because the count then depends on how many locations this
+    /// lowering happens to allocate per construct - an implementation detail
+    /// that can move without the analysed program changing. A user-facing
+    /// bound that shifts when the lowering is refactored is not a bound anyone
+    /// can rely on, and it silently invalidates every calibration profile.
+    ///
+    /// So the unit is one step per *source statement executed*, plus one per
+    /// loop iteration for the loop's own test:
+    ///
+    /// | Transition | Cost | Why |
+    /// | -- | -- | -- |
+    /// | assignment | step | a source statement executed |
+    /// | `return` | step | likewise |
+    /// | `if` test, either arm | step | the test runs once, whichever arm is taken |
+    /// | loop guard, continuing | step | the per-iteration test is real work |
+    /// | loop guard, exiting | **free** | see below |
+    /// | counter init, counter increment, block entry | **free** | invented here |
+    ///
+    /// # Why the exiting guard is free
+    ///
+    /// A loop running `n` times evaluates its guard `n + 1` times - `n`
+    /// successes and one failure. Charging the failure would make every loop
+    /// cost one more than its iteration count, which is arithmetically
+    /// defensible and reads badly: a bound of `n + 1` for a loop everyone
+    /// describes as running `n` times invites the reader to think the analysis
+    /// is loose when it is exact. The trailing test is folded into the model
+    /// rather than into the number.
+    ///
+    /// This is a *choice*, and `landav-engine` makes the same one. The two
+    /// agreeing is what makes either checkable against the other.
     fn emit(
         &mut self,
         from: LocationId,
         to: LocationId,
         guard: Guard,
         update: Update,
+        cost: Cost,
         origin: Origin,
     ) {
         self.transitions
-            .push(Transition::new(from, to, guard, update, origin));
+            .push(Transition::new(from, to, guard, update, cost, origin));
     }
 
-    /// One transition per clause of `dnf`.
+    /// One transition per clause of `dnf`, each charged `cost`.
+    ///
+    /// # Why every clause is charged, not just one
+    ///
+    /// A disjunctive guard becomes several transitions out of one location,
+    /// and an execution takes **exactly one** of them - they are alternatives,
+    /// not a sequence. So charging each the full cost of the test is right:
+    /// whichever fires, one test happened.
     ///
     /// Clauses that are unsatisfiable on their face are dropped. That removes
     /// transitions no execution could take, so it cannot remove an execution -
@@ -693,6 +802,7 @@ impl<'a> Lowering<'a> {
         from: LocationId,
         to: LocationId,
         update: &Update,
+        cost: &Cost,
         origin: &Origin,
     ) {
         for clause in dnf {
@@ -700,7 +810,14 @@ impl<'a> Lowering<'a> {
             if guard.is_trivially_unsatisfiable() {
                 continue;
             }
-            self.emit(from, to, guard, update.clone(), origin.clone());
+            self.emit(
+                from,
+                to,
+                guard,
+                update.clone(),
+                cost.clone(),
+                origin.clone(),
+            );
         }
     }
 
