@@ -109,8 +109,9 @@ pub fn run(
     explicit_config: Option<&Path>,
     resource: Option<ResourceKind>,
     coverage: bool,
+    bounds: bool,
 ) -> Outcome {
-    match analyse(target, explicit_config, resource, coverage) {
+    match analyse(target, explicit_config, resource, coverage, bounds) {
         Ok(outcome) => outcome,
         Err(error) => {
             report_failure(&error);
@@ -125,6 +126,7 @@ fn analyse(
     explicit_config: Option<&Path>,
     resource: Option<ResourceKind>,
     detail: bool,
+    bounds: bool,
 ) -> Result<Outcome, ToolError> {
     let config = config::load(target, explicit_config)?;
     let (kind, mut walk) = crate::sources::collect(target)?;
@@ -157,7 +159,9 @@ fn analyse(
                 // read offered no function to lower, and counting it as a
                 // refused construct would file a parser limitation under a
                 // language construct nobody wrote.
-                if let Err(problem) = accumulate(path, &text, &mut coverage) {
+                if let Err(problem) =
+                    accumulate(path, &text, &mut coverage, bounds.then_some(&mut report))
+                {
                     walk.problems.push(problem);
                 }
             }
@@ -600,7 +604,12 @@ const fn classify(
 /// disagreement between two entry points rather than a property of the source —
 /// it is blamed rather than swallowed, because a coverage denominator that
 /// silently lost a file is the omission this story is about.
-fn accumulate(path: &Path, text: &str, coverage: &mut Coverage) -> Result<(), ToolError> {
+fn accumulate<W: std::io::Write>(
+    path: &Path,
+    text: &str,
+    coverage: &mut Coverage,
+    mut bounds: Option<&mut Report<W>>,
+) -> Result<(), ToolError> {
     let functions = landav_python::lower_module(path, text).map_err(|error| {
         ToolError::at_path(
             path,
@@ -612,9 +621,60 @@ fn accumulate(path: &Path, text: &str, coverage: &mut Coverage) -> Result<(), To
         )
     })?;
     for function in &functions {
-        coverage.record(landav_its::lower(function.program()).as_ref());
+        let lowered = landav_its::lower(function.program());
+        // A function that did not lower has no bound to report either, and
+        // saying so is the point: the coverage line counts it, and a `--bounds`
+        // run that simply omitted it would read as a bound of zero.
+        if let Some(report) = bounds.as_deref_mut() {
+            report.line(format_args!(
+                "{}",
+                describe_bound(function, lowered.is_ok())
+            ));
+        }
+        coverage.record(lowered.as_ref());
     }
     Ok(())
+}
+
+/// One function's bound, as a line.
+///
+/// # Why the quantifier is spelled out
+///
+/// `Theta` and `O` are different claims and the difference is the product.
+/// `Theta` says the analysis derived the cost *exactly*; `O` says the true cost
+/// may be lower than the number shown. A reader who cannot tell them apart
+/// cannot tell a tight answer from a cautious one, which is most of what this
+/// tool is for.
+///
+/// The engine reports its own exactness, so no solver is consulted and none
+/// needs to be installed. Where it has no answer the line says that too - the
+/// external solver may still find an upper bound, and silence here would be
+/// read as zero.
+fn describe_bound(function: &landav_python::LoweredFunction, lowered: bool) -> String {
+    let at = function.location();
+    let where_ = format!("{}:{}:{}", at.file().display(), at.line(), at.column());
+    if !lowered {
+        return format!(
+            "{where_}: {}: no bound: this function did not lower, so nothing was \
+             derived for it",
+            function.name()
+        );
+    }
+    match landav_engine::cost(function.program()) {
+        landav_engine::TripCount::Exact(bound) => format!(
+            "{where_}: {}: Theta({bound}) - derived exactly",
+            function.name()
+        ),
+        landav_engine::TripCount::AtMost(bound) => format!(
+            "{where_}: {}: O({bound}) - an upper bound; the true cost may be lower",
+            function.name()
+        ),
+        landav_engine::TripCount::Unknown => format!(
+            "{where_}: {}: no bound: the native engine could not derive one, so this \
+             function is covered only by whatever an external solver reports",
+            function.name()
+        ),
+    }
 }
 
 /// The line a run prints when part of what it looked at did not lower.
