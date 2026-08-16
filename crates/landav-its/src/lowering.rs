@@ -31,7 +31,8 @@ use landav_bound::{Origin, Symbol};
 
 use crate::{
     MAX_DNF_CLAUSES, arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId,
-    constraint::Constraint, construct::Construct, expr_id::ExprId, guard::Guard, its::Its,
+    constraint::Constraint, construct::Construct, cost::Cost, expr_id::ExprId, guard::Guard,
+    its::Its,
     its_var::ItsVar, location::Location, location_id::LocationId, lowering_error::LoweringError,
     polynomial::Polynomial, refusals::Refusals, relation::Relation, source_cond::SourceCond,
     source_expr::SourceExpr, source_program::SourceProgram, source_stmt::SourceStmt,
@@ -677,8 +678,13 @@ impl<'a> Lowering<'a> {
         update: Update,
         origin: Origin,
     ) {
+        // One step per transition. The Python fragment this lowering accepts
+        // has no construct whose single execution is worth more than one unit -
+        // no calls, no comprehensions, no collection operations - so a step
+        // count is the honest cost model for it. The moment one of those
+        // refusals is relaxed, this is the line that has to change with it.
         self.transitions
-            .push(Transition::new(from, to, guard, update, origin));
+            .push(Transition::new(from, to, guard, update, Cost::step(), origin));
     }
 
     /// One transition per clause of `dnf`.

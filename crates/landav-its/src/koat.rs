@@ -92,7 +92,17 @@ fn render_rule(its: &Its, transition: &Transition) -> String {
         }
         rule.push_str(&mangle(var));
     }
-    rule.push_str(") -> ");
+    // A bare `->` is cost one to KoAT, so the common case needs no annotation
+    // and step-counting systems render exactly as they did before costs were
+    // representable. Anything else is spelled out, including zero - `-{0}>` is
+    // read as free, and verified so against the solver rather than assumed.
+    if transition.cost().is_step() {
+        rule.push_str(") -> ");
+    } else {
+        rule.push_str(") -{");
+        rule.push_str(&render_polynomial(transition.cost().polynomial()));
+        rule.push_str("}> ");
+    }
     rule.push_str(&transition.target().to_string());
     rule.push('(');
     for (index, var) in its.vars().iter().enumerate() {
@@ -209,4 +219,81 @@ pub fn mangle(var: &ItsVar) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use landav_bound::{Origin, Symbol};
+
+    use super::render_rule;
+    use crate::{
+        cost::Cost, guard::Guard, its::Its, its_var::ItsVar, location_id::LocationId,
+        polynomial::Polynomial, transition::Transition, update::Update,
+    };
+
+    /// The cost annotation is the one piece of this format whose syntax was
+    /// established by probing KoAT rather than by reading a grammar. `-{c}>` was
+    /// confirmed to move the solver's answer in the expected direction - a rule
+    /// charged two units per iteration reports `2*Arg_0+3` where the unweighted
+    /// form reports `Arg_0+1` - and `-{0}>` was confirmed to be read as free
+    /// rather than ignored.
+    ///
+    /// So these assert an empirical fact about the solver, not a restatement of
+    /// the code above. If a future KoAT changes the syntax, this is where it
+    /// surfaces, and the fix is to re-probe rather than to guess again.
+    fn rule_for(cost: Cost) -> String {
+        // Built directly rather than lowered: the lowering emits only unit
+        // costs, so a lowered system cannot exercise the annotated branch at
+        // all. That gap closes when the trip-count work starts charging real
+        // costs; until then this is the only way to test the renderer.
+        let its = Its {
+            name: Symbol::from("probe"),
+            origin: Origin::new("probe"),
+            vars: vec![ItsVar::new(Symbol::from("n"))],
+            params: Vec::new(),
+            start: LocationId(0),
+            exit: LocationId(1),
+            locations: Vec::new(),
+            transitions: Vec::new(),
+        };
+        let transition = Transition::new(
+            LocationId(0),
+            LocationId(1),
+            Guard::always(),
+            Update::identity(),
+            cost,
+            Origin::new("probe"),
+        );
+        render_rule(&its, &transition)
+    }
+
+    #[test]
+    fn a_unit_cost_renders_as_a_bare_arrow() {
+        let rule = rule_for(Cost::step());
+        assert!(rule.contains(") -> "), "got {rule}");
+        assert!(!rule.contains("-{"), "unit cost should stay implicit: {rule}");
+    }
+
+    #[test]
+    fn a_charged_transition_shows_its_cost() {
+        let rule = rule_for(Cost::constant(3));
+        assert!(rule.contains(") -{3}> "), "got {rule}");
+    }
+
+    /// Zero is the case a "annotate when non-default" rule gets wrong if it
+    /// tests truthiness instead of equality with one. A dropped `-{0}>` silently
+    /// becomes a step, which inflates every bound routed through that edge.
+    #[test]
+    fn a_free_transition_is_annotated_rather_than_omitted() {
+        let rule = rule_for(Cost::free());
+        assert!(rule.contains(") -{0}> "), "zero must be explicit: {rule}");
+    }
+
+    #[test]
+    fn a_stateful_cost_renders_as_its_polynomial() {
+        let rule = rule_for(Cost::stateful(Polynomial::var(ItsVar::new(Symbol::from(
+            "n",
+        )))));
+        assert!(rule.contains(") -{vn}> "), "got {rule}");
+    }
 }
