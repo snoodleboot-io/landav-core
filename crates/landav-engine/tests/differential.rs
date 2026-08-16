@@ -127,6 +127,37 @@ fn nested_loops() -> SourceProgram {
     build.build(vec![outer])
 }
 
+/// `for i in range(0, n): for j in range(0, i): x = 0`
+///
+/// The case the summation exists for. The engine sums to `n^2` exactly; the
+/// solver has to recover the triangular structure from a flat graph.
+fn triangular() -> SourceProgram {
+    let mut build = SourceProgramBuilder::new("triangular", here(), vec![VarName::new("n")]);
+    let one = NonZeroI64::new(1).unwrap();
+
+    let inner_start = build.int(0, here());
+    // The inner limit is the outer counter. This is what makes it triangular.
+    let inner_stop = build.var(VarName::new("i"), here());
+    let value = build.int(0, here());
+    let assign = build.assign(VarName::new("x"), value, here());
+    let inner = build.for_range(
+        VarName::new("j"),
+        RangeSpec::new(inner_start, inner_stop, one),
+        vec![assign],
+        here(),
+    );
+
+    let outer_start = build.int(0, here());
+    let outer_stop = build.var(VarName::new("n"), here());
+    let outer = build.for_range(
+        VarName::new("i"),
+        RangeSpec::new(outer_start, outer_stop, one),
+        vec![inner],
+        here(),
+    );
+    build.build(vec![outer])
+}
+
 /// The solver's bound for a system, or a sentence saying why there is none.
 fn solver_bound(its: &Its) -> Result<Bound, String> {
     let report = run(Solver::Koat, its, &Config::default())
@@ -259,5 +290,20 @@ fn the_solver_is_strictly_looser_on_nested_loops() {
         "the native engine should be strictly tighter than the solver on nested \
          loops; if this fails because they are now equal, that is good news and \
          this test should be retired deliberately.\n  engine = {engine}\n  solver = {solver}"
+    );
+}
+
+/// Triangular nesting. The engine sums it to `n^2` exactly; the solver must
+/// recover the same structure from a flat transition graph and is not expected
+/// to match. The check is that the exact answer stays inside the sound one.
+///
+/// This is the case the summation was built for, so it is the one most worth
+/// having an independent witness to. If the summation is ever wrong, the two
+/// disagree here first.
+#[test]
+fn triangular_nesting_stays_within_the_solvers_bound() {
+    assert_engine_within_solver(
+        "triangular_nesting_stays_within_the_solvers_bound",
+        &triangular(),
     );
 }
