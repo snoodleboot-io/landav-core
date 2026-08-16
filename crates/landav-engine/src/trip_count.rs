@@ -75,9 +75,7 @@ impl TripCount {
     pub fn then(self, next: Self) -> Self {
         match (self, next) {
             (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
-            (Self::Exact(left), Self::Exact(right)) => {
-                Self::Exact(Bound::sum([left, right]))
-            }
+            (Self::Exact(left), Self::Exact(right)) => Self::Exact(Bound::sum([left, right])),
             (left, right) => {
                 // At least one side is loose, so the sum is. `bound` cannot be
                 // `None` here - the `Unknown` cases are already handled above -
@@ -112,9 +110,7 @@ impl TripCount {
         let per_iteration = body.then(Self::Exact(Bound::one()));
         match (self, per_iteration) {
             (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
-            (Self::Exact(count), Self::Exact(each)) => {
-                Self::Exact(Bound::prod([count, each]))
-            }
+            (Self::Exact(count), Self::Exact(each)) => Self::Exact(Bound::prod([count, each])),
             (count, each) => match (count.bound(), each.bound()) {
                 (Some(c), Some(e)) => Self::AtMost(Bound::prod([c.clone(), e.clone()])),
                 _ => Self::Unknown,

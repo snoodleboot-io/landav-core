@@ -271,7 +271,10 @@ mod tests {
     fn a_unit_cost_renders_as_a_bare_arrow() {
         let rule = rule_for(Cost::step());
         assert!(rule.contains(") -> "), "got {rule}");
-        assert!(!rule.contains("-{"), "unit cost should stay implicit: {rule}");
+        assert!(
+            !rule.contains("-{"),
+            "unit cost should stay implicit: {rule}"
+        );
     }
 
     #[test]

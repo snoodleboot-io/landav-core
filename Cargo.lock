@@ -464,6 +464,7 @@ version = "0.0.0"
 dependencies = [
  "landav-bound",
  "landav-its",
+ "landav-solvers",
  "thiserror 2.0.20",
 ]
 

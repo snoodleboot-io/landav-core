@@ -50,6 +50,36 @@ jobs:
       - name: Docs
         run: cargo doc --workspace --no-deps
 
+  # The native engine and KoAT2 analyse the same programs by entirely different
+  # routes -- one reads the source structure, the other a flat transition system
+  # -- so where they disagree, one of them is wrong. That makes the external
+  # solver a free oracle for the engine, and the engine a free oracle for the
+  # lowering's cost model.
+  #
+  # It is a separate job because it needs a solver on PATH, and the shipped
+  # engine must never need one. `LANDAV_REQUIRE_SOLVERS=1` turns the tests'
+  # own "solver missing, skipping" path into a failure: without it a broken
+  # install would report green for a comparison that never ran.
+  differential:
+    name: native engine vs. KoAT2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install KoAT2
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/koat2" \
+            https://github.com/aprove-developers/KoAT2-Releases/releases/latest/download/koat2
+          chmod +x "$HOME/.local/bin/koat2"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cross-check the two engines
+        env:
+          LANDAV_REQUIRE_SOLVERS: "1"
+        run: cargo test -p landav-engine --test differential
+
   edition-boundary:
     name: no entitlement logic in core
     runs-on: ubuntu-latest

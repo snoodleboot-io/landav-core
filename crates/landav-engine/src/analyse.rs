@@ -33,9 +33,10 @@ pub fn cost(program: &SourceProgram) -> TripCount {
 
 /// The cost of a statement list, in sequence.
 fn body_cost(program: &SourceProgram, body: &[StmtId]) -> TripCount {
-    body.iter().fold(TripCount::Exact(Bound::zero()), |acc, id| {
-        acc.then(stmt_cost(program, *id))
-    })
+    body.iter()
+        .fold(TripCount::Exact(Bound::zero()), |acc, id| {
+            acc.then(stmt_cost(program, *id))
+        })
 }
 
 /// The cost of one statement.
@@ -113,17 +114,15 @@ fn count_of(program: &SourceProgram, range: RangeSpec) -> TripCount {
             // Ceiling division, done without floats.
             (span + stride - 1) / stride
         };
-        return u64::try_from(count).map_or(TripCount::Unknown, |n| {
-            TripCount::Exact(Bound::constant(n))
-        });
+        return u64::try_from(count)
+            .map_or(TripCount::Unknown, |n| TripCount::Exact(Bound::constant(n)));
     }
 
     // Symbolic stop, unit ascending step, and a start pinned to zero: the count
     // *is* the stop expression. This is `for i in range(n)`, which is the
     // overwhelming majority of counted loops in real Python.
     if step == 1 && matches!(start, Some(SourceExpr::Int { value: 0 })) {
-        return expr_bound::read(program, range.stop)
-            .map_or(TripCount::Unknown, TripCount::Exact);
+        return expr_bound::read(program, range.stop).map_or(TripCount::Unknown, TripCount::Exact);
     }
 
     // A symbolic start would need `stop - start`, and a stride above one would

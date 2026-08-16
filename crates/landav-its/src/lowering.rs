@@ -32,12 +32,11 @@ use landav_bound::{Origin, Symbol};
 use crate::{
     MAX_DNF_CLAUSES, arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId,
     constraint::Constraint, construct::Construct, cost::Cost, expr_id::ExprId, guard::Guard,
-    its::Its,
-    its_var::ItsVar, location::Location, location_id::LocationId, lowering_error::LoweringError,
-    polynomial::Polynomial, refusals::Refusals, relation::Relation, source_cond::SourceCond,
-    source_expr::SourceExpr, source_program::SourceProgram, source_stmt::SourceStmt,
-    stmt_id::StmtId, transition::Transition, unsupported::Unsupported, update::Update,
-    var_name::VarName,
+    its::Its, its_var::ItsVar, location::Location, location_id::LocationId,
+    lowering_error::LoweringError, polynomial::Polynomial, refusals::Refusals, relation::Relation,
+    source_cond::SourceCond, source_expr::SourceExpr, source_program::SourceProgram,
+    source_stmt::SourceStmt, stmt_id::StmtId, transition::Transition, unsupported::Unsupported,
+    update::Update, var_name::VarName,
 };
 
 /// A condition in disjunctive normal form: a disjunction of conjunctions.

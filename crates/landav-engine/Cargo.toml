@@ -20,3 +20,9 @@ thiserror = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The differential check runs the external solver over the same program and
+# compares. Only a dev-dependency: the shipped engine must never need a solver
+# on PATH, which is the whole point of it being native.
+landav-solvers = { workspace = true }

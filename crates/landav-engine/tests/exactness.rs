@@ -94,11 +94,8 @@ fn an_empty_counted_loop_still_costs_its_own_iteration() {
 /// because neither iteration space depends on the other's counter.
 #[test]
 fn rectangular_nesting_multiplies_and_stays_exact() {
-    let mut build = SourceProgramBuilder::new(
-        "f",
-        here(),
-        vec![VarName::new("n"), VarName::new("m")],
-    );
+    let mut build =
+        SourceProgramBuilder::new("f", here(), vec![VarName::new("n"), VarName::new("m")]);
     let one = NonZeroI64::new(1).expect("1 is non-zero");
 
     let inner_zero = build.int(0, here());
@@ -182,11 +179,8 @@ fn literal_ranges_are_counted_outright() {
 /// negative.
 #[test]
 fn a_symbolic_start_is_refused_rather_than_approximated() {
-    let mut build = SourceProgramBuilder::new(
-        "f",
-        here(),
-        vec![VarName::new("a"), VarName::new("b")],
-    );
+    let mut build =
+        SourceProgramBuilder::new("f", here(), vec![VarName::new("a"), VarName::new("b")]);
     let start = build.var(VarName::new("a"), here());
     let stop = build.var(VarName::new("b"), here());
     let range = RangeSpec::new(start, stop, NonZeroI64::new(1).expect("1 is non-zero"));
@@ -283,11 +277,8 @@ fn equal_branches_stay_exact() {
 /// refused rather than given one that would be wrong in one direction.
 #[test]
 fn a_subtracting_endpoint_has_no_bound() {
-    let mut build = SourceProgramBuilder::new(
-        "f",
-        here(),
-        vec![VarName::new("n"), VarName::new("m")],
-    );
+    let mut build =
+        SourceProgramBuilder::new("f", here(), vec![VarName::new("n"), VarName::new("m")]);
     let start = build.int(0, here());
     let n = build.var(VarName::new("n"), here());
     let m = build.var(VarName::new("m"), here());
