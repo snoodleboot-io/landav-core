@@ -147,9 +147,29 @@ fn parse_rule(line: &str) -> Result<ParsedRule, String> {
         Some((rule, guard)) => (rule.trim(), Some(guard.trim())),
         None => (line, None),
     };
-    let (lhs, rhs) = rule
-        .split_once("->")
-        .ok_or_else(|| format!("rule has no arrow: {line}"))?;
+    // Two arrow forms. `->` is KoAT's unit-cost rule; `-{c}>` carries an
+    // explicit cost, which the lowering emits for every transition it invented
+    // for its own convenience. Parsing only the bare form would let a
+    // mis-costed rule through as a parse error rather than as a wrong number,
+    // which reads like a format bug and is not one.
+    //
+    // The annotated form is tried first: `-{0}>` also contains no `->`, but a
+    // naive `->` search on some future syntax could match inside the braces.
+    let (lhs, rhs) = match rule.split_once("-{") {
+        Some((lhs, rest)) => {
+            let (cost, rhs) = rest
+                .split_once("}>")
+                .ok_or_else(|| format!("weighted arrow is not closed: {line}"))?;
+            // The cost must parse as an expression, or the emitter has written
+            // something the solver cannot read.
+            parse_expr(cost.trim())
+                .map_err(|why| format!("rule cost does not parse: {cost:?}: {why}"))?;
+            (lhs, rhs)
+        }
+        None => rule
+            .split_once("->")
+            .ok_or_else(|| format!("rule has no arrow: {line}"))?,
+    };
 
     let (source, argument_text) = split_call(lhs.trim())?;
     let (target, image_text) = split_call(rhs.trim())?;

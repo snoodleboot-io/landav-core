@@ -559,8 +559,13 @@ fn a_transition_renders_as_a_readable_step() {
             !rendered.is_empty(),
             "a transition rendered as nothing at all"
         );
+        // Two arrow spellings, both meaning "and then": a bare `->` when the
+        // step costs one, and `-{c}>` when it costs anything else. The
+        // annotated form is not decoration - a transition the lowering
+        // invented costs nothing, and hiding that would make the rendering
+        // disagree with what is emitted to the solver.
         assert!(
-            rendered.contains("->"),
+            rendered.contains("->") || rendered.contains("}>"),
             "a transition must render both of its endpoints: {rendered:?}"
         );
         assert!(
