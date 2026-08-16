@@ -449,6 +449,7 @@ dependencies = [
  "clap",
  "landav-bound",
  "landav-calibrate",
+ "landav-its",
  "landav-python",
  "landav-solvers",
  "serde_json",

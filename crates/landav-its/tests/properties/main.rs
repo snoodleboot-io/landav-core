@@ -17,6 +17,14 @@
 //! | 3. 20 hand-written functions lower and are accepted | `corpus`, `koat_format` |
 //! | 4. unsupported constructs diagnose, never silently truncate | `refusal` |
 //!
+//! `LAN-68` continues from there — the report, the accumulation across units
+//! and the coverage number:
+//!
+//! | `LAN-68` AC | file |
+//! |---|---|
+//! | 1. every unsupported construct maps to a named diagnostic | `refusal`, `coverage` |
+//! | 2. a coverage report lists which constructs were skipped and why | `coverage` |
+//!
 //! and the non-negotiable that outranks all four:
 //!
 //! | Non-negotiable | file |
@@ -54,6 +62,7 @@ mod support;
 
 mod algebra;
 mod corpus;
+mod coverage;
 mod fragment;
 mod koat_format;
 mod refusal;

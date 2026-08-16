@@ -75,6 +75,41 @@ struct CheckArgs {
         long_help = crate::resource::detail(),
     )]
     resource: Option<ResourceKind>,
+
+    /// Report which constructs were out of scope, where, and what that leaves
+    /// unanalysed. LAN-68.
+    ///
+    /// # Why a flag changes the exit code
+    ///
+    /// Passing it turns a run that could not lower everything into
+    /// [`Outcome::Inconclusive`], which `--resource` already does for the same
+    /// reason: a question was asked and the honest answer is "not fully".
+    ///
+    /// The escalation is *not* unconditional today, and that is a decision
+    /// rather than an oversight. At this milestone no bound is derived from the
+    /// lowering, so the default verdict — the `LAV0xx` rules — does not rest on
+    /// it, and failing every real Python file on the reach of an M0 fragment
+    /// produces a gate that gets switched off, which is the argument
+    /// `crate::check::classify` already makes about an empty `__init__.py`.
+    /// What is unconditional is the *reporting*: the ratio is on every run's
+    /// summary line whether or not this flag is passed.
+    ///
+    /// When bound inference lands and the verdict does rest on the lowering,
+    /// the change is to make this the default, not to revisit which outcome a
+    /// refusal earns.
+    #[arg(
+        long,
+        long_help = "Report which constructs were out of scope, where, and what that \
+                     leaves unanalysed.\n\n\
+                     Lists every refused construct with a position, the count for each, \
+                     and the constructs in the vocabulary that were never met. A run \
+                     that could not lower everything it was given reports as \
+                     inconclusive rather than clean: a function that did not lower \
+                     produces no transition system, so no bound covers it.\n\n\
+                     The coverage ratio itself is on every run's summary line, with or \
+                     without this flag."
+    )]
+    coverage: bool,
 }
 
 /// Parse `argv` and run, returning the outcome to be mapped to an exit code.
@@ -84,9 +119,12 @@ struct CheckArgs {
 pub fn dispatch() -> Outcome {
     match Cli::try_parse() {
         Ok(cli) => match cli.command {
-            Command::Check(args) => {
-                crate::check::run(&args.path, args.config.as_deref(), args.resource)
-            }
+            Command::Check(args) => crate::check::run(
+                &args.path,
+                args.config.as_deref(),
+                args.resource,
+                args.coverage,
+            ),
         },
         Err(error) => usage(&error),
     }

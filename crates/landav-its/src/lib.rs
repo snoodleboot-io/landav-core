@@ -124,17 +124,27 @@
 //! would lower cleanly and the bound would silently omit whatever the node
 //! stood for.
 //!
-//! # The `LAN-68` seam
+//! # The coverage report
 //!
-//! This story stops at the diagnostic *vocabulary* and its collection.
-//! [`Construct`] is the named set, [`Unsupported`] is one record with a
-//! position, [`Refusals`] is the non-empty ordered ledger, and
-//! [`Construct::all`] enumerates the vocabulary so a report can list the
-//! constructs that were **not** hit as well as the ones that were.
-//! [`Refusals::constructs`] and [`Refusals::count_of`] are the aggregation
-//! `LAN-68` criterion 2 needs. What is deliberately absent is the report
-//! itself — its format, its accumulation across many functions, and the
-//! coverage percentage.
+//! `LAN-67` built the diagnostic *vocabulary* and its collection: [`Construct`]
+//! is the named set, [`Unsupported`] is one record with a position, [`Refusals`]
+//! is the non-empty ordered ledger, and [`Construct::all`] enumerates the
+//! vocabulary so a report can list the constructs that were **not** hit as well
+//! as the ones that were.
+//!
+//! `LAN-68` is [`Coverage`], which turns that into a report over a whole run.
+//! It accumulates across units and across files, ranks the constructs by how
+//! often each one blocked the lowering, keeps a malformed program apart from a
+//! language construct, and carries a percentage that **cannot reach 100 unless
+//! every unit lowered**.
+//!
+//! Refusing one unit loudly is not enough on its own. The failure mode one
+//! level up is that four functions out of five refused, the report named the
+//! fifth, and the reader concluded the file was analysed — so every accessor on
+//! [`Coverage`] exists to keep the denominator in view. The ratio is over
+//! *units*, not statements: refusal is all-or-nothing per unit, and "90% of the
+//! statements lowered" would describe a function that produced no transitions
+//! at all as nearly analysed.
 //!
 //! [`Refusals::blames`] and [`LoweringError::blames`] are the other half of
 //! the seam, pointing at `F-015`: they turn this crate's vocabulary into
@@ -154,6 +164,7 @@ pub mod compare_op;
 pub mod cond_id;
 pub mod constraint;
 pub mod construct;
+pub mod coverage;
 pub mod expr_id;
 pub mod guard;
 pub mod its;
@@ -181,13 +192,13 @@ pub mod var_name;
 
 pub use crate::{
     arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId, constraint::Constraint,
-    construct::Construct, expr_id::ExprId, guard::Guard, its::Its, its_var::ItsVar,
-    location::Location, location_id::LocationId, lowering::lower, lowering_error::LoweringError,
-    monomial::Monomial, polynomial::Polynomial, range_spec::RangeSpec, refusals::Refusals,
-    relation::Relation, source_cond::SourceCond, source_expr::SourceExpr,
-    source_program::SourceProgram, source_program_builder::SourceProgramBuilder,
-    source_stmt::SourceStmt, stmt_id::StmtId, transition::Transition, unsupported::Unsupported,
-    update::Update, var_name::VarName,
+    construct::Construct, coverage::Coverage, expr_id::ExprId, guard::Guard, its::Its,
+    its_var::ItsVar, location::Location, location_id::LocationId, lowering::lower,
+    lowering_error::LoweringError, monomial::Monomial, polynomial::Polynomial,
+    range_spec::RangeSpec, refusals::Refusals, relation::Relation, source_cond::SourceCond,
+    source_expr::SourceExpr, source_program::SourceProgram,
+    source_program_builder::SourceProgramBuilder, source_stmt::SourceStmt, stmt_id::StmtId,
+    transition::Transition, unsupported::Unsupported, update::Update, var_name::VarName,
 };
 
 /// The highest total degree a [`Polynomial`] may reach.

@@ -15,6 +15,10 @@ path = "src/main.rs"
 [dependencies]
 landav-bound = { workspace = true }
 landav-calibrate = { workspace = true }
+# The lowering, for `--coverage`. Language-neutral: `landav-its` owns the
+# refusal vocabulary and the coverage report, `landav-python` owns the
+# translation into it, and this crate learns no Python fact from either.
+landav-its = { workspace = true }
 landav-python = { workspace = true }
 landav-solvers = { workspace = true }
 clap = { workspace = true }

@@ -44,6 +44,32 @@
 //! completed; what it has to report is a fact about the file, and the person
 //! who can act on it is the person who owns the file.
 //!
+//! # A partly-lowered file must not read as a fully-analysed one
+//!
+//! `LAN-68`. A Python construct the lowering will not take produces **no
+//! transition**, and an integer transition system missing a transition admits
+//! fewer executions than the program has — so a bound derived from it can be
+//! exceeded. The analysis is unsound *by omission*, and on a terminal it looks
+//! exactly like a clean result. [`landav_its::lower`] closes that hole for one
+//! function by refusing outright rather than emitting a partial system;
+//! [`landav_its::Coverage`] closes it for a run.
+//!
+//! Two decisions, made here:
+//!
+//! * **The ratio is on every run's summary line**, complete or partial, with or
+//!   without `--coverage`. Without it the summary says "3 files analysed" and
+//!   stops, which invites exactly the wrong reading. This is the argument
+//!   `LAN-66` makes for the suppression counts, applied to a number that has
+//!   more riding on it.
+//! * **`--coverage` escalates a partial run to [`Outcome::Inconclusive`]**, and
+//!   the default run's exit code is unchanged. At M0 no bound is derived from
+//!   the lowering, so the default verdict — the `LAV0xx` rules — does not rest
+//!   on it, and failing every real Python file on the reach of an M0 fragment
+//!   produces a gate that gets switched off. Asking about the lowering and
+//!   getting a partial answer is a different matter, and it lands where
+//!   `--resource` already lands. See [`classify`] for where a refusal sits in
+//!   the ordering and why it is never [`Outcome::Clean`].
+//!
 //! # A waived finding is not a finding, and the waiver is
 //!
 //! `LAN-66` lets an author waive a rule they have judged acceptable, inline or
@@ -69,6 +95,7 @@ use std::io::Write as _;
 use std::path::Path;
 
 use landav_bound::ResourceKind;
+use landav_its::Coverage;
 use landav_python::{ModuleAnalysis, PythonError, Suppression, SuppressionStatus};
 
 use crate::config::{self, Config};
@@ -81,8 +108,9 @@ pub fn run(
     target: &Path,
     explicit_config: Option<&Path>,
     resource: Option<ResourceKind>,
+    coverage: bool,
 ) -> Outcome {
-    match analyse(target, explicit_config, resource) {
+    match analyse(target, explicit_config, resource, coverage) {
         Ok(outcome) => outcome,
         Err(error) => {
             report_failure(&error);
@@ -96,6 +124,7 @@ fn analyse(
     target: &Path,
     explicit_config: Option<&Path>,
     resource: Option<ResourceKind>,
+    detail: bool,
 ) -> Result<Outcome, ToolError> {
     let config = config::load(target, explicit_config)?;
     let (kind, mut walk) = crate::sources::collect(target)?;
@@ -104,6 +133,7 @@ fn analyse(
     let mut inconclusive = 0usize;
     let mut statements = 0usize;
     let mut waived = Tally::default();
+    let mut coverage = Coverage::new();
     let mut report = Report::new(std::io::stdout().lock());
 
     for path in &walk.sources {
@@ -123,6 +153,13 @@ fn analyse(
                 findings += module.findings().len();
                 publish(&mut report, &module);
                 waived.absorb(&mut report, &module);
+                // Only for a file that parsed. A file the frontend could not
+                // read offered no function to lower, and counting it as a
+                // refused construct would file a parser limitation under a
+                // language construct nobody wrote.
+                if let Err(problem) = accumulate(path, &text, &mut coverage) {
+                    walk.problems.push(problem);
+                }
             }
             Err(PythonError::Parse {
                 line,
@@ -164,6 +201,14 @@ fn analyse(
         report.line(format_args!("{}", crate::resource::unaccounted(kind)));
     }
 
+    // The full report, only when it was asked for. Printed before the summary,
+    // like the findings, so that the summary stays the last line of the run.
+    if detail {
+        for line in coverage.report().lines() {
+            report.line(format_args!("{line}"));
+        }
+    }
+
     summarise(
         &mut report,
         target,
@@ -173,7 +218,14 @@ fn analyse(
         &waived,
         inconclusive,
         resource,
+        &coverage,
     );
+    // Printed *after* the summary rather than before it, so that the summary
+    // remains the first `landav:` line of the run — a contract the suppression
+    // suite reads the run's counts off.
+    if !coverage.is_complete() {
+        report.line(format_args!("{}", partial_analysis(&coverage, detail)));
+    }
     // A report that never reached the operator is not a report, so a stream
     // that could not be written is a reason the run did not complete — and
     // therefore a `2` with blame, not a silent verdict about findings nobody
@@ -190,6 +242,7 @@ fn analyse(
             findings,
             inconclusive,
             unaccounted,
+            detail && !coverage.is_complete(),
         )
     } else {
         Outcome::Failed
@@ -463,6 +516,34 @@ const fn resource_unaccounted(resource: Option<ResourceKind>, statements: usize)
 /// Above clean because exit `0` claims analysis ran and every bound held. There
 /// is no bound and it did not hold; saying so is the difference between a
 /// verdict and a fabrication.
+///
+/// # Where a refused construct sits, and why it is `Inconclusive`
+///
+/// `refused` is LAN-68: the caller asked how much of the target became an
+/// integer transition system, and the answer was "not all of it".
+///
+/// It is **never** [`Outcome::Clean`], and that is the whole story. A construct
+/// the lowering will not take produces no transition; a system missing a
+/// transition admits fewer executions than the program has, so a bound derived
+/// from it can be exceeded. Exit `0` claims analysis ran and every bound held,
+/// and here part of the program was never turned into anything a bound could be
+/// derived from. A clean code for that is unsound by omission and looks exactly
+/// like a real clean result, which is the failure this story exists to prevent.
+///
+/// It is [`Outcome::Inconclusive`] rather than [`Outcome::Failed`] for the
+/// reason `crate::outcome` gives: the tool ran to completion and produced a
+/// result *about the code*, naming the construct and the position, so the
+/// person who can act on it is the author of the code and not whoever runs CI.
+/// Filing a `sorted()` call the analyser declined to model alongside an
+/// unreadable input would page the wrong team, and would teach them that code
+/// `2` is noise.
+///
+/// It ranks beside `unaccounted` and below everything the run established about
+/// the code, on the same argument: a finding and an unreadable file are results,
+/// and the reach of this milestone's fragment is a limitation. It does not
+/// compete with the emptiness check either way — a refusal needs a function,
+/// and a function is at least one statement, so `refused` implies
+/// `statements > 0`.
 const fn classify(
     target: Target,
     files: usize,
@@ -470,6 +551,7 @@ const fn classify(
     findings: usize,
     inconclusive: usize,
     unaccounted: bool,
+    refused: bool,
 ) -> Outcome {
     if findings > 0 {
         return Outcome::Findings;
@@ -483,10 +565,92 @@ const fn classify(
             Target::File => Outcome::Clean,
         };
     }
-    if unaccounted {
+    if refused || unaccounted {
         return Outcome::Inconclusive;
     }
     Outcome::Clean
+}
+
+/// Translate every function in one file and record whether each one lowered.
+///
+/// Two steps, two owners, and they are kept apart deliberately.
+/// [`landav_python::lower_module`] answers "what does this Python function look
+/// like in the numeric fragment" and fails only if the *file* cannot be read;
+/// [`landav_its::lower`] answers "can that be turned into a transition system"
+/// and fails whenever the function uses something outside the fragment. Fusing
+/// them would make "this file has a syntax error" and "this function calls
+/// `sorted`" the same kind of failure, and they need different responses — the
+/// first is a tool error, the second is a result about the code.
+///
+/// A function is offered for **every** top-level `def`, including the ones that
+/// obviously will not lower. Skipping them would make the denominator flatter
+/// as the fragment got narrower, which is exactly backwards.
+///
+/// # The file is parsed twice
+///
+/// Once by [`landav_python::analyze_module_with`] for the rules and once here
+/// for the lowering. Acceptable at M0 and worth removing when the two entry
+/// points can share a parse; it is recorded here rather than left to be
+/// rediscovered by whoever profiles a large tree.
+///
+/// # Errors
+///
+/// A [`ToolError`] naming the path if the frontend could not translate it at
+/// all. The caller has already parsed the file successfully, so this is a
+/// disagreement between two entry points rather than a property of the source —
+/// it is blamed rather than swallowed, because a coverage denominator that
+/// silently lost a file is the omission this story is about.
+fn accumulate(path: &Path, text: &str, coverage: &mut Coverage) -> Result<(), ToolError> {
+    let functions = landav_python::lower_module(path, text).map_err(|error| {
+        ToolError::at_path(
+            path,
+            format!(
+                "parsed for the rules but not for the lowering ({error}), so this file \
+                 is missing from the coverage report and the report's denominator \
+                 would understate what was skipped"
+            ),
+        )
+    })?;
+    for function in &functions {
+        coverage.record(landav_its::lower(function.program()).as_ref());
+    }
+    Ok(())
+}
+
+/// The line a run prints when part of what it looked at did not lower.
+///
+/// Printed on **every** run that refused something, with or without
+/// `--coverage`, because this is the sentence that stops a partly-analysed file
+/// reading as a whole one. The detail — every construct, every position, and
+/// the constructs that were never met — is behind the flag; the fact is not.
+fn partial_analysis(coverage: &Coverage, detail: bool) -> String {
+    let mut line = format!(
+        "landav: coverage: {} of {} function(s) became an integer transition system",
+        coverage.lowered(),
+        coverage.units()
+    );
+    if let Some((construct, count)) = coverage.dominant() {
+        line.push_str(&format!(
+            "; {} construct(s) out of scope, most often {} ({}) ×{count}",
+            coverage.refusals(),
+            construct.tag(),
+            construct.describe()
+        ));
+    }
+    if coverage.malformed() > 0 {
+        line.push_str(&format!(
+            "; {} function(s) the frontend built wrongly",
+            coverage.malformed()
+        ));
+    }
+    line.push_str(
+        "; a function that did not lower produces no transition system, so nothing is \
+         derived from it and no bound reported here covers it",
+    );
+    if !detail {
+        line.push_str(" — run again with --coverage for the construct list and positions");
+    }
+    line
 }
 
 /// The diagnostic for a target that yielded nothing.
@@ -512,6 +676,13 @@ fn nothing_to_analyse(target: &Path, files: usize) -> ToolError {
 /// the number can only notice it going up if the number is always there.
 /// `LAN-66` criterion 3 is this line — a waiver that never appears in a
 /// summary is a waiver nobody will ever revisit.
+///
+/// The coverage ratio is here on the same argument and for a sharper reason.
+/// Without it the summary says "3 files analysed" and stops, which invites the
+/// reading `LAN-68` exists to prevent: that the three files were analysed
+/// *whole*. The clause is on every run — complete, partial and with no function
+/// to lower at all — so that a number a CI job watches is always there to be
+/// watched, and so that the day it drops there is a baseline to notice against.
 /// The selected resource is named here on **every** run that named one,
 /// including the runs that found nothing to analyse and so print no
 /// unaccounted-for line. A summary that does not say which resource was asked
@@ -533,16 +704,18 @@ fn summarise<W: std::io::Write>(
     waived: &Tally,
     inconclusive: usize,
     resource: Option<ResourceKind>,
+    coverage: &Coverage,
 ) {
     report.line(format_args!(
         "landav: {} analysed under {} — {} finding(s), {} suppressed, {}, {} inconclusive; \
-         resource: {}; configuration: {}",
+         {}; resource: {}; configuration: {}",
         plural(sources.len(), "file"),
         target.display(),
         findings,
         waived.suppressed,
         plural(waived.stale, "stale waiver"),
         inconclusive,
+        coverage.summary(),
         describe_resource(resource),
         config.source()
     ));
@@ -600,10 +773,13 @@ fn report_failure(error: &ToolError) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Report, classify, describe_resource, plural, resource_unaccounted};
+    use super::{
+        Report, classify, describe_resource, partial_analysis, plural, resource_unaccounted,
+    };
     use crate::outcome::Outcome;
     use crate::sources::Target;
     use landav_bound::ResourceKind;
+    use landav_its::Coverage;
 
     /// A writer that fails the way a closed pipe does.
     struct BrokenPipe;
@@ -648,20 +824,23 @@ mod tests {
     #[test]
     fn an_unparsable_file_is_inconclusive_rather_than_nothing_analysed() {
         assert_eq!(
-            classify(Target::File, 1, 0, 0, 1, false),
+            classify(Target::File, 1, 0, 0, 1, false, false),
             Outcome::Inconclusive
         );
         assert_eq!(
-            classify(Target::Directory, 1, 0, 0, 1, false),
+            classify(Target::Directory, 1, 0, 0, 1, false, false),
             Outcome::Inconclusive
         );
-        assert_ne!(classify(Target::File, 1, 0, 0, 1, false), Outcome::Clean);
+        assert_ne!(
+            classify(Target::File, 1, 0, 0, 1, false, false),
+            Outcome::Clean
+        );
     }
 
     #[test]
     fn a_directory_with_no_files_is_never_clean() {
         assert_eq!(
-            classify(Target::Directory, 0, 0, 0, 0, false),
+            classify(Target::Directory, 0, 0, 0, 0, false, false),
             Outcome::NothingAnalysed
         );
     }
@@ -669,7 +848,7 @@ mod tests {
     #[test]
     fn a_directory_of_files_with_no_statements_is_never_clean() {
         assert_eq!(
-            classify(Target::Directory, 3, 0, 0, 0, false),
+            classify(Target::Directory, 3, 0, 0, 0, false, false),
             Outcome::NothingAnalysed
         );
     }
@@ -678,30 +857,36 @@ mod tests {
     /// matching, so an empty `__init__.py` is not "the tool could not look".
     #[test]
     fn a_named_file_with_no_statements_is_not_a_tool_error() {
-        assert_eq!(classify(Target::File, 1, 0, 0, 0, false), Outcome::Clean);
+        assert_eq!(
+            classify(Target::File, 1, 0, 0, 0, false, false),
+            Outcome::Clean
+        );
     }
 
     #[test]
     fn an_inconclusive_unit_is_not_absorbed_by_clean_neighbours() {
         assert_eq!(
-            classify(Target::Directory, 2, 40, 0, 1, false),
+            classify(Target::Directory, 2, 40, 0, 1, false, false),
             Outcome::Inconclusive
         );
         assert_ne!(
-            classify(Target::Directory, 2, 40, 0, 1, false),
+            classify(Target::Directory, 2, 40, 0, 1, false, false),
             Outcome::Clean
         );
     }
 
     #[test]
     fn a_proven_run_is_clean() {
-        assert_eq!(classify(Target::File, 1, 6, 0, 0, false), Outcome::Clean);
+        assert_eq!(
+            classify(Target::File, 1, 6, 0, 0, false, false),
+            Outcome::Clean
+        );
     }
 
     #[test]
     fn findings_outrank_inconclusive_in_what_is_reported() {
         assert_eq!(
-            classify(Target::Directory, 2, 40, 1, 1, false),
+            classify(Target::Directory, 2, 40, 1, 1, false, false),
             Outcome::Findings
         );
     }
@@ -712,16 +897,19 @@ mod tests {
     #[test]
     fn a_resource_nothing_could_bound_is_never_clean() {
         assert_eq!(
-            classify(Target::File, 1, 6, 0, 0, true),
+            classify(Target::File, 1, 6, 0, 0, true, false),
             Outcome::Inconclusive
         );
         assert_eq!(
-            classify(Target::Directory, 2, 40, 0, 0, true),
+            classify(Target::Directory, 2, 40, 0, 0, true, false),
             Outcome::Inconclusive
         );
         // The control: the same run without a resource selected is clean, so
         // the outcome is a consequence of the question asked.
-        assert_eq!(classify(Target::File, 1, 6, 0, 0, false), Outcome::Clean);
+        assert_eq!(
+            classify(Target::File, 1, 6, 0, 0, false, false),
+            Outcome::Clean
+        );
     }
 
     /// "This target holds no code" outranks "no bound was derived for the
@@ -732,11 +920,11 @@ mod tests {
     #[test]
     fn nothing_analysed_outranks_an_unbounded_resource() {
         assert_eq!(
-            classify(Target::Directory, 0, 0, 0, 0, true),
+            classify(Target::Directory, 0, 0, 0, 0, true, false),
             Outcome::NothingAnalysed
         );
         assert_eq!(
-            classify(Target::Directory, 3, 0, 0, 0, true),
+            classify(Target::Directory, 3, 0, 0, 0, true, false),
             Outcome::NothingAnalysed
         );
     }
@@ -747,11 +935,11 @@ mod tests {
     #[test]
     fn established_results_outrank_an_unbounded_resource() {
         assert_eq!(
-            classify(Target::Directory, 2, 40, 1, 0, true),
+            classify(Target::Directory, 2, 40, 1, 0, true, false),
             Outcome::Findings
         );
         assert_eq!(
-            classify(Target::Directory, 2, 40, 0, 1, true),
+            classify(Target::Directory, 2, 40, 0, 1, true, false),
             Outcome::Inconclusive
         );
     }
@@ -792,5 +980,142 @@ mod tests {
         assert_eq!(plural(1, "file"), "1 file");
         assert_eq!(plural(0, "file"), "0 files");
         assert_eq!(plural(2, "file"), "2 files");
+    }
+
+    // -----------------------------------------------------------------------
+    // LAN-68
+    // -----------------------------------------------------------------------
+
+    /// A refused construct is never clean, whichever way the target was named.
+    ///
+    /// The central assertion of `LAN-68` at the level the ordering is decided.
+    /// Exit `0` claims analysis ran and every bound held; part of the program
+    /// was never turned into anything a bound could be derived from.
+    #[test]
+    fn a_refused_construct_is_never_clean() {
+        assert_eq!(
+            classify(Target::File, 1, 6, 0, 0, false, true),
+            Outcome::Inconclusive
+        );
+        assert_eq!(
+            classify(Target::Directory, 2, 40, 0, 0, false, true),
+            Outcome::Inconclusive
+        );
+        // The control: the same run with nothing refused is clean, so the
+        // outcome is a consequence of the refusal and not of the shape.
+        assert_eq!(
+            classify(Target::File, 1, 6, 0, 0, false, false),
+            Outcome::Clean
+        );
+    }
+
+    /// Everything the run established about the code still outranks it.
+    ///
+    /// A finding and an unreadable file are results; the reach of this
+    /// milestone's fragment is a limitation, and a limitation must not mask a
+    /// result somebody can act on today.
+    #[test]
+    fn established_results_outrank_a_refused_construct() {
+        assert_eq!(
+            classify(Target::Directory, 2, 40, 1, 0, false, true),
+            Outcome::Findings
+        );
+        assert_eq!(
+            classify(Target::Directory, 2, 40, 0, 1, false, true),
+            Outcome::Inconclusive
+        );
+    }
+
+    /// A refusal and an unbounded resource are the same tier, and neither can
+    /// be silently absorbed by the other.
+    #[test]
+    fn a_refusal_and_an_unbounded_resource_share_a_tier() {
+        assert_eq!(
+            classify(Target::File, 1, 6, 0, 0, true, true),
+            Outcome::Inconclusive
+        );
+        assert_eq!(
+            classify(Target::File, 1, 6, 0, 0, true, false),
+            Outcome::Inconclusive
+        );
+        assert_eq!(
+            classify(Target::File, 1, 6, 0, 0, false, true),
+            Outcome::Inconclusive
+        );
+    }
+
+    /// The line a reader sees names the ratio, the construct and the
+    /// consequence, and points at the detail only when the detail was not
+    /// already printed.
+    #[test]
+    fn the_partial_analysis_line_says_what_it_means() {
+        let coverage = Coverage::new();
+        let line = partial_analysis(&coverage, false);
+        assert!(
+            line.contains("0 of 0"),
+            "the line must carry the ratio: {line}"
+        );
+        assert!(
+            line.contains("no transition system"),
+            "the line must say what a refusal costs: {line}"
+        );
+        assert!(
+            line.contains("--coverage"),
+            "a default run must say where the detail is: {line}"
+        );
+        assert!(
+            !partial_analysis(&coverage, true).contains("--coverage"),
+            "a run that already printed the detail must not advertise it again"
+        );
+    }
+
+    /// A frontend defect is named on the line, and only when there is one.
+    ///
+    /// Closes a mutant `cargo mutants` left alive: nothing exercised the
+    /// malformed clause, so a build that always printed it — or never did —
+    /// passed. Both directions matter. Always printing it puts "1 function(s)
+    /// the frontend built wrongly" on runs where the frontend is fine, which
+    /// trains a reader to skip the clause; never printing it hides the one
+    /// failure in this report that is landav's own bug rather than a property
+    /// of the analysed code.
+    #[test]
+    fn the_partial_analysis_line_names_a_frontend_defect_only_when_there_is_one() {
+        use landav_its::{Construct, SourceProgramBuilder};
+
+        let origin = |line: u32| landav_bound::Origin::new(format!("unit.py:{line}:1"));
+
+        // A refusal: a language construct outside the fragment.
+        let mut builder = SourceProgramBuilder::new("refuser", origin(1), vec![]);
+        let offending = builder.unsupported_stmt(Construct::Call, origin(4));
+        let refused = builder.build(vec![offending]);
+        let refused = landav_its::lower(&refused);
+        assert!(refused.is_err(), "a call is outside the fragment");
+        let Err(refusal) = refused else { return };
+
+        // A frontend defect: a body naming a statement from another program.
+        let mut donor = SourceProgramBuilder::new("donor", origin(1), vec![]);
+        let stranger = donor.return_stmt(origin(9));
+        let _ = donor.build(vec![stranger]);
+        let broken =
+            SourceProgramBuilder::new("built_wrong", origin(1), vec![]).build(vec![stranger]);
+        let broken = landav_its::lower(&broken);
+        assert!(broken.is_err(), "the handle names no node in this program");
+        let Err(defect) = broken else { return };
+
+        let mut refusals_only = Coverage::new();
+        refusals_only.record(Err(&refusal));
+        assert!(
+            !partial_analysis(&refusals_only, false).contains("frontend"),
+            "a refused construct was reported as a frontend defect: {}",
+            partial_analysis(&refusals_only, false)
+        );
+
+        let mut with_defect = Coverage::new();
+        with_defect.record(Err(&defect));
+        assert!(
+            partial_analysis(&with_defect, false).contains("frontend"),
+            "a malformed program was not reported at all: {}",
+            partial_analysis(&with_defect, false)
+        );
     }
 }
