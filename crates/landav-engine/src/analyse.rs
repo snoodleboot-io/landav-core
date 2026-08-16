@@ -5,13 +5,27 @@ use landav_its::{RangeSpec, SourceExpr, SourceProgram, SourceStmt, StmtId};
 
 use crate::{expr_bound, trip_count::TripCount};
 
-/// What the program costs, in steps.
+/// What the program costs, in **source steps**: one per statement executed,
+/// plus one per loop iteration for the loop's own test and increment.
 ///
-/// The unit matches the ITS lowering's cost model - one step per transition -
-/// so a result here is directly comparable with what the external solver
-/// reports for the same function. That comparability is the point: two
-/// independent engines agreeing is evidence, and disagreeing is a bug in one of
-/// them.
+/// # This is not the same unit the solver reports
+///
+/// Measured rather than assumed. For `for i in range(n): for j in range(m): x = 0`
+/// this engine gives `n * (1 + 2m)`, and KoAT2 over the lowered system gives
+/// `3mn + 3m + 4n + 2`. The gap is not precision - it is that the lowering
+/// emits several transitions per source construct (a guard test, a body, a
+/// counter increment) and the solver counts all of them.
+///
+/// Neither number is wrong; they answer different questions. This one is the
+/// more stable of the two, because the ITS transition count is an artifact of
+/// lowering choices that could change without the program changing.
+///
+/// **The consequence is that the two cannot currently be compared**, so the
+/// "report tightness when upper and lower meet" plan does not work as written.
+/// Reconciling them is what `Cost` on a transition is for: charging the
+/// bookkeeping transitions nothing and the source-bearing ones one step would
+/// put both engines in this unit. That is tracked separately and is not done
+/// here.
 #[must_use]
 pub fn cost(program: &SourceProgram) -> TripCount {
     body_cost(program, program.body())
