@@ -66,14 +66,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # rust-toolchain.toml pins the version; this action honours it.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The release publishes a zstd-compressed static binary, not a bare one.
+      # `koat2_static.zst` rather than `koat2`: the latter 404s, which is how
+      # this job failed the first time it ran.
       - name: Install KoAT2
         run: |
           set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq zstd
           mkdir -p "$HOME/.local/bin"
-          curl -fsSL -o "$HOME/.local/bin/koat2" \
-            https://github.com/aprove-developers/KoAT2-Releases/releases/latest/download/koat2
+          curl -fsSL -o /tmp/koat2.zst \
+            https://github.com/aprove-developers/KoAT2-Releases/releases/latest/download/koat2_static.zst
+          zstd -d -f /tmp/koat2.zst -o "$HOME/.local/bin/koat2"
           chmod +x "$HOME/.local/bin/koat2"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Fail the job here rather than let a broken install turn into a skipped
+      # comparison further down. The test's own skip path is loud, but a job
+      # whose whole purpose is the cross-check should not reach it at all.
+      - name: Confirm the solver is usable
+        run: koat2 --help > /dev/null
 
       - name: Cross-check the two engines
         env:
