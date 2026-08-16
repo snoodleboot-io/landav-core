@@ -58,6 +58,15 @@ def unbounded(n: int) -> int:
     while i < n:
         i = i + 1
     return i
+
+
+def mixed(n: int) -> int:
+    x = 0
+    for i in range(n):
+        x = i
+    while n > 0:
+        n = n - 1
+    return x
 ";
 
 /// The flag is opt-in, so a run without it must look exactly as it did before.
@@ -134,23 +143,32 @@ fn triangular_nesting_reports_a_quadratic_equality() -> io::Result<()> {
 }
 
 /// The silence problem. A `while` loop has no mechanism in this engine, and the
-/// function must be **named** as unbounded rather than left out.
+/// function must be **named** rather than left out - an omitted function reads
+/// as a bound of zero, the most attractive possible answer.
+///
+/// Since `LAN-81` the region is named too, rather than the whole function being
+/// written off, so the assertion is on the region rather than on the words "no
+/// bound".
 #[test]
-fn a_function_with_no_derivable_bound_is_named_rather_than_omitted() -> io::Result<()> {
+fn a_function_with_no_derivable_bound_names_the_region_responsible() -> io::Result<()> {
     let project = Project::new()?;
     let target = project.write("shapes.py", SHAPES_PY)?;
 
     let run = project.check(&target, &["--bounds"])?;
     assert!(
         run.mentions("unbounded:"),
-        "a function the engine could not bound must still appear, or its \
-         absence reads as a bound of zero: {}",
+        "a function the engine could not bound must still appear: {}",
         run.describe()
     );
+    let line = run
+        .output()
+        .lines()
+        .find(|line| line.contains("unbounded:"))
+        .map(str::to_owned)
+        .unwrap_or_default();
     assert!(
-        run.mentions("no bound"),
-        "the absence of a bound must be stated: {}",
-        run.describe()
+        line.contains("while at"),
+        "the unanalysed region must be named and placed: {line:?}"
     );
     Ok(())
 }
@@ -204,6 +222,116 @@ fn asking_for_bounds_does_not_change_the_verdict() -> io::Result<()> {
         EXIT_CLEAN,
         "reporting a bound is not a finding: {}",
         run.describe()
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// LAN-81: a hole is not a lost bound
+// ---------------------------------------------------------------------------
+
+/// The regression. A function mixing a counted loop with a `while` used to
+/// report nothing at all - the counted half was derived and then discarded
+/// because `Unknown` propagated through the sum.
+#[test]
+fn a_while_no_longer_erases_the_bound_around_it() -> io::Result<()> {
+    let project = Project::new()?;
+    let target = project.write("shapes.py", SHAPES_PY)?;
+
+    let run = project.check(&target, &["--bounds"])?;
+    let line = run
+        .output()
+        .lines()
+        .find(|line| line.contains("mixed:"))
+        .map(str::to_owned)
+        .unwrap_or_default();
+
+    assert!(
+        !line.contains("no bound"),
+        "the counted half is derivable and must be reported: {line:?}"
+    );
+    assert!(
+        line.contains("2 * n"),
+        "the counted loop's cost must survive the `while` beside it: {line:?}"
+    );
+    Ok(())
+}
+
+/// The blame. Naming the construct and the line is what a user can act on;
+/// "no bound" is not.
+#[test]
+fn an_unanalysed_region_is_named_and_placed() -> io::Result<()> {
+    let project = Project::new()?;
+    let target = project.write("shapes.py", SHAPES_PY)?;
+
+    let run = project.check(&target, &["--bounds"])?;
+    let line = run
+        .output()
+        .lines()
+        .find(|line| line.contains("mixed:"))
+        .map(str::to_owned)
+        .unwrap_or_default();
+
+    assert!(
+        line.contains("while at"),
+        "the hole must name the construct responsible: {line:?}"
+    );
+    assert!(
+        line.contains("apart from"),
+        "a bound with a hole must be qualified, never reported as standalone: \
+         {line:?}"
+    );
+    Ok(())
+}
+
+/// A qualified bound is still an equality *outside* its holes, and says so.
+/// Collapsing it to `O` would discard what the engine actually established.
+#[test]
+fn a_qualified_bound_keeps_the_quantifier_it_earned() -> io::Result<()> {
+    let project = Project::new()?;
+    let target = project.write("shapes.py", SHAPES_PY)?;
+
+    let run = project.check(&target, &["--bounds"])?;
+    let line = run
+        .output()
+        .lines()
+        .find(|line| line.contains("mixed:"))
+        .map(str::to_owned)
+        .unwrap_or_default();
+
+    assert!(
+        line.contains("Theta("),
+        "the counted half was exact, and the report should say so rather than \
+         downgrading the whole function: {line:?}"
+    );
+    Ok(())
+}
+
+/// The hole variable appears in the bound *and* in the list, so a reader can
+/// connect the two. A bound mentioning `#hole0` with nothing naming it would
+/// be worse than no detail at all.
+#[test]
+fn the_hole_in_the_bound_matches_the_one_described() -> io::Result<()> {
+    let project = Project::new()?;
+    let target = project.write("shapes.py", SHAPES_PY)?;
+
+    let run = project.check(&target, &["--bounds"])?;
+    let line = run
+        .output()
+        .lines()
+        .find(|line| line.contains("mixed:"))
+        .map(str::to_owned)
+        .unwrap_or_default();
+
+    let before = line.split("apart from").next().unwrap_or_default();
+    let after = line.split("apart from").nth(1).unwrap_or_default();
+    assert!(
+        before.contains("#hole"),
+        "the bound must show its hole: {line:?}"
+    );
+    assert!(
+        after.contains("#hole"),
+        "the description must name the same hole: {line:?}"
     );
     Ok(())
 }

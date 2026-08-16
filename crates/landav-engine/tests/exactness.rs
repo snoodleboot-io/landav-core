@@ -174,11 +174,11 @@ fn literal_ranges_are_counted_outright() {
 }
 
 /// A symbolic start would need `stop - start`, which the bound algebra has no
-/// way to write because subtraction is not monotone. Refused rather than
-/// approximated with `stop`, which is **unsound** when the start may be
-/// negative.
+/// way to write because subtraction is not monotone. Not approximated with
+/// `stop`, which is **unsound** when the start may be negative - the loop
+/// becomes a hole instead, so the rest of the function still gets a bound.
 #[test]
-fn a_symbolic_start_is_refused_rather_than_approximated() {
+fn a_symbolic_start_becomes_a_hole_rather_than_an_approximation() {
     let mut build =
         SourceProgramBuilder::new("f", here(), vec![VarName::new("a"), VarName::new("b")]);
     let start = build.var(VarName::new("a"), here());
@@ -187,13 +187,15 @@ fn a_symbolic_start_is_refused_rather_than_approximated() {
     let loop_stmt = build.for_range(VarName::new("i"), range, vec![], here());
     let program = build.build(vec![loop_stmt]);
 
-    assert_eq!(cost(&program), TripCount::Unknown);
+    let result = cost(&program);
+    assert_eq!(result.holes().len(), 1, "the loop is one unanalysed region");
+    assert_eq!(result.holes()[0].construct(), "for");
 }
 
 /// A stride above one needs `ceil(n / k)`, and division is not expressible
 /// either. Not silently widened to `n`.
 #[test]
-fn a_symbolic_range_with_a_wide_stride_is_refused() {
+fn a_symbolic_range_with_a_wide_stride_becomes_a_hole() {
     let mut build = SourceProgramBuilder::new("f", here(), vec![VarName::new("n")]);
     let start = build.int(0, here());
     let stop = build.var(VarName::new("n"), here());
@@ -201,14 +203,18 @@ fn a_symbolic_range_with_a_wide_stride_is_refused() {
     let loop_stmt = build.for_range(VarName::new("i"), range, vec![], here());
     let program = build.build(vec![loop_stmt]);
 
-    assert_eq!(cost(&program), TripCount::Unknown);
+    let result = cost(&program);
+    assert_eq!(result.holes().len(), 1);
+    assert!(
+        !result.is_complete(),
+        "a hole means the bound is not standalone"
+    );
 }
 
-/// `while` needs a ranking argument this engine does not have. `Unknown`, so
-/// the caller falls through to the solver rather than receiving a fabricated
-/// number that would displace a real one.
+/// `while` needs a ranking argument this engine does not have, so it becomes a
+/// hole - named and carried - rather than a fabricated number or a dead end.
 #[test]
-fn a_while_loop_is_unknown_rather_than_guessed() {
+fn a_while_loop_becomes_a_named_hole() {
     let mut build = SourceProgramBuilder::new("f", here(), vec![VarName::new("n")]);
     let left = build.var(VarName::new("i"), here());
     let right = build.var(VarName::new("n"), here());
@@ -216,7 +222,18 @@ fn a_while_loop_is_unknown_rather_than_guessed() {
     let loop_stmt = build.while_loop(cond, vec![], here());
     let program = build.build(vec![loop_stmt]);
 
-    assert_eq!(cost(&program), TripCount::Unknown);
+    let result = cost(&program);
+    assert_eq!(result.holes().len(), 1, "one `while` is one region");
+    assert_eq!(
+        result.holes()[0].construct(),
+        "while",
+        "the hole must name the construct that caused it, or the user has \
+         nothing to act on"
+    );
+    assert!(
+        result.bound().is_some(),
+        "a hole still yields a bound to report"
+    );
 }
 
 /// Branches of unequal cost give an upper bound, not an exact one: claiming
@@ -273,10 +290,11 @@ fn equal_branches_stay_exact() {
     );
 }
 
-/// Subtraction in an endpoint is not monotone, so it has no bound. The loop is
-/// refused rather than given one that would be wrong in one direction.
+/// Subtraction in an endpoint is not monotone, so there is no bound for the
+/// count. The loop becomes a hole rather than being given a count that would
+/// be wrong in one direction.
 #[test]
-fn a_subtracting_endpoint_has_no_bound() {
+fn a_subtracting_endpoint_becomes_a_hole() {
     let mut build =
         SourceProgramBuilder::new("f", here(), vec![VarName::new("n"), VarName::new("m")]);
     let start = build.int(0, here());
@@ -287,21 +305,26 @@ fn a_subtracting_endpoint_has_no_bound() {
     let loop_stmt = build.for_range(VarName::new("i"), range, vec![], here());
     let program = build.build(vec![loop_stmt]);
 
-    assert_eq!(cost(&program), TripCount::Unknown);
+    assert_eq!(cost(&program).holes().len(), 1);
 }
 
-/// An unsupported construct is `Unknown`, never skipped. A skipped statement
-/// would make the total smaller than the truth, which is the one direction a
-/// resource bound must never move.
+/// An unsupported construct is a hole, never skipped. A skipped statement would
+/// make the total smaller than the truth, which is the one direction a resource
+/// bound must never move.
 #[test]
-fn an_unsupported_statement_is_not_silently_dropped() {
+fn an_unsupported_statement_becomes_a_hole_naming_the_construct() {
     let mut build = SourceProgramBuilder::new("f", here(), vec![]);
     let value = build.int(0, here());
     let assign = build.assign(VarName::new("x"), value, here());
     let refused = build.unsupported_stmt(landav_its::Construct::Call, here());
     let program = build.build(vec![assign, refused]);
 
-    assert_eq!(cost(&program), TripCount::Unknown);
+    let result = cost(&program);
+    assert_eq!(result.holes().len(), 1);
+    assert_eq!(result.holes()[0].construct(), "call");
+    // The assignment before it is still counted. Before holes, the refusal
+    // swallowed it.
+    assert!(result.bound().is_some());
 }
 
 /// `for i in range(n): for j in range(i): x = 0`
@@ -433,5 +456,155 @@ fn a_strided_loop_body_that_reads_its_counter_is_not_summed() {
     assert!(
         matches!(result, TripCount::AtMost(_)),
         "a strided counter must not be summed as if it stepped by one, got {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LAN-81: a hole is not a lost bound
+// ---------------------------------------------------------------------------
+
+/// `for i in range(n): x = 0` followed by `while n > 0: n = n - 1`.
+///
+/// The shape this story exists for, and the shape most real Python has.
+fn mixed() -> SourceProgram {
+    let mut build = SourceProgramBuilder::new("mixed", here(), vec![VarName::new("n")]);
+    let one = NonZeroI64::new(1).expect("1 is non-zero");
+
+    let start = build.int(0, here());
+    let stop = build.var(VarName::new("n"), here());
+    let value = build.int(0, here());
+    let assign = build.assign(VarName::new("x"), value, here());
+    let counted = build.for_range(
+        VarName::new("i"),
+        RangeSpec::new(start, stop, one),
+        vec![assign],
+        here(),
+    );
+
+    let read = build.var(VarName::new("n"), here());
+    let zero = build.int(0, here());
+    let cond = build.compare(landav_its::CompareOp::Gt, read, zero, here());
+    let decrement_read = build.var(VarName::new("n"), here());
+    let step = build.int(1, here());
+    let decremented = build.arith(ArithOp::Sub, decrement_read, step, here());
+    let decrement = build.assign(VarName::new("n"), decremented, here());
+    let unbounded = build.while_loop(cond, vec![decrement], here());
+
+    build.build(vec![counted, unbounded])
+}
+
+/// **The regression this story is about.** Before holes, the `while` made the
+/// whole function `Unknown` - the counted loop above it was derived correctly
+/// and then discarded.
+#[test]
+fn a_while_no_longer_erases_the_bound_around_it() {
+    let result = cost(&mixed());
+    let bound = result
+        .bound()
+        .expect("the counted half is still derivable and must be reported");
+    assert_eq!(result.holes().len(), 1, "only the `while` is unanalysed");
+    assert_eq!(result.holes()[0].construct(), "while");
+
+    // With the hole at zero the remainder is exactly the counted loop's cost:
+    // 2n for the loop, plus nothing else in the function.
+    let hole = result.holes()[0].var();
+    let without = bound.subst(&hole, &landav_bound::Bound::zero());
+    for n in [0_u64, 1, 4, 9] {
+        assert_eq!(
+            at(&without, "n", n),
+            landav_bound::Nat::Fin(2 * n),
+            "the counted half must survive the `while` beside it, at n = {n}"
+        );
+    }
+}
+
+/// A partial result is not a complete one, and must not be mistaken for a
+/// bound that stands on its own - it cannot be compared against a budget or
+/// against another engine until its holes are filled.
+#[test]
+fn a_partial_result_does_not_claim_to_be_complete() {
+    let result = cost(&mixed());
+    assert!(!result.is_complete());
+    assert!(
+        !result.is_exact(),
+        "a bound containing a hole is never a plain equality"
+    );
+    // But what *was* derived was derived exactly, and saying so is the point.
+    assert!(
+        result.exact_outside_holes(),
+        "the counted loop was exact, and that is the actionable half"
+    );
+}
+
+/// Filling a hole yields what the engine would have produced had it known the
+/// region all along. This is the property that makes holes worth carrying
+/// rather than merely reporting.
+#[test]
+fn filling_a_hole_recovers_the_whole_bound() {
+    let result = cost(&mixed());
+    let bound = result.bound().expect("a bound").clone();
+    let hole = result.holes()[0].var();
+
+    // Suppose the `while` is later bounded at 3n by some other means.
+    let filled = bound.subst(
+        &hole,
+        &landav_bound::Bound::prod([
+            landav_bound::Bound::constant(3),
+            landav_bound::Bound::var(Symbol::from("n")),
+        ]),
+    );
+    for n in [0_u64, 1, 5, 12] {
+        assert_eq!(
+            at(&filled, "n", n),
+            landav_bound::Nat::Fin(2 * n + 3 * n),
+            "the filled bound must be the sum of both halves at n = {n}"
+        );
+    }
+}
+
+/// A hole is not a parameter. A consumer walking the bound's variables must be
+/// able to tell them apart, or it will ask the user for a value for a region.
+#[test]
+fn a_hole_is_distinguishable_from_a_parameter() {
+    let result = cost(&mixed());
+    let bound = result.bound().expect("a bound");
+    let named: Vec<String> = bound
+        .vars()
+        .iter()
+        .filter(|var| !landav_engine::Hole::is_hole(var))
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        named,
+        vec!["n".to_owned()],
+        "only the parameter should survive the filter; got {named:?}"
+    );
+    assert!(
+        bound.vars().len() > named.len(),
+        "the hole must actually be present in the bound"
+    );
+}
+
+/// Two unanalysable regions are two holes. Sharing one variable would mean
+/// filling either fills both, which would be wrong in general and silently so.
+#[test]
+fn two_regions_get_two_holes() {
+    let mut build = SourceProgramBuilder::new("twice", here(), vec![VarName::new("n")]);
+    let make_while = |build: &mut SourceProgramBuilder| {
+        let read = build.var(VarName::new("n"), here());
+        let zero = build.int(0, here());
+        let cond = build.compare(landav_its::CompareOp::Gt, read, zero, here());
+        build.while_loop(cond, vec![], here())
+    };
+    let first = make_while(&mut build);
+    let second = make_while(&mut build);
+    let program = build.build(vec![first, second]);
+
+    let result = cost(&program);
+    assert_eq!(result.holes().len(), 2);
+    assert_ne!(
+        result.holes()[0].var(),
+        result.holes()[1].var(),
+        "two regions must not share a variable"
     );
 }
