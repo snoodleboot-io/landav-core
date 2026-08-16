@@ -660,7 +660,8 @@ fn describe_bound(function: &landav_python::LoweredFunction, lowered: bool) -> S
             function.name()
         );
     }
-    match landav_engine::cost(function.program()) {
+    let derived = landav_engine::cost(function.program());
+    match &derived {
         landav_engine::TripCount::Exact(bound) => format!(
             "{where_}: {}: Theta({bound}) - derived exactly",
             function.name()
@@ -669,12 +670,47 @@ fn describe_bound(function: &landav_python::LoweredFunction, lowered: bool) -> S
             "{where_}: {}: O({bound}) - an upper bound; the true cost may be lower",
             function.name()
         ),
+        landav_engine::TripCount::Partial { bound, holes, .. } => format!(
+            "{where_}: {}: {}({bound}) apart from {}",
+            function.name(),
+            // The qualifier still describes what *was* derived. "Exact except
+            // for the `while` at line 42" is actionable; "at most infinity" is
+            // not, and collapsing to it would throw away the useful half.
+            if derived.exact_outside_holes() {
+                "Theta"
+            } else {
+                "O"
+            },
+            describe_holes(holes, &at.file().display().to_string())
+        ),
         landav_engine::TripCount::Unknown => format!(
-            "{where_}: {}: no bound: the native engine could not derive one, so this \
-             function is covered only by whatever an external solver reports",
+            "{where_}: {}: no bound: the native engine could not read this function \
+             at all, so it is covered only by whatever an external solver reports",
             function.name()
         ),
     }
+}
+
+/// The unanalysed regions, named and placed.
+///
+/// This is the blame. "No bound" tells a user nothing they can act on; naming
+/// the construct and the line tells them exactly what to change, or what to
+/// point a solver at.
+fn describe_holes(holes: &[landav_engine::Hole], file: &str) -> String {
+    holes
+        .iter()
+        .map(|hole| {
+            // The line already opens with this file's path, so repeating it per
+            // hole turns a readable sentence into three lines of noise. Trimmed
+            // to the position, which is the part that differs.
+            let origin = hole.origin().as_str();
+            let at = origin
+                .strip_prefix(file)
+                .map_or(origin, |rest| rest.trim_start_matches(':'));
+            format!("{} ({} at {at})", hole.var().symbol(), hole.construct())
+        })
+        .collect::<Vec<String>>()
+        .join(", ")
 }
 
 /// The line a run prints when part of what it looked at did not lower.

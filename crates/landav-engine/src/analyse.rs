@@ -1,9 +1,9 @@
 //! Walking a structured program and accumulating what it costs.
 
-use landav_bound::{Bound, VarId};
+use landav_bound::{Bound, Origin, VarId};
 use landav_its::{RangeSpec, SourceExpr, SourceProgram, SourceStmt, StmtId, VarName};
 
-use crate::{expr_bound, summation, trip_count::TripCount};
+use crate::{expr_bound, hole::Hole, summation, trip_count::TripCount};
 
 /// What the program costs, in **source steps**: one per statement executed,
 /// plus one per loop iteration for the loop's own test and increment.
@@ -28,19 +28,45 @@ use crate::{expr_bound, summation, trip_count::TripCount};
 /// here.
 #[must_use]
 pub fn cost(program: &SourceProgram) -> TripCount {
-    body_cost(program, program.body())
+    let mut holes = Counter::default();
+    body_cost(program, program.body(), &mut holes)
+}
+
+/// Hands out distinct indices so two regions never share a hole variable.
+///
+/// Threaded rather than global: two analyses of the same program must produce
+/// the same bound, and a process-wide counter would make the variable names
+/// depend on how much analysis happened first.
+#[derive(Default)]
+struct Counter(usize);
+
+impl Counter {
+    fn next(&mut self, construct: &'static str, origin: Origin) -> Hole {
+        let hole = Hole::new(self.0, construct, origin);
+        self.0 += 1;
+        hole
+    }
+}
+
+/// Where a statement is, for blaming a hole on it.
+fn origin_of(program: &SourceProgram, id: StmtId) -> Origin {
+    program
+        .stmt_origin(id)
+        .cloned()
+        .unwrap_or_else(|| program.origin().clone())
 }
 
 /// The cost of a statement list, in sequence.
-fn body_cost(program: &SourceProgram, body: &[StmtId]) -> TripCount {
+fn body_cost(program: &SourceProgram, body: &[StmtId], holes: &mut Counter) -> TripCount {
     body.iter()
         .fold(TripCount::Exact(Bound::zero()), |acc, id| {
-            acc.then(stmt_cost(program, *id))
+            let next = stmt_cost(program, *id, holes);
+            acc.then(next)
         })
 }
 
 /// The cost of one statement.
-fn stmt_cost(program: &SourceProgram, id: StmtId) -> TripCount {
+fn stmt_cost(program: &SourceProgram, id: StmtId, holes: &mut Counter) -> TripCount {
     let Some(stmt) = program.stmt(id) else {
         return TripCount::Unknown;
     };
@@ -54,16 +80,19 @@ fn stmt_cost(program: &SourceProgram, id: StmtId) -> TripCount {
             else_body,
             ..
         } => {
-            let taken = body_cost(program, then_body).branching(body_cost(program, else_body));
+            let then_cost = body_cost(program, then_body, holes);
+            let else_cost = body_cost(program, else_body, holes);
+            let taken = then_cost.branching(else_cost);
             // One step for the test itself, whichever way it goes.
             taken.then(TripCount::Exact(Bound::one()))
         }
 
         // A `while` loop needs a ranking argument, which this engine does not
-        // yet have. Deliberately `Unknown` rather than a guess: the caller has
-        // an external solver for exactly this case, and a fabricated bound here
-        // would displace a real one.
-        SourceStmt::While { .. } => TripCount::Unknown,
+        // have. It becomes a **hole** rather than a guess or a refusal: the
+        // cost is real and unknown, so it is named and carried. Everything
+        // around it still gets derived, which is the whole point - before
+        // holes, one `while` erased every exact bound in the function.
+        SourceStmt::While { .. } => TripCount::opaque(holes.next("while", origin_of(program, id))),
 
         SourceStmt::ForRange {
             target,
@@ -71,12 +100,16 @@ fn stmt_cost(program: &SourceProgram, id: StmtId) -> TripCount {
             body,
         } => {
             let count = count_of(program, *range);
-            loop_cost(program, target, *range, body, count)
+            loop_cost(program, target, *range, body, count, holes, id)
         }
 
         // Lowering refuses these outright, so a program containing one never
-        // reaches a solver either. Reported rather than skipped.
-        SourceStmt::Unsupported { .. } => TripCount::Unknown,
+        // reaches a solver either. Still a hole rather than a dead end: the
+        // report can then say which construct cost the bound, and the rest of
+        // the function keeps whatever was derived around it.
+        SourceStmt::Unsupported { construct, .. } => {
+            TripCount::opaque(holes.next(construct.tag(), origin_of(program, id)))
+        }
     }
 }
 
@@ -155,8 +188,17 @@ fn loop_cost(
     range: RangeSpec,
     body: &[StmtId],
     count: TripCount,
+    holes: &mut Counter,
+    id: StmtId,
 ) -> TripCount {
-    let body = body_cost(program, body);
+    let body = body_cost(program, body, holes);
+
+    // A loop whose trip count could not be derived is itself a region: the body
+    // is understood, but how many times it runs is not, and multiplying by an
+    // unknown count is the same as knowing nothing about the whole loop.
+    if matches!(count, TripCount::Unknown) {
+        return TripCount::opaque(holes.next("for", origin_of(program, id)));
+    }
     let counter = VarId::new(target.symbol().clone());
 
     // The summation is only valid for the counter this engine can reason about
