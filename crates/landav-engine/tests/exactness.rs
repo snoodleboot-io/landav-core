@@ -303,3 +303,95 @@ fn an_unsupported_statement_is_not_silently_dropped() {
 
     assert_eq!(cost(&program), TripCount::Unknown);
 }
+
+/// `for i in range(n): for j in range(i): x = 0`
+fn triangular() -> SourceProgram {
+    let mut build = SourceProgramBuilder::new("tri", here(), vec![VarName::new("n")]);
+    let one = NonZeroI64::new(1).expect("1 is non-zero");
+
+    let inner_start = build.int(0, here());
+    // The inner limit is the *outer* loop's counter. This is what makes the
+    // nesting triangular, and what made the engine leak a bound variable.
+    let inner_stop = build.var(VarName::new("i"), here());
+    let value = build.int(0, here());
+    let assign = build.assign(VarName::new("x"), value, here());
+    let inner = build.for_range(
+        VarName::new("j"),
+        RangeSpec::new(inner_start, inner_stop, one),
+        vec![assign],
+        here(),
+    );
+
+    let outer_start = build.int(0, here());
+    let outer_stop = build.var(VarName::new("n"), here());
+    let outer = build.for_range(
+        VarName::new("i"),
+        RangeSpec::new(outer_start, outer_stop, one),
+        vec![inner],
+        here(),
+    );
+    build.build(vec![outer])
+}
+
+/// The regression. A loop counter is bound by its loop, so it must not appear
+/// in the loop's own cost - the caller can supply `n` and has nothing to supply
+/// for `i`.
+///
+/// This shipped broken: the engine returned `Exact(n * (1 + 2i))`, which is
+/// both unusable and mislabelled, because every step that produced it was
+/// individually exact.
+#[test]
+fn a_loop_counter_never_escapes_into_the_bound() {
+    let program = triangular();
+    let result = cost(&program);
+    let bound = result.bound().expect("triangular nesting has a bound");
+    let named: Vec<String> = bound.vars().iter().map(ToString::to_string).collect();
+    assert_eq!(
+        named,
+        vec!["n".to_owned()],
+        "the bound must name only the function's parameters; `i` and `j` are \
+         bound by their loops. Got {bound}"
+    );
+}
+
+/// Substituting the trip count for the counter is an over-approximation, so
+/// the claim must be weakened to match. Reporting this as exact is the specific
+/// defect above.
+#[test]
+fn triangular_nesting_is_a_bound_and_says_so() {
+    assert!(
+        matches!(cost(&triangular()), TripCount::AtMost(_)),
+        "triangular nesting is approximated, and must not claim exactness"
+    );
+}
+
+/// Soundness of the approximation, checked against the truth rather than
+/// against the implementation.
+///
+/// The exact cost is `sum over i < n of (1 + 2i)` = `n^2`. The engine reports
+/// `n * (1 + 2n)` = `2n^2 + n`, which dominates it everywhere - right shape,
+/// about twice too large.
+///
+/// Worth recording that `n^2` **is** expressible in the current bound algebra,
+/// so closing this gap does not depend on the frozen-API change: the
+/// intermediate sum needs rational arithmetic, but the answer does not.
+#[test]
+fn the_triangular_approximation_dominates_the_truth() {
+    let bound = cost(&triangular())
+        .bound()
+        .expect("triangular nesting has a bound")
+        .clone();
+    for n in [0_u64, 1, 2, 3, 4, 8, 32] {
+        let truth: u64 = (0..n).map(|i| 1 + 2 * i).sum();
+        let reported = at(&bound, "n", n);
+        assert_eq!(
+            truth,
+            n * n,
+            "the arithmetic in this test is wrong, not the engine"
+        );
+        assert!(
+            reported.magnitude_cmp(landav_bound::Nat::Fin(truth)) != std::cmp::Ordering::Less,
+            "the reported bound {reported:?} is below the true cost {truth} at n = {n}"
+        );
+    }
+}

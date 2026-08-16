@@ -1,7 +1,7 @@
 //! Walking a structured program and accumulating what it costs.
 
-use landav_bound::Bound;
-use landav_its::{RangeSpec, SourceExpr, SourceProgram, SourceStmt, StmtId};
+use landav_bound::{Bound, VarId};
+use landav_its::{RangeSpec, SourceExpr, SourceProgram, SourceStmt, StmtId, VarName};
 
 use crate::{expr_bound, trip_count::TripCount};
 
@@ -65,15 +65,67 @@ fn stmt_cost(program: &SourceProgram, id: StmtId) -> TripCount {
         // would displace a real one.
         SourceStmt::While { .. } => TripCount::Unknown,
 
-        SourceStmt::ForRange { range, body, .. } => {
+        SourceStmt::ForRange {
+            target,
+            range,
+            body,
+        } => {
             let count = count_of(program, *range);
-            count.iterating(body_cost(program, body))
+            let body = close_over_counter(target, &count, body_cost(program, body));
+            count.iterating(body)
         }
 
         // Lowering refuses these outright, so a program containing one never
         // reaches a solver either. Reported rather than skipped.
         SourceStmt::Unsupported { .. } => TripCount::Unknown,
     }
+}
+
+/// Remove the loop counter from a body's cost, so the result is a function of
+/// the enclosing scope alone.
+///
+/// # The bug this exists to prevent
+///
+/// A loop counter is **bound by its loop**. A body whose cost mentions it -
+/// `for i in range(n): for j in range(i): ...` - produces a cost in terms of
+/// `i`, and multiplying that by the trip count leaves `i` free in the answer.
+/// The caller can supply `n`; it has nothing to supply for `i`. Worse, the
+/// result would be labelled exact, because every step that produced it was.
+///
+/// # Why substituting the trip count is sound
+///
+/// The counter of an ascending loop from zero takes values in `[0, count)`, so
+/// `count` dominates every value it holds. [`Bound`] is **weakly monotone by
+/// construction**: replacing a variable by something that dominates it can only
+/// increase the result. So the substitution is an over-approximation, and one
+/// that needs no argument beyond the type's own guarantee.
+///
+/// The result is relaxed to [`TripCount::AtMost`], because it genuinely is.
+///
+/// # What this gives up, and what would recover it
+///
+/// The exact answer is the definite sum `sum over k < count of body(k)`, not
+/// `count * body(count)`. For triangular nesting the sum is `n^2` and this
+/// approximation gives `2n^2 + n` - the right shape, twice too large.
+///
+/// Recovering it means extracting the body's cost as a polynomial in the
+/// counter and summing it in closed form. That is the tracked recurrence-
+/// extraction work; it is deliberately not attempted here, because a loose
+/// bound that says it is loose is worth shipping and a wrong exact one is not.
+fn close_over_counter(target: &VarName, count: &TripCount, body: TripCount) -> TripCount {
+    let counter = VarId::new(target.symbol().clone());
+    let Some(body_bound) = body.bound() else {
+        return TripCount::Unknown;
+    };
+    if !body_bound.may_contain_var(&counter) {
+        return body;
+    }
+    // The counter escapes. Without a trip count there is nothing to dominate
+    // it with, so there is no sound bound to give.
+    let Some(ceiling) = count.bound() else {
+        return TripCount::Unknown;
+    };
+    TripCount::AtMost(body_bound.subst(&counter, ceiling))
 }
 
 /// How many times a counted loop runs.
