@@ -522,3 +522,162 @@ fn locations_carry_labels_that_name_their_construct() {
         );
     }
 }
+
+/// **A transition renders as the whole step: both endpoints, guard and
+/// update.**
+///
+/// The suite reads transitions through their accessors and through
+/// `Its::to_koat`, never through [`landav_its::Transition`]'s own `Display` —
+/// so replacing that `Display` with one that writes *nothing at all* passed
+/// every test. The same held for [`landav_its::VarName`].
+///
+/// These two renderings are the ones a person reads when a lowering surprises
+/// them: a panic message, a `{:?}`-free assertion failure, a debug dump. A
+/// silent `Display` turns each of those into an empty string at precisely the
+/// moment it is needed, and nothing else in the crate notices.
+#[test]
+fn a_transition_renders_as_a_readable_step() {
+    let mut builder = SourceProgramBuilder::new(
+        "step",
+        origin(1),
+        vec![VarName::new("n"), VarName::new("i")],
+    );
+    let i = builder.var(VarName::new("i"), origin(2));
+    let n = builder.var(VarName::new("n"), origin(2));
+    let one = builder.int(1, origin(2));
+    let guard = builder.compare(CompareOp::Lt, i, n, origin(2));
+    let next = builder.arith(ArithOp::Add, i, one, origin(3));
+    let bump = builder.assign(VarName::new("i"), next, origin(3));
+    let loop_stmt = builder.while_loop(guard, vec![bump], origin(2));
+    let program = builder.build(vec![loop_stmt]);
+
+    let its = lower(&program).expect("a counted loop is inside the fragment");
+
+    for transition in its.transitions() {
+        let rendered = transition.to_string();
+        assert!(
+            !rendered.is_empty(),
+            "a transition rendered as nothing at all"
+        );
+        assert!(
+            rendered.contains("->"),
+            "a transition must render both of its endpoints: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&transition.source().to_string())
+                && rendered.contains(&transition.target().to_string()),
+            "a transition named endpoints it does not have: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&transition.update().to_string()),
+            "a transition dropped its update: {rendered:?}"
+        );
+    }
+
+    // The two steps worth naming: one that carries a real guard, and one that
+    // carries a real update. Between them every part of the rendering is
+    // something other than a default, so a `Display` that dropped any one part
+    // would show here.
+    let guarded = its
+        .transitions()
+        .iter()
+        .find(|transition| !transition.guard().is_always())
+        .expect("the loop header is guarded by i < n");
+    let rendered = guarded.to_string();
+    let guard_text = guarded.guard().to_string();
+    assert!(
+        rendered.contains(&guard_text),
+        "the guard {guard_text:?} is missing from {rendered:?}"
+    );
+    assert!(
+        rendered.find(&guarded.source().to_string()) < rendered.find("->"),
+        "the source must be rendered before the arrow: {rendered:?}"
+    );
+    assert!(
+        rendered.find("->") < rendered.find(&guard_text),
+        "the guard must be rendered after the endpoints: {rendered:?}"
+    );
+
+    let assigning = its
+        .transitions()
+        .iter()
+        .find(|transition| !transition.update().is_identity())
+        .expect("the loop body increments i");
+    let rendered = assigning.to_string();
+    let update_text = assigning.update().to_string();
+    assert!(
+        update_text.contains(":="),
+        "a non-identity update must render as an assignment: {update_text:?}"
+    );
+    assert!(
+        rendered.contains(&update_text),
+        "the update {update_text:?} is missing from {rendered:?}"
+    );
+    assert!(
+        rendered.find("->") < rendered.find(&update_text),
+        "the update must be rendered after the endpoints: {rendered:?}"
+    );
+
+    // Two different transitions must not render alike.
+    let renderings: std::collections::BTreeSet<String> = its
+        .transitions()
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    assert!(
+        renderings.len() > 1,
+        "every transition in a loop rendered identically: {renderings:?}"
+    );
+}
+
+/// A variable name renders as the name the frontend spelled.
+///
+/// Trivial, and it survived mutation as a `Display` that writes nothing:
+/// every assertion in the suite reached the name through `as_str` instead.
+#[test]
+fn a_variable_name_renders_as_itself() {
+    for spelling in ["x", "counter", "n_items", "\u{e9}l\u{e8}ve"] {
+        let name = VarName::new(spelling);
+        assert_eq!(name.to_string(), spelling);
+        assert_eq!(name.to_string(), name.as_str());
+        assert!(!name.to_string().is_empty());
+    }
+    assert_ne!(
+        VarName::new("x").to_string(),
+        VarName::new("y").to_string(),
+        "two different names must not render alike"
+    );
+}
+
+/// **A range's stride is never zero**, which is why `RangeSpec::ascending`'s
+/// `step > 0` and `step >= 0` cannot be separated by any test.
+///
+/// The stride is a [`NonZeroI64`], so the two comparisons agree on every value
+/// the type admits and the mutation is equivalent. That is a property of the
+/// *type*, and it is the reason the surviving mutant is acceptable — so it is
+/// pinned here, and a future change to a plain `i64` fails this instead of
+/// quietly turning `range(0, 10, 0)` into an ascending loop that never
+/// advances.
+#[test]
+fn a_range_stride_cannot_be_zero_so_ascending_is_total() {
+    assert!(NonZeroI64::new(0).is_none(), "the stride type refuses zero");
+
+    let mut builder = SourceProgramBuilder::new("strides", origin(1), vec![]);
+    let start = builder.int(0, origin(2));
+    let stop = builder.int(10, origin(2));
+
+    for step in [1_i64, 2, 7, i64::MAX] {
+        let stride = NonZeroI64::new(step).expect("non-zero");
+        assert!(
+            RangeSpec::new(start, stop, stride).ascending(),
+            "a positive stride ascends"
+        );
+    }
+    for step in [-1_i64, -3, i64::MIN] {
+        let stride = NonZeroI64::new(step).expect("non-zero");
+        assert!(
+            !RangeSpec::new(start, stop, stride).ascending(),
+            "a negative stride descends"
+        );
+    }
+}

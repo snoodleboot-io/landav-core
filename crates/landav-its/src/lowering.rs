@@ -905,3 +905,219 @@ fn disjoin(left: &Dnf, right: &Dnf) -> Dnf {
     out.extend(right.iter().cloned());
     out
 }
+
+/// Unit tests for the parts of this module that no integration test can name.
+///
+/// # Why these live here rather than in `tests/`
+///
+/// `expr_child_ok`, `cond_child_ok`, `cross` and `disjoin` are private, and
+/// three of the four are only reachable from outside through a whole lowering.
+/// That indirection is what let their boundaries survive mutation testing:
+/// the guards were killed by a 120-second clock rather than an assertion, and
+/// the two [`MAX_DNF_CLAUSES`] comparisons were not killed at all, because
+/// building a source condition whose normal form lands *exactly* on the cap is
+/// far more work than the property deserves.
+///
+/// Being unit tests they also run in the library test binary, which cargo
+/// executes **before** any integration target - so a broken guard reports here
+/// first, in microseconds, and `tests/frozen_invariants.rs` explains at length
+/// why that matters.
+#[cfg(test)]
+mod tests {
+    // A test that cannot assert is not a test; the panic lints are relaxed
+    // here exactly as they are in `tests/properties/main.rs`.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use landav_bound::Origin;
+
+    use super::{Dnf, MAX_DNF_CLAUSES, cross, disjoin, dnf_true};
+    use crate::{
+        cond_id::CondId, constraint::Constraint, expr_id::ExprId, its_var::ItsVar,
+        lowering::Lowering, polynomial::Polynomial, relation::Relation,
+        source_program::SourceProgram, source_program_builder::SourceProgramBuilder,
+    };
+
+    fn empty_program() -> SourceProgram {
+        SourceProgramBuilder::new("guarded", Origin::new("guard.rs:1:1"), vec![]).build(vec![])
+    }
+
+    /// `count` distinct one-constraint clauses.
+    fn clauses(count: usize) -> Dnf {
+        (0..count)
+            .map(|index| {
+                let polynomial = Polynomial::var(ItsVar::new(format!("v{index}")));
+                vec![Constraint::new(polynomial, Relation::Ge)]
+            })
+            .collect()
+    }
+
+    /// Whether a normal form is the widened `true`.
+    fn is_widened(dnf: &Dnf) -> bool {
+        *dnf == dnf_true()
+    }
+
+    // -- the acyclicity guards ----------------------------------------------
+
+    /// **A child's index must strictly precede its parent's.**
+    ///
+    /// This is the sole reason `expr_poly`'s worklist terminates: each edge it
+    /// follows strictly decreases the arena index, so the chain of visits from
+    /// a node at index `n` is at most `n` long. Relax the comparison to `>` -
+    /// or let the function return `true` unconditionally, which is the mutant
+    /// that was killed by the clock - and a program whose node 0 names node 1
+    /// while node 1 names node 0 is walked forever.
+    ///
+    /// Asserted here directly, on a guard that never enters the loop, because
+    /// an assertion inside a traversal that can hang cannot report.
+    #[test]
+    fn an_expression_operand_must_precede_the_node_that_names_it() {
+        let program = empty_program();
+        let mut lowering = Lowering::new(&program);
+
+        assert!(
+            lowering.expr_child_ok(ExprId(4), ExprId(3)),
+            "an earlier operand is well-formed and must be followed"
+        );
+        assert!(
+            lowering.expr_child_ok(ExprId(1), ExprId(0)),
+            "index zero is a legitimate operand of index one"
+        );
+        assert!(
+            lowering.malformed.is_none(),
+            "a well-formed operand must not be blamed"
+        );
+
+        assert!(
+            !lowering.expr_child_ok(ExprId(3), ExprId(3)),
+            "a node naming itself is a cycle of length one"
+        );
+        assert!(
+            !lowering.expr_child_ok(ExprId(3), ExprId(4)),
+            "a node naming a later node can close a cycle"
+        );
+        assert!(
+            !lowering.expr_child_ok(ExprId(0), ExprId(0)),
+            "the first node has no legitimate operand at all"
+        );
+        assert!(
+            lowering
+                .malformed
+                .as_ref()
+                .is_some_and(|detail| !detail.as_str().is_empty()),
+            "refusing an operand must record why"
+        );
+    }
+
+    /// The same invariant, on the condition arena, whose traversal terminates
+    /// for the same reason and whose guard survived mutation the same way.
+    #[test]
+    fn a_condition_operand_must_precede_the_node_that_names_it() {
+        let program = empty_program();
+        let mut lowering = Lowering::new(&program);
+
+        assert!(lowering.cond_child_ok(CondId(2), CondId(1)));
+        assert!(lowering.malformed.is_none());
+
+        assert!(
+            !lowering.cond_child_ok(CondId(2), CondId(2)),
+            "a condition naming itself is a cycle"
+        );
+        assert!(
+            !lowering.cond_child_ok(CondId(2), CondId(7)),
+            "a condition naming a later node can close a cycle"
+        );
+        assert!(
+            lowering
+                .malformed
+                .as_ref()
+                .is_some_and(|detail| !detail.as_str().is_empty()),
+            "refusing a condition operand must record why"
+        );
+    }
+
+    // -- the DNF cap --------------------------------------------------------
+
+    /// **[`MAX_DNF_CLAUSES`] is an inclusive limit.**
+    ///
+    /// `cross` widens to `true` rather than form a product bigger than the
+    /// cap. Widening is *sound*, which is why getting the boundary wrong is
+    /// invisible to the soundness suite: a `>=` here throws away a perfectly
+    /// representable conjunction and silently makes both branches of an `if`
+    /// available, and every soundness property still passes. The boundary is
+    /// therefore stated as a boundary - at the cap, exact; one past it,
+    /// widened.
+    #[test]
+    fn a_product_exactly_at_the_clause_cap_is_kept_and_one_past_it_widens() {
+        assert_eq!(
+            MAX_DNF_CLAUSES, 64,
+            "the cases below are chosen to divide it"
+        );
+
+        let exact = cross(&clauses(8), &clauses(8));
+        assert_eq!(
+            exact.len(),
+            MAX_DNF_CLAUSES,
+            "a product landing exactly on the cap must be kept, not widened"
+        );
+        assert!(
+            !is_widened(&exact),
+            "an exact-cap product was widened to true"
+        );
+        assert!(
+            exact.iter().all(|clause| clause.len() == 2),
+            "a cross product's clauses are the concatenation of one from each side"
+        );
+
+        let over = cross(&clauses(8), &clauses(9));
+        assert!(
+            is_widened(&over),
+            "a product of {} clauses exceeds the cap and must widen to true",
+            8 * 9
+        );
+
+        // And the cheap end still behaves: nothing widens below the cap.
+        let small = cross(&clauses(3), &clauses(4));
+        assert_eq!(small.len(), 12);
+        assert!(!is_widened(&small));
+    }
+
+    /// The same boundary for `disjoin`, whose budget is a sum rather than a
+    /// product.
+    #[test]
+    fn a_disjunction_exactly_at_the_clause_cap_is_kept_and_one_past_it_widens() {
+        let exact = disjoin(&clauses(32), &clauses(32));
+        assert_eq!(
+            exact.len(),
+            MAX_DNF_CLAUSES,
+            "a disjunction landing exactly on the cap must be kept"
+        );
+        assert!(!is_widened(&exact));
+
+        let over = disjoin(&clauses(32), &clauses(33));
+        assert!(
+            is_widened(&over),
+            "a disjunction of 65 clauses exceeds the cap and must widen to true"
+        );
+
+        let small = disjoin(&clauses(2), &clauses(3));
+        assert_eq!(small.len(), 5);
+        assert!(!is_widened(&small));
+    }
+
+    /// The widened value is the normal form that admits everything: one empty
+    /// clause. An empty *disjunction* would be `false` and admit nothing,
+    /// which is the unsound direction, so the two must not be confused.
+    #[test]
+    fn widening_produces_true_and_not_false() {
+        let widened = dnf_true();
+        assert_eq!(widened.len(), 1, "`true` is a single clause");
+        assert!(
+            widened.iter().all(Vec::is_empty),
+            "`true`'s single clause is the empty conjunction"
+        );
+        assert!(
+            !widened.is_empty(),
+            "an empty disjunction is `false`, which admits no transition at all"
+        );
+    }
+}

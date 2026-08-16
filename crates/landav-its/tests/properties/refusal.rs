@@ -17,7 +17,8 @@
 
 use landav_bound::Origin;
 use landav_its::{
-    ArithOp, CompareOp, Construct, LoweringError, SourceProgramBuilder, VarName, lower,
+    ArithOp, CompareOp, Construct, LoweringError, Refusals, SourceProgramBuilder, Unsupported,
+    VarName, lower,
 };
 
 fn origin(line: u32) -> Origin {
@@ -535,4 +536,250 @@ fn a_power_expression_lowers_to_a_polynomial() {
     let error = lower(&program).expect_err("past the degree cap");
     let refusals = error.refusals().expect("a refusal");
     assert!(refusals.constructs().contains(&Construct::PolynomialDegree));
+}
+
+/// **The ledger accumulates: every record, counted and positioned.**
+///
+/// [`Refusals`] is the whole of criterion 4's "*every* refusal is reported".
+/// The suite reached it almost exclusively through
+/// [`landav_its::Refusals::constructs`], which deduplicates — so nothing
+/// observed that a *second* refusal of an already-seen construct survives at
+/// all. Mutation testing found the hole from the other side: `merge` replaced
+/// by a no-op, `count_of` replaced by the constant `1`, `origins` replaced by
+/// an empty vector and `is_empty` replaced by `true` all passed the suite.
+///
+/// That is not four operator slips, it is one gap: the ledger's *cardinality*
+/// was unobserved. A frontend that refuses the same construct at eleven
+/// positions must be told about eleven positions, not about one construct.
+#[test]
+fn the_ledger_keeps_every_record_and_counts_them() {
+    let first = Unsupported::new(Construct::Call, origin(10));
+    let second = Unsupported::new(Construct::Call, origin(20));
+    let third = Unsupported::new(Construct::Subscript, origin(30));
+
+    let mut ledger = Refusals::new(first.clone());
+    assert!(
+        !ledger.is_empty(),
+        "a ledger built from a record is never empty"
+    );
+    assert_eq!(ledger.len(), 1);
+
+    ledger.insert(second.clone());
+    ledger.insert(third.clone());
+    assert_eq!(
+        ledger.len(),
+        3,
+        "three distinct refusals must survive as three records"
+    );
+
+    // Two refusals of one construct at two positions are two records and one
+    // construct: the count and the deduplicated view must not be conflated.
+    assert_eq!(
+        ledger.count_of(Construct::Call),
+        2,
+        "the same construct refused twice must be counted twice"
+    );
+    assert_eq!(ledger.count_of(Construct::Subscript), 1);
+    assert_eq!(
+        ledger.count_of(Construct::PatternMatch),
+        0,
+        "a construct that was never refused must count zero"
+    );
+    assert_eq!(
+        ledger.constructs(),
+        vec![Construct::Call, Construct::Subscript]
+    );
+
+    // Every position, without deduplication, in canonical order.
+    let positions: Vec<String> = ledger
+        .origins()
+        .iter()
+        .map(|origin| origin.as_str().to_owned())
+        .collect();
+    assert_eq!(
+        positions.len(),
+        3,
+        "one position per record, not per construct"
+    );
+    assert!(
+        positions.contains(&"refused.py:10:1".to_owned())
+            && positions.contains(&"refused.py:20:1".to_owned())
+            && positions.contains(&"refused.py:30:1".to_owned()),
+        "the ledger lost a position: {positions:?}"
+    );
+
+    // Inserting a record that is already present changes nothing.
+    ledger.insert(second.clone());
+    assert_eq!(ledger.len(), 3, "an identical record must deduplicate");
+
+    // `merge` is `insert` over a whole ledger, and must move every record.
+    let mut left = Refusals::new(first.clone());
+    let mut right = Refusals::new(third.clone());
+    right.insert(second.clone());
+    left.merge(right);
+    assert_eq!(
+        left.len(),
+        3,
+        "merging a two-record ledger into a one-record ledger must give three"
+    );
+    assert_eq!(left.count_of(Construct::Call), 2);
+    assert_eq!(
+        left.as_slice(),
+        ledger.as_slice(),
+        "merge and insert must agree"
+    );
+
+    // And the blame view carries the same cardinality across the F-015 seam.
+    assert_eq!(
+        left.blames().as_slice().len(),
+        3,
+        "a record was dropped on the way to Blames"
+    );
+}
+
+/// **The ledger renders one record per line, with no leading blank.**
+///
+/// A frontend prints this straight to a terminal. The separator comparison
+/// survived mutation three ways — `>=` puts a blank line above the first
+/// record, `==` puts the separator in the wrong place entirely, and `<` runs
+/// every refusal together on one line — and none of the three was visible,
+/// because the only assertions on `Display` used single-record ledgers, where
+/// a separator never fires.
+#[test]
+fn the_ledger_renders_one_record_per_line() {
+    let single = Refusals::new(Unsupported::new(Construct::Call, origin(10)));
+    let rendered = single.to_string();
+    assert!(
+        !rendered.starts_with('\n') && !rendered.ends_with('\n'),
+        "a one-record ledger must not be padded with blank lines: {rendered:?}"
+    );
+    assert_eq!(rendered.lines().count(), 1);
+
+    let mut many = single;
+    many.insert(Unsupported::new(Construct::Subscript, origin(20)));
+    many.insert(Unsupported::new(Construct::BindingForm, origin(30)));
+
+    let rendered = many.to_string();
+    assert_eq!(
+        rendered.lines().count(),
+        3,
+        "three refusals must render as three lines, not one: {rendered:?}"
+    );
+    assert!(
+        !rendered.starts_with('\n'),
+        "the first record must not be preceded by a separator: {rendered:?}"
+    );
+    assert_eq!(
+        rendered.matches('\n').count(),
+        2,
+        "n records take n-1 separators: {rendered:?}"
+    );
+    for line in rendered.lines() {
+        assert!(!line.is_empty(), "a blank line in the ledger: {rendered:?}");
+    }
+}
+
+/// **A refusal's specifics survive to the record.**
+///
+/// [`landav_its::Unsupported::detail`] is what carries the part a
+/// [`Construct`] cannot say — which callee, which operator. Replacing it with
+/// `None` passed the suite, which means every assertion about a detailed
+/// refusal was reading the construct and the position and never the detail:
+/// `unsupported_expr_detailed` and `unsupported_expr` were indistinguishable.
+#[test]
+fn a_detailed_refusal_carries_its_specifics_to_the_record() {
+    let mut builder = SourceProgramBuilder::new("detailed", origin(1), vec![]);
+    let plain = builder.unsupported_stmt(Construct::Call, origin(7));
+    let detailed = builder.unsupported_stmt_detailed(Construct::Call, "expensive", origin(8));
+    let program = builder.build(vec![plain, detailed]);
+
+    let error = lower(&program).expect_err("two refusals");
+    let refusals = error.refusals().expect("a refusal");
+    assert_eq!(
+        refusals.count_of(Construct::Call),
+        2,
+        "a plain and a detailed refusal of one construct are two records"
+    );
+
+    let details: Vec<Option<String>> = refusals
+        .as_slice()
+        .iter()
+        .map(|record| record.detail().map(|d| d.as_str().to_owned()))
+        .collect();
+    assert!(
+        details.contains(&Some("expensive".to_owned())),
+        "the frontend's specifics were dropped: {details:?}"
+    );
+    assert!(
+        details.contains(&None),
+        "a refusal with no specifics must report None, not a fabricated detail"
+    );
+
+    // Directly, too: the two constructors must not agree.
+    let bare = Unsupported::new(Construct::Call, origin(7));
+    let with = Unsupported::with_detail(Construct::Call, origin(7), "expensive");
+    assert_eq!(bare.detail(), None);
+    assert_eq!(
+        with.detail().map(landav_bound::Symbol::as_str),
+        Some("expensive")
+    );
+    assert_ne!(bare, with, "the detail is part of a record's identity");
+}
+
+/// **A source node's position is recoverable from its handle.**
+///
+/// `SourceProgram::expr_origin`, `cond_origin` and `stmt_origin` are how a
+/// consumer turns a handle back into blame, and all three could be replaced by
+/// `None` without failing anything: the lowering reads them through a fallback
+/// to the *program's* origin, so a node whose position is lost is reported at
+/// the function's position instead — plausible, wrong, and silent.
+///
+/// Asserted with distinct lines per node so that a fallback cannot pass.
+#[test]
+fn a_source_handle_reports_the_position_it_was_built_with() {
+    let mut builder = SourceProgramBuilder::new("positions", origin(1), vec![]);
+    let literal = builder.int(1, origin(11));
+    let other = builder.int(2, origin(12));
+    let sum = builder.arith(ArithOp::Add, literal, other, origin(13));
+    let comparison = builder.compare(CompareOp::Lt, literal, other, origin(14));
+    let statement = builder.assign(VarName::new("x"), sum, origin(15));
+    let program = builder.build(vec![statement]);
+
+    let at = |o: Option<&landav_bound::Origin>| o.map(|o| o.as_str().to_owned());
+
+    assert_eq!(
+        at(program.expr_origin(literal)),
+        Some("refused.py:11:1".to_owned())
+    );
+    assert_eq!(
+        at(program.expr_origin(other)),
+        Some("refused.py:12:1".to_owned())
+    );
+    assert_eq!(
+        at(program.expr_origin(sum)),
+        Some("refused.py:13:1".to_owned())
+    );
+    assert_eq!(
+        at(program.cond_origin(comparison)),
+        Some("refused.py:14:1".to_owned())
+    );
+    assert_eq!(
+        at(program.stmt_origin(statement)),
+        Some("refused.py:15:1".to_owned())
+    );
+
+    // None of them is the *program's* position, so a fallback is visible.
+    assert_eq!(program.origin().as_str(), "refused.py:1:1");
+
+    // A handle from another program names nothing here, and must say so rather
+    // than answering with a neighbour's position.
+    let mut donor = SourceProgramBuilder::new("donor", origin(1), vec![]);
+    let stranger: Vec<_> = (0..40).map(|v| donor.int(v, origin(99))).collect();
+    let far = stranger.last().copied().expect("forty were built");
+    assert_eq!(
+        program.expr_origin(far),
+        None,
+        "a handle naming no node here must not be given a position"
+    );
+    assert_eq!(program.expr(far), None);
 }

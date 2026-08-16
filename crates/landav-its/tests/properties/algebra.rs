@@ -24,7 +24,8 @@
 use std::collections::BTreeMap;
 
 use landav_its::{
-    Constraint, Guard, ItsVar, MAX_DEGREE, MAX_MONOMIALS, Monomial, Polynomial, Relation, Update,
+    Constraint, Construct, Guard, ItsVar, MAX_DEGREE, MAX_MONOMIALS, Monomial, Polynomial,
+    Relation, Update,
 };
 use proptest::prelude::*;
 
@@ -378,4 +379,296 @@ fn polynomial_rendering_is_pinned() {
         .expect("in range");
     // Canonical order puts the constant first.
     assert_eq!(mixed.to_string(), "-4 + x");
+}
+
+/// **The polynomial caps are inclusive, and each is checked on its own.**
+///
+/// `the_polynomial_caps_refuse` above establishes that the caps bite; what it
+/// deliberately does not do is say *where*. Its term-cap assertion is the
+/// disjunction `refused || len <= MAX_MONOMIALS`, which a `>=` comparison
+/// satisfies just as well as a `>` one — and mutation testing found exactly
+/// that: swapping `>` for `>=` or `==` in `Polynomial::check_limits` changed
+/// no test, and neither did replacing the whole function with `Ok(())`.
+///
+/// An off-by-one here is not cosmetic. Refusing at the cap turns a
+/// representable program into a refusal, which shows up as a *missing* bound;
+/// admitting one past it defeats the reason the cap exists, which is that the
+/// emitter expands every power into repeated multiplication. So the boundary
+/// is stated as a boundary: at the cap, accepted; one past it, refused, and
+/// with the construct that names which cap was hit.
+#[test]
+fn the_polynomial_caps_are_inclusive_and_separately_enforced() {
+    let wide = |count: usize| -> Vec<Monomial> {
+        (0..count)
+            .map(|index| Monomial::linear(1, var(&format!("w{index}"))))
+            .collect()
+    };
+
+    let at_cap = Polynomial::from_monomials(wide(MAX_MONOMIALS))
+        .expect("a polynomial with exactly MAX_MONOMIALS terms is representable");
+    assert_eq!(
+        at_cap.monomials().len(),
+        MAX_MONOMIALS,
+        "the terms were silently dropped rather than accepted"
+    );
+
+    assert_eq!(
+        Polynomial::from_monomials(wide(MAX_MONOMIALS + 1)),
+        Err(Construct::PolynomialSize),
+        "one term past the cap must refuse, and must say it was the size cap"
+    );
+
+    // The degree cap is independent: one term, well inside the term cap, and
+    // past the degree cap on its own.
+    let steep = Monomial::new(1, [(var("x"), MAX_DEGREE + 1)]).expect("exponents do not overflow");
+    assert_eq!(
+        Polynomial::from_monomials([steep]),
+        Err(Construct::PolynomialDegree),
+        "a single term past the degree cap must refuse, naming the degree cap"
+    );
+    let level = Monomial::new(1, [(var("x"), MAX_DEGREE)]).expect("exponents do not overflow");
+    assert!(
+        Polynomial::from_monomials([level]).is_ok(),
+        "a term exactly at the degree cap is representable"
+    );
+}
+
+/// **`multiply` checks the term count *before* forming the products.**
+///
+/// The doc comment claims it, and it is the difference between refusing a
+/// hostile pair of operands and materialising their product first. The claim
+/// is only observable because the two failures carry different constructs: the
+/// pre-check reports [`Construct::PolynomialSize`], whereas forming the
+/// products first would hit a coefficient overflow and report
+/// [`Construct::ArithmeticOverflow`]. Operands chosen so that the two answers
+/// disagree.
+#[test]
+fn multiply_refuses_on_size_before_it_multiplies_anything() {
+    let saturated = |count: usize, prefix: &str| -> Polynomial {
+        Polynomial::from_monomials(
+            (0..count).map(|index| Monomial::linear(i64::MAX, var(&format!("{prefix}{index}")))),
+        )
+        .expect("well inside both caps")
+    };
+
+    // 17 * 16 = 272 pairs, past MAX_MONOMIALS; every individual product would
+    // overflow, so the *reported* construct says which check ran first.
+    let left = saturated(17, "l");
+    let right = saturated(16, "r");
+    assert_eq!(
+        left.multiply(&right),
+        Err(Construct::PolynomialSize),
+        "the size cap must be reached before any product is formed"
+    );
+
+    // 16 * 16 = 256 pairs, exactly the cap: representable, and formed. The
+    // coefficients are 1 here so the arithmetic cannot be what refuses.
+    let ones = |count: usize, prefix: &str| -> Polynomial {
+        Polynomial::from_monomials(
+            (0..count).map(|index| Monomial::linear(1, var(&format!("{prefix}{index}")))),
+        )
+        .expect("well inside both caps")
+    };
+    let product = ones(16, "a")
+        .multiply(&ones(16, "b"))
+        .expect("a product landing exactly on the term cap is representable");
+    assert_eq!(
+        product.monomials().len(),
+        MAX_MONOMIALS,
+        "16 distinct terms times 16 distinct terms is 256 distinct terms"
+    );
+}
+
+/// **Rendering: the sign of a term that is not the first, and the `*` between
+/// two variables of an implicit-coefficient term.**
+///
+/// `polynomial_rendering_is_pinned` covers a leading negative (`-4 + x`) and a
+/// single power (`x^2`). Neither reaches the two branches below, and mutation
+/// testing said so: the comparison choosing `" - "` from `" + "` for a
+/// *non-leading* term, and the one that decides whether a `*` separates two
+/// variables of a coefficient-1 term, both survived.
+///
+/// A dropped `*` is not a cosmetic defect — `x*y` and `xy` are different
+/// variables to a reader and to any parser downstream of this crate — and a
+/// dropped minus sign renders a subtraction as an addition.
+#[test]
+fn polynomial_rendering_separates_signs_and_factors() {
+    let difference = Polynomial::var(var("x"))
+        .sub(&Polynomial::var(var("y")))
+        .expect("in range");
+    assert_eq!(
+        difference.to_string(),
+        "x - y",
+        "a negative term after the first must render as a subtraction"
+    );
+
+    let sum = Polynomial::var(var("x"))
+        .add(&Polynomial::var(var("y")))
+        .expect("in range");
+    assert_eq!(
+        sum.to_string(),
+        "x + y",
+        "and a positive one as an addition"
+    );
+    assert_ne!(
+        difference.to_string(),
+        sum.to_string(),
+        "`x - y` and `x + y` must not render alike"
+    );
+
+    let product = Polynomial::var(var("x"))
+        .multiply(&Polynomial::var(var("y")))
+        .expect("in range");
+    assert_eq!(
+        product.to_string(),
+        "x*y",
+        "two variables in one term must be separated, not run together"
+    );
+
+    let three = Polynomial::from_monomials([Monomial::new(
+        1,
+        [(var("x"), 2), (var("y"), 1), (var("z"), 1)],
+    )
+    .expect("in range")])
+    .expect("in range");
+    assert_eq!(
+        three.to_string(),
+        "x^2*y*z",
+        "every factor after the first takes a separator, exponent or not"
+    );
+
+    // With an explicit coefficient the separator appears before the *first*
+    // factor too, which is the other side of the same branch.
+    let scaled = Polynomial::from_monomials([
+        Monomial::new(3, [(var("x"), 1), (var("y"), 1)]).expect("in range")
+    ])
+    .expect("in range");
+    assert_eq!(scaled.to_string(), "3*x*y");
+}
+
+/// What separates two assignments in an update's rendering.
+const SEPARATOR: &str = ", ";
+
+/// **An update renders as a comma-separated simultaneous assignment.**
+///
+/// `an_update_reports_what_it_writes` pins the *identity* rendering ("skip")
+/// and every accessor, but never renders an update with two assignments in it
+/// — so the comparison that decides where the separator goes was unobserved,
+/// and survived being changed three ways. Running `x := y` into `y := x` with
+/// no separator, or emitting a leading one, produces text a reader has to
+/// guess at.
+#[test]
+fn update_rendering_separates_its_assignments() {
+    let single = Update::new([(var("x"), Polynomial::var(var("y")))]);
+    let rendered = single.to_string();
+    assert_eq!(rendered, "x := y");
+    assert!(
+        !rendered.starts_with(SEPARATOR),
+        "a single assignment must not be preceded by a separator: {rendered:?}"
+    );
+
+    let pair = Update::new([
+        (var("x"), Polynomial::var(var("y"))),
+        (var("y"), Polynomial::var(var("x"))),
+    ]);
+    let rendered = pair.to_string();
+    assert_eq!(
+        rendered, "x := y, y := x",
+        "two assignments take exactly one separator, between them"
+    );
+    assert_eq!(
+        rendered.matches(SEPARATOR).count(),
+        1,
+        "n assignments take n-1 separators: {rendered:?}"
+    );
+
+    let three = Update::new([
+        (var("x"), Polynomial::constant(1)),
+        (var("y"), Polynomial::constant(2)),
+        (var("z"), Polynomial::constant(3)),
+    ]);
+    assert_eq!(three.to_string(), "x := 1, y := 2, z := 3");
+}
+
+/// **A polynomial never carries a zero coefficient**, which is what makes four
+/// surviving mutants genuinely equivalent rather than untested.
+///
+/// Both [`Polynomial`]'s `Display` and `koat::render_polynomial` choose a sign
+/// with `coefficient < 0`. Swapping that for `<= 0` survives mutation testing,
+/// and it survives because the two agree on every input the function can
+/// receive: a zero coefficient is dropped on construction and cancelled on
+/// collection, so it never reaches the comparison. `koat.rs` says as much in a
+/// comment; this test is the executable half of that claim.
+///
+/// It is worth having as a test rather than a note because the equivalence is
+/// **contingent**. Make a zero coefficient representable — a constructor that
+/// skips normalisation, a `with_coefficient(0)` that survives into a
+/// polynomial — and those mutants stop being equivalent, silently. Then this
+/// fails, and the note is no longer true.
+#[test]
+fn no_polynomial_can_carry_a_zero_coefficient() {
+    let zeroed = Polynomial::from_monomials([
+        Monomial::linear(0, var("x")),
+        Monomial::constant(0),
+        Monomial::linear(5, var("y")),
+    ])
+    .expect("in range");
+    assert_eq!(
+        zeroed.monomials().len(),
+        1,
+        "zero coefficients must be dropped on construction: {zeroed}"
+    );
+
+    let cancelled = Polynomial::var(var("x"))
+        .sub(&Polynomial::var(var("x")))
+        .expect("in range");
+    assert!(
+        cancelled.is_zero(),
+        "x - x must collect to the zero polynomial, not to a zero term"
+    );
+    assert!(cancelled.monomials().is_empty());
+
+    assert_eq!(Polynomial::constant(0), Polynomial::zero());
+    assert!(Polynomial::constant(0).monomials().is_empty());
+
+    // The invariant, over every polynomial the constructors can reach.
+    let built = [
+        Polynomial::zero(),
+        Polynomial::constant(-7),
+        Polynomial::var(var("x")),
+        zeroed,
+        cancelled,
+        Polynomial::var(var("x"))
+            .multiply(&Polynomial::var(var("y")))
+            .expect("in range"),
+        Polynomial::var(var("x")).power(3).expect("in range"),
+    ];
+    for polynomial in &built {
+        for term in polynomial.monomials() {
+            assert_ne!(
+                term.coefficient(),
+                0,
+                "{polynomial} carries a zero coefficient, which makes the sign \
+                 comparisons in Display and koat::render_polynomial reachable at zero"
+            );
+        }
+    }
+}
+
+/// **The identity update and the default update are the same value**, which is
+/// why `Update::identity -> Default::default()` survives mutation.
+///
+/// Recorded rather than chased. The two are required to agree — a `Default`
+/// that differed from the identity would mean `Update::default()` silently
+/// wrote something — so no test can separate them, and the surviving mutant is
+/// the correct outcome rather than a gap.
+#[test]
+fn the_identity_update_is_the_default_update() {
+    assert_eq!(Update::identity(), Update::default());
+    assert!(Update::default().is_identity());
+    assert_eq!(Update::default().assignments().len(), 0);
+    assert_eq!(
+        Update::identity().to_string(),
+        Update::default().to_string()
+    );
 }
