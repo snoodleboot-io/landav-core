@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use landav_bound::Origin;
 use landav_its::{ArithOp, CompareOp, Its, SourceProgramBuilder, VarName, lower};
-use landav_solvers::{Answer, ArgMap, Config, Solver, SolverError, Timeout, run};
+use landav_solvers::{Answer, ArgMap, Config, Report, Solver, SolverError, Timeout, run};
 
 /// Report that a test did not run, in a way the CI log keeps.
 ///
@@ -86,6 +86,74 @@ fn stub(name: &str, body: &str) -> Option<PathBuf> {
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).ok()?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).ok()?;
     Some(path)
+}
+
+/// `ETXTBSY`. Rust formats a raw OS error as `... (os error 26)`, and that
+/// suffix is Rust's own rather than the platform's `strerror`, so it is stable
+/// where the message text is not.
+const TEXT_FILE_BUSY: &str = "os error 26";
+
+/// The most attempts [`run_stub`] will make before giving up.
+///
+/// The race it works around is a fork-and-exec window measured in microseconds,
+/// so a handful of retries is generous. A bound rather than a loop because a
+/// genuinely un-executable stub must fail the test rather than hang it.
+const BUSY_ATTEMPTS: usize = 20;
+
+/// [`run`], retrying only while the stub is still held open for writing.
+///
+/// # The race
+///
+/// `stub` writes a file and then the test execs it. Meanwhile a sibling test
+/// thread forks to spawn its own solver, and that child **inherits the still-open
+/// write descriptor**. `CLOEXEC` closes it at `exec`, but the window between
+/// `fork` and `exec` is real, and a kernel asked to execute a file that some
+/// process holds open for writing refuses with `ETXTBSY`.
+///
+/// Measured at roughly one failure in seven full-suite runs. It only appears
+/// under the harness's parallelism, which is why running the test alone always
+/// passed and made it look like a flaky assertion rather than a flaky spawn.
+///
+/// # Why retry rather than remove the race
+///
+/// The obvious fixes do not work here. Renaming a freshly written file into
+/// place does not help - `ETXTBSY` is a property of the inode, which `rename`
+/// preserves. Probe-executing the stub before handing it over is worse: two of
+/// these stubs are `sleep 600` and `kill -SEGV $$`, so the probe would hang the
+/// suite or dump core. Creating every stub up front narrows the window but
+/// cannot close it, because the tests that spawn a real solver fork during that
+/// same burst.
+///
+/// So the race is inherent to `fork`/`exec` from a multi-threaded process and
+/// is tolerated rather than eliminated. **The retry is confined to the tests.**
+/// Putting it in `landav-solvers` would mean shipping a workaround for a
+/// condition users effectively never meet, in the crate whose job is to report
+/// spawn failures faithfully.
+///
+/// Only `ETXTBSY` is retried. Every other spawn failure - a missing binary
+/// above all - is returned on the first attempt, so the tests that assert on
+/// those still see them immediately.
+#[cfg(unix)]
+fn run_stub(solver: Solver, its: &Its, config: &Config) -> Result<Report, SolverError> {
+    for attempt in 1..=BUSY_ATTEMPTS {
+        let outcome = run(solver, its, config);
+        let busy = matches!(
+            &outcome,
+            Err(SolverError::Spawn { detail, .. }) if detail.contains(TEXT_FILE_BUSY)
+        );
+        if !busy {
+            return outcome;
+        }
+        assert!(
+            attempt < BUSY_ATTEMPTS,
+            "the stub was still held open for writing after {BUSY_ATTEMPTS} attempts, \
+             which is far longer than the fork-and-exec window this works around. \
+             Something is holding the file open, and that is a real defect rather \
+             than the race: {outcome:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    unreachable!("the loop returns or asserts on its final attempt")
 }
 
 /// `def countdown(n): i = 0; while i < n: i = i + 1`, and optionally a leading
@@ -195,7 +263,7 @@ fn a_solver_that_never_finishes_is_killed_at_the_deadline() {
         .with_timeout(timeout);
 
     let started = std::time::Instant::now();
-    let failed = run(Solver::Koat, &its, &config);
+    let failed = run_stub(Solver::Koat, &its, &config);
     let elapsed = started.elapsed();
 
     assert!(
@@ -220,7 +288,7 @@ fn a_solver_that_dies_on_a_signal_is_reported_rather_than_propagated() {
         panic!("the countdown fragment must lower");
     };
     let config = Config::default().with_program(Solver::Koat, &script);
-    let failed = run(Solver::Koat, &its, &config);
+    let failed = run_stub(Solver::Koat, &its, &config);
     assert!(
         matches!(failed, Err(SolverError::Killed { .. })),
         "a signalled child must be Killed, got {failed:?}"
@@ -248,7 +316,7 @@ fn a_solver_that_exits_non_zero_reports_its_status_and_its_complaint() {
         panic!("the countdown fragment must lower");
     };
     let config = Config::default().with_program(Solver::Koat, &script);
-    let failed = run(Solver::Koat, &its, &config);
+    let failed = run_stub(Solver::Koat, &its, &config);
     let Err(SolverError::Failed { status, detail, .. }) = failed else {
         panic!("a non-zero exit must be Failed, got {failed:?}");
     };
@@ -272,7 +340,7 @@ fn a_solver_that_says_nothing_is_not_treated_as_an_answer() {
         panic!("the countdown fragment must lower");
     };
     let config = Config::default().with_program(Solver::Koat, &script);
-    let failed = run(Solver::Koat, &its, &config);
+    let failed = run_stub(Solver::Koat, &its, &config);
     assert!(
         matches!(failed, Err(SolverError::NoAnswer { .. })),
         "silence is not a bound, got {failed:?}"
@@ -295,7 +363,7 @@ fn the_system_reaches_the_solver_as_a_file_named_on_the_command_line() {
     let config = Config::default().with_program(Solver::Koat, &script);
     // The stub prints the ITS rather than a bound, so the parse fails — but it
     // fails *quoting what it read*, which is the assertion.
-    let failed = run(Solver::Koat, &its, &config);
+    let failed = run_stub(Solver::Koat, &its, &config);
     let message = failed.err().map(|e| e.to_string()).unwrap_or_default();
     assert!(
         message.contains("GOAL COMPLEXITY") || message.contains("STARTTERM"),
@@ -495,5 +563,65 @@ fn a_program_may_be_named_or_given_as_a_path() {
         overridden.program(Solver::Koat),
         Path::new("koat2"),
         "overriding one program must not move the other"
+    );
+}
+
+/// The retry above is a workaround for a race that is, by nature, hard to
+/// reproduce on demand - it was measured at roughly one full-suite run in
+/// seven, and it stops appearing entirely when the machine is quiet. A fix for
+/// a defect that will not reproduce is a fix nobody can check.
+///
+/// So the condition is created deliberately rather than waited for. Holding the
+/// stub open for writing is exactly what a forked sibling's inherited
+/// descriptor does, and the kernel refuses to execute it for the same reason.
+///
+/// This asserts two things the timing-based runs cannot: that `ETXTBSY`
+/// **does** reach this crate as a `Spawn` error carrying the OS detail, and
+/// that [`run_stub`] recovers once the descriptor is released.
+#[cfg(unix)]
+#[test]
+fn the_busy_retry_recovers_from_a_deliberately_held_descriptor() {
+    let Some(script) = stub("held.sh", "exit 0") else {
+        panic!("the stub script must be writable");
+    };
+    let Some(its) = countdown(false) else {
+        panic!("the countdown fragment must lower");
+    };
+    let config = Config::default().with_program(Solver::Koat, &script);
+
+    // First, prove the condition is real: while a write handle is open, the
+    // spawn must fail with exactly the error the retry keys on. Without this
+    // the test below could pass because nothing was ever busy.
+    let holder = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .expect("the stub must be re-openable for writing");
+    let blocked = run(Solver::Koat, &its, &config);
+    let Err(SolverError::Spawn { detail, .. }) = &blocked else {
+        drop(holder);
+        panic!(
+            "holding a write descriptor must make the spawn fail, got {blocked:?}. \
+             If this platform no longer refuses, the retry is dead code and should go."
+        );
+    };
+    assert!(
+        detail.contains(TEXT_FILE_BUSY),
+        "the busy condition must arrive as `{TEXT_FILE_BUSY}`, or the retry keys \
+         on the wrong thing and will never fire: {detail:?}"
+    );
+
+    // Now release it on a timer and confirm the retry rides it out. The delay
+    // is comfortably inside the retry budget and comfortably longer than one
+    // attempt, so a `run` without the retry would still be blocked.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        drop(holder);
+    });
+
+    let recovered = run_stub(Solver::Koat, &its, &config);
+    assert!(
+        matches!(recovered, Err(SolverError::NoAnswer { .. })),
+        "once the descriptor is released the stub should run and say nothing, \
+         which is `NoAnswer`; got {recovered:?}"
     );
 }
