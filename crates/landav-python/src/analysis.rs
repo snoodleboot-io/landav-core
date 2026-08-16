@@ -152,8 +152,16 @@ pub fn analyze_module(path: &Path, source: &str) -> Result<ModuleAnalysis, Pytho
     analyze_module_with(path, source, &[])
 }
 
-/// The analysis proper, before any waiver has been consulted.
-fn analyze_raw(path: &Path, source: &str) -> Result<ModuleAnalysis, PythonError> {
+/// Parses `source`, applying the depth guard to the bytes first.
+///
+/// Shared by the rule engine and by [`crate::lowering`], because the guard is
+/// not optional for either: the parser is recursive-descent, so nesting depth
+/// is stack depth, and this crate reads untrusted Python. A stack overflow is
+/// an abort that takes the blame path with it.
+pub(crate) fn parse_guarded(
+    path: &Path,
+    source: &str,
+) -> Result<(Vec<ast::Stmt>, LineIndex), PythonError> {
     let index = LineIndex::new(source);
 
     if let Some(offset) = nesting_overflow(source) {
@@ -178,6 +186,13 @@ fn analyze_raw(path: &Path, source: &str) -> Result<ModuleAnalysis, PythonError>
             detail: error.error.to_string(),
         }
     })?;
+
+    Ok((module, index))
+}
+
+/// The analysis proper, before any waiver has been consulted.
+fn analyze_raw(path: &Path, source: &str) -> Result<ModuleAnalysis, PythonError> {
+    let (module, index) = parse_guarded(path, source)?;
 
     let analysis = Analysis {
         path,

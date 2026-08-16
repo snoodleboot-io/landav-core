@@ -88,6 +88,8 @@
 pub mod analysis;
 pub mod finding;
 pub mod location;
+pub mod lowered_function;
+pub mod lowering;
 pub mod python_error;
 pub mod registry;
 pub mod rule;
@@ -111,6 +113,8 @@ pub use crate::{
     analysis::{ModuleAnalysis, analyze_module, analyze_module_with, analyze_source},
     finding::Finding,
     location::Location,
+    lowered_function::LoweredFunction,
+    lowering::lower_module,
     python_error::PythonError,
     registry::{RETIRED_CODES, is_retired_code, registry, rule, rule_for_code},
     rule::Rule,

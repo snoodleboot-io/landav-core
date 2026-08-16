@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc da0def304617dc564362cdde10c889cd6fe585643e94af5819b4c34cd6fcd551 # shrinks to stop = 1, interference = [0], initial = {"n": 0}
+cc f48f7473d780f29aa1dfe6c33170ae25bb67e364bc77085b24df24bc4d862670 # shrinks to body = [Assign { target: 1, value: Bin(Add, Int(0), Int(2)) }, While { trips: 3, body: [For { target: 0, start: Int(3), stop: Int(-2), step: -1, body: [Assign { target: 1, value: Neg(Bin(Mul, Var(1), Var(1))) }] }] }], initial = {"n": 0}

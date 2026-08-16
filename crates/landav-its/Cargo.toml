@@ -12,5 +12,12 @@ authors.workspace = true
 landav-bound = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true
+
+[[test]]
+name = "properties"
+path = "tests/properties/main.rs"

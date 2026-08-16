@@ -471,6 +471,7 @@ name = "landav-its"
 version = "0.0.0"
 dependencies = [
  "landav-bound",
+ "proptest",
  "thiserror 2.0.20",
 ]
 
