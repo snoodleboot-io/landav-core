@@ -5,6 +5,7 @@ members = [
     "crates/landav-calibrate",
     "crates/landav-its",
     "crates/landav-solvers",
+    "crates/landav-engine",
     "crates/landav-fdk",
     "crates/landav-python",
     "crates/landav-cli",
@@ -22,6 +23,7 @@ authors = ["Landav contributors"]
 [workspace.dependencies]
 landav-bound = { path = "crates/landav-bound", version = "0.0.0" }
 landav-calibrate = { path = "crates/landav-calibrate", version = "0.0.0" }
+landav-engine = { path = "crates/landav-engine", version = "0.0.0" }
 landav-fdk = { path = "crates/landav-fdk", version = "0.0.0" }
 landav-its = { path = "crates/landav-its", version = "0.0.0" }
 landav-solvers = { path = "crates/landav-solvers", version = "0.0.0" }
