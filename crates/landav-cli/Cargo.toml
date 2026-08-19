@@ -27,6 +27,10 @@ landav-engine = { workspace = true }
 landav-solvers = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+# Derives the machine-readable run shape in `machine.rs`. `serde_json` alone
+# would mean hand-building every value, which is exactly where a field quietly
+# stops matching its documentation.
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 # Configuration is read from `pyproject.toml`, which is TOML, so a TOML reader

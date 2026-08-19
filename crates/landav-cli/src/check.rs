@@ -100,6 +100,7 @@ use landav_python::{ModuleAnalysis, PythonError, Suppression, SuppressionStatus}
 
 use crate::config::{self, Config};
 use crate::diagnostic::ToolError;
+use crate::machine;
 use crate::outcome::Outcome;
 use crate::sources::Target;
 
@@ -110,8 +111,9 @@ pub fn run(
     resource: Option<ResourceKind>,
     coverage: bool,
     bounds: bool,
+    json: bool,
 ) -> Outcome {
-    match analyse(target, explicit_config, resource, coverage, bounds) {
+    match analyse(target, explicit_config, resource, coverage, bounds, json) {
         Ok(outcome) => outcome,
         Err(error) => {
             report_failure(&error);
@@ -127,6 +129,7 @@ fn analyse(
     resource: Option<ResourceKind>,
     detail: bool,
     bounds: bool,
+    json: bool,
 ) -> Result<Outcome, ToolError> {
     let config = config::load(target, explicit_config)?;
     let (kind, mut walk) = crate::sources::collect(target)?;
@@ -136,7 +139,12 @@ fn analyse(
     let mut statements = 0usize;
     let mut waived = Tally::default();
     let mut coverage = Coverage::new();
-    let mut report = Report::new(std::io::stdout().lock());
+    // Structured output is built alongside the text rather than instead of it,
+    // so the two cannot disagree about what the run found. In JSON mode the
+    // text is withheld at the point of writing, not skipped at the point of
+    // computing - a second code path would be a second thing to keep correct.
+    let mut collected = json.then(machine::Collector::default);
+    let mut report = Report::new_gated(std::io::stdout().lock(), !json);
 
     for path in &walk.sources {
         // A file that could not be read is recorded and the walk continues, so
@@ -153,15 +161,22 @@ fn analyse(
             Ok(module) => {
                 statements += module.statements();
                 findings += module.findings().len();
+                if let Some(sink) = collected.as_mut() {
+                    sink.absorb_findings(&module);
+                }
                 publish(&mut report, &module);
                 waived.absorb(&mut report, &module);
                 // Only for a file that parsed. A file the frontend could not
                 // read offered no function to lower, and counting it as a
                 // refused construct would file a parser limitation under a
                 // language construct nobody wrote.
-                if let Err(problem) =
-                    accumulate(path, &text, &mut coverage, bounds.then_some(&mut report))
-                {
+                if let Err(problem) = accumulate(
+                    path,
+                    &text,
+                    &mut coverage,
+                    bounds.then_some(&mut report),
+                    collected.as_mut(),
+                ) {
                     walk.problems.push(problem);
                 }
             }
@@ -172,6 +187,12 @@ fn analyse(
                 ..
             }) => {
                 inconclusive += 1;
+                if let Some(sink) = collected.as_mut() {
+                    sink.problem(
+                        Some(path.display().to_string()),
+                        format!("unreadable as Python at {line}:{column}: {detail}"),
+                    );
+                }
                 report.line(format_args!(
                     "{}:{line}:{column}: inconclusive: unreadable-source: the frontend \
                      could not read this file as Python ({detail}), so no bound was \
@@ -238,7 +259,7 @@ fn analyse(
         walk.problems.push(problem);
     }
 
-    let outcome = if walk.problems.is_empty() {
+    let mut outcome = if walk.problems.is_empty() {
         classify(
             kind,
             walk.sources.len(),
@@ -251,6 +272,42 @@ fn analyse(
     } else {
         Outcome::Failed
     };
+
+    if let Some(sink) = collected {
+        // Emitted after the outcome is decided, so the JSON can carry the same
+        // verdict the exit code does. A consumer must never have to infer one
+        // from the other.
+        let run = sink.finish(
+            outcome,
+            machine::Summary {
+                files_analysed: walk.sources.len(),
+                statements,
+                functions: coverage.units(),
+                lowered: coverage.lowered(),
+                coverage_percent: coverage.percent(),
+                refusals: coverage.refusals(),
+                findings,
+                suppressed: waived.suppressed(),
+                stale_waivers: waived.stale(),
+            },
+            &walk.problems,
+        );
+        match serde_json::to_string_pretty(&run) {
+            Ok(text) => println!("{text}"),
+            Err(why) => {
+                // A consumer that asked for JSON and received nothing must not
+                // read the silence as a clean run. The verdict is overridden
+                // here rather than only recorded, because it has already been
+                // decided by this point and a problem pushed now would not
+                // reach it.
+                walk.problems.push(ToolError::at_path(
+                    target,
+                    format!("could not render the run as JSON: {why}"),
+                ));
+                outcome = Outcome::Failed;
+            }
+        }
+    }
 
     // Sorted, so that identical input produces identical stderr whatever order
     // the filesystem handed the entries back in.
@@ -295,6 +352,18 @@ struct Tally {
     stale: usize,
     /// Findings credited to each `(pattern, rule code)`.
     credited: BTreeMap<(String, String), usize>,
+}
+
+impl Tally {
+    /// Findings removed by a waiver.
+    const fn suppressed(&self) -> usize {
+        self.suppressed
+    }
+
+    /// Waivers that removed nothing.
+    const fn stale(&self) -> usize {
+        self.stale
+    }
 }
 
 impl Tally {
@@ -417,6 +486,13 @@ fn describe(record: &Suppression) -> String {
 /// from [`Report::finish`], because an exit code describing findings the
 /// operator never saw is a code that describes nothing they can act on.
 struct Report<W: std::io::Write> {
+    /// Whether anything is actually written.
+    ///
+    /// A JSON run still walks every line the text run would, and discards
+    /// them here. Withholding at the point of *writing* rather than skipping
+    /// at the point of *computing* means there is one code path deciding what
+    /// a run found, so the two formats cannot come to different conclusions.
+    writing: bool,
     /// Where the report goes.
     out: W,
     /// The first write failure, if any. Later writes are skipped: a stream
@@ -427,12 +503,20 @@ struct Report<W: std::io::Write> {
 
 impl<W: std::io::Write> Report<W> {
     /// A report over `out`, with nothing written and nothing failed.
-    const fn new(out: W) -> Self {
-        Self { out, failure: None }
+    /// A report that writes only when `writing`.
+    const fn new_gated(out: W, writing: bool) -> Self {
+        Self {
+            writing,
+            out,
+            failure: None,
+        }
     }
 
     /// Write one record, terminated by a newline.
     fn line(&mut self, args: std::fmt::Arguments<'_>) {
+        if !self.writing {
+            return;
+        }
         if self.failure.is_some() {
             return;
         }
@@ -609,6 +693,7 @@ fn accumulate<W: std::io::Write>(
     text: &str,
     coverage: &mut Coverage,
     mut bounds: Option<&mut Report<W>>,
+    mut collected: Option<&mut machine::Collector>,
 ) -> Result<(), ToolError> {
     let functions = landav_python::lower_module(path, text).map_err(|error| {
         ToolError::at_path(
@@ -630,6 +715,9 @@ fn accumulate<W: std::io::Write>(
                 "{}",
                 describe_bound(function, lowered.is_ok())
             ));
+        }
+        if let Some(sink) = collected.as_deref_mut() {
+            sink.absorb_function(function, lowered.as_ref().map(|_| ()));
         }
         coverage.record(lowered.as_ref());
     }
@@ -895,7 +983,7 @@ mod tests {
     /// than handing back a code that describes output nobody received.
     #[test]
     fn a_report_that_could_not_be_written_carries_blame() {
-        let mut report = Report::new(BrokenPipe);
+        let mut report = Report::new_gated(BrokenPipe, true);
         report.line(format_args!("a finding nobody will see"));
         let blame = report.finish().map(|error| error.to_string());
         assert!(
@@ -909,7 +997,7 @@ mod tests {
     /// A report that was delivered in full is not a failure.
     #[test]
     fn a_report_that_was_written_reports_no_problem() {
-        let mut report = Report::new(Vec::new());
+        let mut report = Report::new_gated(Vec::new(), true);
         report.line(format_args!("delivered"));
         assert!(report.finish().is_none());
     }

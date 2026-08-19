@@ -58,6 +58,25 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// A stable name for machine-readable output.
+    ///
+    /// Deliberately not `Debug`: a derived representation is a rendering
+    /// detail that a refactor may change, and this is a value consumers branch
+    /// on. Spelled out so that renaming a variant is a visible decision here
+    /// rather than a silent break in someone's CI gate.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Findings => "findings",
+            Self::Inconclusive => "inconclusive",
+            Self::NothingAnalysed => "nothing-analysed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl Outcome {
     /// The process exit code for this outcome.
     ///
     /// **Total, and deliberately written with one arm per variant and no

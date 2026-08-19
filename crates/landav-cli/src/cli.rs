@@ -128,6 +128,24 @@ struct CheckArgs {
                      installed."
     )]
     bounds: bool,
+
+    /// Emit the run as JSON instead of prose.
+    ///
+    /// For a CI gate or an agent. Text stays the default: a person at a
+    /// terminal must not get a wall of JSON for asking a simple question.
+    #[arg(
+        long,
+        long_help = "Emit the run as JSON on stdout instead of prose.\n\n\
+                     Everything the run concluded, structured: per function the bound, \
+                     whether it is exact, the regions that were not derived, and every \
+                     refused construct with a position. Diagnostics stay on stderr, so \
+                     `landav check . --json | jq` works without filtering.\n\n\
+                     The exit code still carries the verdict, and the JSON repeats it, \
+                     so a gate can branch on either without parsing the other.\n\n\
+                     The shape carries a schema version. Fields may be added without a \
+                     bump; a field changing meaning or disappearing is a bump."
+    )]
+    json: bool,
 }
 
 /// Parse `argv` and run, returning the outcome to be mapped to an exit code.
@@ -143,6 +161,7 @@ pub fn dispatch() -> Outcome {
                 args.resource,
                 args.coverage,
                 args.bounds,
+                args.json,
             ),
         },
         Err(error) => usage(&error),
