@@ -38,6 +38,7 @@ mod check;
 mod cli;
 mod config;
 mod diagnostic;
+mod machine;
 mod outcome;
 mod resource;
 mod sources;
