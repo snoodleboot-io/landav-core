@@ -106,14 +106,23 @@ use crate::sources::Target;
 
 /// Run `check` over `target`, reporting to stdout and stderr.
 pub fn run(
-    target: &Path,
+    target: Option<&Path>,
+    stdin_name: Option<&str>,
     explicit_config: Option<&Path>,
     resource: Option<ResourceKind>,
     coverage: bool,
     bounds: bool,
     json: bool,
 ) -> Outcome {
-    match analyse(target, explicit_config, resource, coverage, bounds, json) {
+    match analyse(
+        target,
+        stdin_name,
+        explicit_config,
+        resource,
+        coverage,
+        bounds,
+        json,
+    ) {
         Ok(outcome) => outcome,
         Err(error) => {
             report_failure(&error);
@@ -124,15 +133,46 @@ pub fn run(
 
 /// The run proper. Every failure is a [`ToolError`] carrying blame.
 fn analyse(
-    target: &Path,
+    target: Option<&Path>,
+    stdin_name: Option<&str>,
     explicit_config: Option<&Path>,
     resource: Option<ResourceKind>,
     detail: bool,
     bounds: bool,
     json: bool,
 ) -> Result<Outcome, ToolError> {
-    let config = config::load(target, explicit_config)?;
-    let (kind, mut walk) = crate::sources::collect(target)?;
+    // Two different notions of "where", deliberately separated. Configuration
+    // is discovered from the working directory when there is no path, because
+    // a caller piping a snippet is still working inside a project and should
+    // get that project's rules. What the run *reports* itself as having
+    // analysed is the snippet's name, because telling a user the run covered
+    // `.` when it read one buffer would be a claim about a whole tree.
+    let anchor = target.unwrap_or_else(|| Path::new("."));
+    let config = config::load(anchor, explicit_config)?;
+
+    // Source read once, before the walk, so a failure to read it is a tool
+    // error rather than a file that mysteriously vanished mid-run.
+    let piped = match stdin_name {
+        Some(name) => Some((name.to_owned(), read_stdin(name)?)),
+        None => None,
+    };
+
+    let reported_as = stdin_name.map_or(anchor, Path::new);
+
+    let (kind, mut walk) = match piped.as_ref() {
+        // One synthetic unit. Everything downstream - parsing, waivers,
+        // coverage, the verdict - treats it exactly as it treats a file, which
+        // is the point: a snippet must not take a second code path that can
+        // drift from the first.
+        Some((name, _)) => (
+            crate::sources::Target::File,
+            crate::sources::Walk {
+                sources: vec![std::path::PathBuf::from(name)],
+                problems: Vec::new(),
+            },
+        ),
+        None => crate::sources::collect(anchor)?,
+    };
 
     let mut findings = 0usize;
     let mut inconclusive = 0usize;
@@ -150,12 +190,15 @@ fn analyse(
         // A file that could not be read is recorded and the walk continues, so
         // that one run names every path it could not look at rather than one
         // per invocation.
-        let text = match read_source(path) {
-            Ok(text) => text,
-            Err(problem) => {
-                walk.problems.push(problem);
-                continue;
-            }
+        let text = match piped.as_ref() {
+            Some((_, text)) => text.clone(),
+            None => match read_source(path) {
+                Ok(text) => text,
+                Err(problem) => {
+                    walk.problems.push(problem);
+                    continue;
+                }
+            },
         };
         match landav_python::analyze_module_with(path, &text, config.waivers()) {
             Ok(module) => {
@@ -236,7 +279,7 @@ fn analyse(
 
     summarise(
         &mut report,
-        target,
+        reported_as,
         &config,
         &walk.sources,
         findings,
@@ -301,7 +344,7 @@ fn analyse(
                 // decided by this point and a problem pushed now would not
                 // reach it.
                 walk.problems.push(ToolError::at_path(
-                    target,
+                    anchor,
                     format!("could not render the run as JSON: {why}"),
                 ));
                 outcome = Outcome::Failed;
@@ -316,7 +359,7 @@ fn analyse(
         report_failure(problem);
     }
     if outcome == Outcome::NothingAnalysed {
-        report_failure(&nothing_to_analyse(target, walk.sources.len()));
+        report_failure(&nothing_to_analyse(reported_as, walk.sources.len()));
     }
     Ok(outcome)
 }
@@ -924,6 +967,38 @@ fn plural(count: usize, noun: &str) -> String {
     } else {
         format!("{count} {noun}s")
     }
+}
+
+/// Read Python source from standard input.
+///
+/// # Why empty input is a failure rather than a clean run
+///
+/// A caller that piped nothing - a broken shell pipeline, a variable that
+/// expanded to nothing, an editor sending an unsaved buffer - would otherwise
+/// get a green run that analysed no code at all. That is the same failure
+/// [`nothing_to_analyse`] exists to prevent for a directory that stopped
+/// matching, and it is worse here because there is no path to go and inspect.
+///
+/// Whitespace-only counts as empty. It parses as a valid module with no
+/// statements, so it would otherwise be indistinguishable from a successful
+/// analysis of nothing.
+fn read_stdin(name: &str) -> Result<String, ToolError> {
+    use std::io::Read as _;
+
+    let mut text = String::new();
+    std::io::stdin()
+        .read_to_string(&mut text)
+        .map_err(|err| ToolError::at_path(Path::new(name), format!("cannot be read: {err}")))?;
+
+    if text.trim().is_empty() {
+        return Err(ToolError::at_path(
+            Path::new(name),
+            "was empty, so the run analysed no code at all; a caller that meant to \
+             send source is looking at a broken pipeline rather than a clean result"
+                .to_owned(),
+        ));
+    }
+    Ok(text)
 }
 
 /// Read a source file, blaming it for anything that stops the bytes arriving.

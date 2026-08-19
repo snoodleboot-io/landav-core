@@ -294,6 +294,46 @@ impl Project {
     /// Run the binary with `args`, with the project root as the working
     /// directory so that configuration discovery has somewhere to discover
     /// from regardless of whether it walks up from the target path or the cwd.
+    /// `landav <args>`, with `source` piped to standard input.
+    ///
+    /// Written out rather than folded into [`Project::run`] with an
+    /// `Option<&str>`, because every existing caller would then have to say
+    /// "no stdin" at a call site that has nothing to do with stdin.
+    pub fn run_with_stdin(&self, args: &[&str], source: &str) -> io::Result<Run> {
+        use std::io::Write as _;
+
+        let mut child = Command::new(BIN)
+            .args(args)
+            .current_dir(self.dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        // Dropped before `wait_with_output`, or the child waits for an EOF that
+        // never comes and the test hangs rather than fails.
+        //
+        // Handled rather than unwrapped: this module is included by test crates
+        // that do not all relax the panic lints, and a hang here would be much
+        // harder to diagnose than a returned error.
+        match child.stdin.take() {
+            Some(mut pipe) => pipe.write_all(source.as_bytes())?,
+            None => {
+                return Err(io::Error::other(
+                    "stdin was requested as a pipe but the child did not provide one",
+                ));
+            }
+        }
+
+        let output = child.wait_with_output()?;
+        Ok(Run {
+            code: output.status.code().unwrap_or(KILLED_BY_SIGNAL),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+        })
+    }
+
     pub fn run(&self, args: &[&str]) -> io::Result<Run> {
         let output = Command::new(BIN)
             .args(args)
