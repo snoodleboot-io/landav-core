@@ -13,8 +13,32 @@
 //!
 //! The ITS export cannot represent containers or heap effects. That is what the
 //! Landav IR (`F-009`, R1) is for; this crate deliberately handles only the
-//! fragment KoAT can already reason about, which is how R0 produces real bounds
-//! within weeks.
+//! fragment KoAT can already reason about, which is how R0 produces bounds at
+//! all within weeks.
+//!
+//! # How much real code this reaches: almost none
+//!
+//! Measured, not estimated. Across five corpora and ~26,800 functions — the
+//! Python 3.12 standard library, a typed application backend with its vendored
+//! dependencies, that backend's own source, numpy, and an HPC teaching suite —
+//! **every bound derived was a constant.** Not one mentioned a parameter.
+//!
+//! | Corpus | Functions | Lowered |
+//! |---|---:|---:|
+//! | Python 3.12 stdlib | 3,057 | 14 (0.5%) |
+//! | typed backend + dependencies | 14,952 | 804 (5.4%) |
+//! | that backend's own code | 53 | 0 |
+//! | numpy | 2,906 | 25 (0.9%) |
+//! | HPC teaching suite | 5,858 | 190 (3.2%) |
+//!
+//! The functions that *do* lower are docstring-only bodies and `@overload`
+//! stubs, which is why the bounds are `0` and `1`.
+//!
+//! This crate is correct on what it accepts. What it accepts is a fragment
+//! real Python almost never sits inside, and that is a property of the
+//! fragment rather than a defect in the lowering. Anyone deciding what to
+//! build next should start from the refusal counts below rather than from how
+//! interesting a construct is.
 //!
 //! # The fragment
 //!
@@ -48,6 +72,35 @@
 //! which is what makes `LAN-68`'s coverage report possible and what stops a
 //! bare "unknown" ever reaching a user.
 //!
+//! ## Which refusals actually cost coverage
+//!
+//! Occurrences across the two largest corpora above. **These are occurrences,
+//! not functions** — one function refusing for several reasons appears in
+//! several rows — so removing the top row alone would not lower the functions
+//! beneath it.
+//!
+//! | Construct | stdlib | typed backend |
+//! |---|---:|---:|
+//! | **call** | 15,121 | 67,164 |
+//! | **non-integer-value** | 13,765 | 52,812 |
+//! | attribute | 2,397 | 12,984 |
+//! | collection | 3,033 | 11,193 |
+//! | exceptional-control-flow | 1,734 | 6,278 |
+//! | complex-assignment-target | 1,256 | 5,559 |
+//! | subscript | 1,015 | 2,804 |
+//! | declaration | 557 | 2,681 |
+//! | conditional-expression | 379 | 2,176 |
+//! | comprehension | 246 | 2,050 |
+//! | unbounded-iteration | 443 | 1,833 |
+//! | coroutine | 69 | 721 |
+//! | integer-division | 209 | — |
+//! | bitwise-operator | 166 | — |
+//! | loop-jump | 103 | — |
+//!
+//! `call` and `non-integer-value` are **72–80% of every refusal**, in both
+//! corpora, in the same order. Everything else is rounding error against them,
+//! and the two of them are what the Landav IR (`F-009`, R1) exists to address.
+//!
 //! Three of those deserve their reasoning recorded, because in each case
 //! refusing was a *choice* over an available alternative:
 //!
@@ -58,16 +111,22 @@
 //! a nondeterministic assignment to `q` guarded by `b*q <= a && a < b*q + b`,
 //! which pins `q` to the single correct value. That needs guards over the
 //! post-state, which the emitter does not yet write, so it is refused today
-//! rather than approximated. This is the most valuable single construct to add
-//! next: `while n > 1: n = n // 2` is the canonical logarithmic loop and this
-//! fragment cannot express it.
+//! rather than approximated. `while n > 1: n = n // 2` is the canonical
+//! logarithmic loop and this fragment cannot express it.
+//!
+//! This documentation previously called division "the most valuable single
+//! construct to add next". **The measurement says otherwise**: division is
+//! 209 refusals out of ~34,000, twelfth by frequency. The encoding above is
+//! worth keeping and the example is a good one; the priority claim was a guess
+//! and it was wrong.
 //!
 //! **`break` and `continue`** ([`Construct::LoopJump`]) are sound to support —
 //! a `break` is a transition to the loop's exit location and a `continue` one
 //! to its head, and the lowering already has both locations in hand. They are
 //! refused because the story's fragment did not name them and a loop-context
 //! stack is machinery this lane did not need for the KoAT worked example.
-//! Cheap to add, and the first thing to add after division.
+//! Cheap to add — and, like division, not what is holding coverage back:
+//! `loop-jump` is 103 refusals.
 //!
 //! **A symbolic loop step** ([`Construct::UnboundedIteration`]) *could* be
 //! over-approximated rather than refused: emitting the loop with no guard at
