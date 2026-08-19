@@ -44,8 +44,48 @@ enum Command {
 #[derive(Debug, Args)]
 struct CheckArgs {
     /// File or directory to analyse.
-    #[arg(value_name = "PATH")]
-    path: PathBuf,
+    ///
+    /// Omitted when `--stdin` is given, and required otherwise. Exactly one of
+    /// the two must be present: a run with neither has nothing to look at, and
+    /// a run with both would have to silently prefer one.
+    #[arg(
+        value_name = "PATH",
+        required_unless_present = "stdin",
+        conflicts_with = "stdin"
+    )]
+    path: Option<PathBuf>,
+
+    /// Read Python source from standard input instead of from a path.
+    ///
+    /// For an agent or an editor holding a block of code, which would
+    /// otherwise have to write a temporary file and invent a name for it.
+    #[arg(
+        long,
+        long_help = "Read Python source from standard input instead of from a path.\n\n\
+                     For a caller holding a block of code rather than a file - an agent, \
+                     an editor, a pre-commit hook working from a buffer. Everything \
+                     downstream behaves exactly as it does for a file: bounds, coverage, \
+                     refusals and the exit code.\n\n\
+                     This is an explicit flag rather than a guess about whether stdin is \
+                     a pipe. A tool that changes behaviour depending on how it was \
+                     invoked is hard to script against.\n\n\
+                     Positions in the output are relative to what was sent, starting at \
+                     line 1. A caller that passed an excerpt knows its own offset; \
+                     landav inventing one it was not told about would be worse."
+    )]
+    stdin: bool,
+
+    /// The name to report positions against when reading from stdin.
+    ///
+    /// Defaults to `<stdin>`, which is deliberately not a path: a name that
+    /// looks like a real file invites a reader to go and open it.
+    #[arg(
+        long,
+        value_name = "NAME",
+        requires = "stdin",
+        default_value = "<stdin>"
+    )]
+    stdin_name: String,
 
     /// Read configuration from FILE, instead of discovering `pyproject.toml`.
     ///
@@ -156,7 +196,8 @@ pub fn dispatch() -> Outcome {
     match Cli::try_parse() {
         Ok(cli) => match cli.command {
             Command::Check(args) => crate::check::run(
-                &args.path,
+                args.path.as_deref(),
+                args.stdin.then_some(args.stdin_name.as_str()),
                 args.config.as_deref(),
                 args.resource,
                 args.coverage,
