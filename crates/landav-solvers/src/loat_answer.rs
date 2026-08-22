@@ -1,5 +1,35 @@
 //! Reading LoAT's answer.
 //!
+//! # Retired: nothing in landav invokes LoAT, and nothing should
+//!
+//! **LoAT is not a dependency of this project and must not be installed as
+//! one.** It is GPL-3.0 - forced, not chosen, by a statically linked Yices 2
+//! and CLN - and landav ships an Apache-2.0 core alongside a commercial BSL
+//! offering. The decision and its reasoning are recorded in the team document
+//! *Lower bounds: build in-house - licence and patent findings*.
+//!
+//! Two further facts make this settled rather than merely cautious:
+//!
+//! * **The invocation never worked.** LoAT selects its reader by file
+//!   extension and accepts only SMT-LIB and ARI. This crate emits KoAT format,
+//!   which LoAT rejects outright. There was no working lower-bound path to
+//!   give up.
+//! * **Lower bounds come from elsewhere now.** `landav-engine` derives exact
+//!   `Theta` for the counted-loop fragment from source structure - both sides
+//!   at once, with no solver - which is a stronger result than pairing an
+//!   upper-bound solver with a lower-bound one would have produced.
+//!
+//! # Why this module is kept rather than deleted
+//!
+//! Parsing an answer is pure, and this half is correct and covered by 45
+//! tests. If an `.ari` emitter is ever written - the one thing that would make
+//! LoAT invocable at all - this is what it would need, and rewriting it from
+//! scratch would be work for no reason.
+//!
+//! So it stays as a **parser without a caller**, deliberately. It is not a
+//! recommendation, and the presence of a reader for a tool's output is not an
+//! argument for installing that tool.
+//!
 //! # A closed vocabulary, not a grammar
 //!
 //! LoAT prints the termination-competition answer format, which is a small
