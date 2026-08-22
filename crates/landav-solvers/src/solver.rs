@@ -36,7 +36,17 @@ use crate::{
 pub enum Solver {
     /// KoAT2 - upper bounds. MIT.
     Koat,
-    /// LoAT - lower bounds. **GPL-3.0**; see the type documentation.
+    /// LoAT - lower bounds. **GPL-3.0, and retired.**
+    ///
+    /// Retained so the answer parser and the licence-boundary tests still have
+    /// a subject, **not** because anything invokes it. landav does not depend
+    /// on LoAT and must not: the copyleft is forced by a statically linked
+    /// Yices 2 and CLN, and it would reach both the Apache-2.0 core and the
+    /// commercial offering beside it.
+    ///
+    /// Lower bounds come from `landav-engine`, which derives exact `Theta` for
+    /// the counted-loop fragment from source structure with no solver at all.
+    /// See [`crate::loat_answer`] for the full reasoning.
     Loat,
 }
 
