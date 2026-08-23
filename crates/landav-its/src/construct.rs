@@ -189,6 +189,56 @@ impl Construct {
         }
     }
 
+    /// Whether a region for this construct can change what a **local name** in
+    /// the frame it stands in denotes.
+    ///
+    /// # Why an attribute access and a subscript are the exception
+    ///
+    /// A region is normally the end of everything the analysis knew: it may
+    /// assign to anything, so no earlier value survives it, and that is what
+    /// `landav-engine` enforces by forgetting every readable name at one.
+    ///
+    /// `x.y` and `x[i]` do run arbitrary user code - a `property`, a
+    /// `__getitem__` - but that code executes in *its own* frame. There is no
+    /// Python expression that rebinds a local of the frame it is evaluated in
+    /// except the walrus, which is [`Construct::BindingForm`] and not this;
+    /// `global`, `nonlocal` and `del` are statements and all three are refused.
+    /// So an integer parameter still holds the value the caller passed on the
+    /// far side of `obj.field`, and a counted loop below it is still counted.
+    ///
+    /// # What it does **not** license
+    ///
+    /// Anything derived from an object's *state*. A `property` getter may call
+    /// `items.append(...)`, so a length read from `items` on entry is not that
+    /// list's length afterwards. Whether a particular name is of that kind is a
+    /// fact about the program, not about the construct, so it is recorded
+    /// there: see [`crate::SourceProgram::is_volatile`].
+    #[must_use]
+    pub const fn may_rebind_locals(self) -> bool {
+        match self {
+            Self::Attribute | Self::Subscript => false,
+            Self::NonIntegerValue
+            | Self::Call
+            | Self::Collection
+            | Self::Comprehension
+            | Self::ExceptionalControlFlow
+            | Self::LoopJump
+            | Self::UnboundedIteration
+            | Self::IntegerDivision
+            | Self::NonPolynomialPower
+            | Self::BitwiseOperator
+            | Self::Declaration
+            | Self::BindingForm
+            | Self::ComplexAssignmentTarget
+            | Self::Coroutine
+            | Self::PatternMatch
+            | Self::ConditionalExpression
+            | Self::ArithmeticOverflow
+            | Self::PolynomialDegree
+            | Self::PolynomialSize => true,
+        }
+    }
+
     /// One sentence naming what was refused, for a human reading a report.
     #[must_use]
     pub const fn describe(self) -> &'static str {

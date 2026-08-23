@@ -25,21 +25,28 @@
 //! pins the rendered list and both of its boundaries, so a message carrying one
 //! name more, or one fewer, than the registry fails.
 //!
-//! # What `--resource` can honestly do at M0, and what these tests therefore
-//! do not assert
+//! # What `--resource` can honestly do, and what these tests therefore assert
 //!
-//! Nothing in this build derives a cost bound. `landav-its` and
-//! `landav-solvers` are empty crates, and the `landav-python` pattern rules are
-//! not resource-parameterised. `--resource` therefore selects a semiring that
-//! nothing propagates through.
+//! This suite used to say "nothing in this build derives a cost bound" and test
+//! the consequence: that asking for one is inconclusive and never clean. That
+//! was true and is no longer true of the whole registry. LAN-87 turned a call
+//! into a named hole carried in the result, which made `queries` - the count of
+//! calls a function issues - derivable from a structure the engine already
+//! builds, and LAN-86 required each resource to state its own status rather
+//! than share one.
 //!
-//! There is consequently **no test here that a selected resource produces a
-//! number**, because producing one would be a fabrication. What is tested is
-//! the opposite: that asking for a bound landav cannot derive is reported as
-//! inconclusive and never as clean. A run that answered `0` — "clean under
-//! `--resource ops`" — would be a false claim about the code, and the whole
-//! point of the exit contract is that a green build is a claim somebody
-//! checked.
+//! So the assertions here are **per resource**, and neither half is spelled out
+//! in this file: the run reports, in its own machine output, whether it derived
+//! a number for the resource it was asked about, and the exit code is then
+//! checked against *that*. A resource that derives nothing must still be
+//! inconclusive and never clean - a run answering `0` for a resource nothing
+//! propagates would be a false claim about the code. A resource that derives
+//! must not be inconclusive - continuing to report a question as unanswered
+//! after answering it trains callers to ignore the verdict on the one resource
+//! that works.
+//!
+//! The numeric content of that answer is `resource_registry.rs`; this file is
+//! about the flag, the exit code and the help text.
 
 mod common;
 
@@ -391,18 +398,33 @@ fn an_unknown_resource_analyses_nothing() -> io::Result<()> {
 // What the flag honestly does at M0
 // ---------------------------------------------------------------------------
 
-/// Selecting a resource landav cannot yet bound is inconclusive, never clean.
+/// The verdict follows the *selected resource's* own status, per resource.
 ///
-/// [`CLEAN_PY`] exits `0` with no `--resource`, and must stop doing so the
-/// moment a bound is asked for that this build does not derive. Exit `0` is a
-/// claim — "analysis ran and every bound held" — and the analysis tier that
-/// would substantiate it (`landav-its`, `landav-solvers`) is not implemented.
+/// This replaces `a_selected_resource_is_inconclusive_rather_than_clean`, which
+/// asserted the blanket claim for all four. That claim was true while nothing
+/// propagated and became false when `queries` began deriving a number; the
+/// honest replacement is the same statement per resource, which is what this
+/// makes.
+///
+/// Neither half is hardcoded here. The run says, in its own machine output,
+/// whether it derived a number for the resource it was asked about, and the
+/// exit code is checked against that answer - so a resource that starts
+/// deriving tomorrow moves to the other branch of this test with no edit, and a
+/// build that stops deriving one moves back.
+///
+/// * **Derives nothing:** exit `0` is a claim - "analysis ran and every bound
+///   held" - and there is no bound and it did not hold. It must be `1`, with
+///   the word the rest of the report uses for that state, or the exit code is
+///   the only signal and it is ambiguous.
+/// * **Derives:** the question was answered, so it must be clean. Reporting a
+///   run inconclusive after concluding something teaches callers to ignore the
+///   verdict on the resource that works.
 ///
 /// The control assertion is the other half: without the flag the same file
-/// still reports clean, so this is a consequence of the question that was
-/// asked and not a regression in the default path.
+/// still reports clean, so any change here is a consequence of the question
+/// that was asked and not a regression in the default path.
 #[test]
-fn a_selected_resource_is_inconclusive_rather_than_clean() -> io::Result<()> {
+fn the_verdict_follows_the_selected_resources_own_status() -> io::Result<()> {
     let project = Project::new()?;
     let clean = project.write("clean.py", CLEAN_PY)?;
 
@@ -415,16 +437,44 @@ fn a_selected_resource_is_inconclusive_rather_than_clean() -> io::Result<()> {
         control.describe()
     );
 
+    let mut derived_any = false;
     for kind in ResourceKind::ALL {
-        let run = project.check(&clean, &["--resource", kind.id().as_str()])?;
-
+        let id = kind.id();
+        let run = project.check(&clean, &["--resource", id.as_str()])?;
         run.assert_did_not_crash();
+
+        // Asked of the tool rather than asserted from a list here: this suite
+        // is about the flag, and which resources derive is the registry's fact
+        // to state and `resource_registry.rs`'s to check.
+        let reported = project.check(&clean, &["--json", "--resource", id.as_str()])?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&reported.stdout).unwrap_or(serde_json::Value::Null);
+        let derives = parsed["resource"]["derived"].as_bool();
+        assert!(
+            derives.is_some(),
+            "a run that selected `{id}` did not say whether it derived a number \
+             for it, so there is nothing to check the exit code against.\n{}",
+            reported.describe()
+        );
+
+        if derives == Some(true) {
+            derived_any = true;
+            assert_eq!(
+                run.code,
+                EXIT_CLEAN,
+                "`--resource {id}` derived a number and then failed the build. \
+                 `Inconclusive` means a question was asked and not answered; \
+                 this one was answered.\n{}",
+                run.describe()
+            );
+            continue;
+        }
+
         assert_ne!(
             run.code,
             EXIT_CLEAN,
-            "`--resource {}` reported clean, which claims a bound in {} that \
+            "`--resource {id}` reported clean, which claims a bound in {} that \
              this build derives no part of.\n{}",
-            kind.id(),
             kind.descriptor().unit(),
             run.describe()
         );
@@ -437,23 +487,39 @@ fn a_selected_resource_is_inconclusive_rather_than_clean() -> io::Result<()> {
         );
         assert!(
             run.mentions("inconclusive"),
-            "the run must say that nothing was concluded for `{}`, or the \
+            "the run must say that nothing was concluded for `{id}`, or the \
              exit code is the only signal and it is ambiguous.\n{}",
-            kind.id(),
             run.describe()
         );
     }
+    assert!(
+        derived_any,
+        "no registered resource derived a number, so the deriving half of this \
+         test never ran; `queries` counts the call holes LAN-87 made real"
+    );
     Ok(())
 }
 
-/// `--help` lists the registered set, generated, and does not overclaim.
+/// `--help` lists the registered set, generated, and states each resource's
+/// status individually.
 ///
-/// Two properties, and the second is the one that rots quietly. The help text
-/// is the only description of the flag most callers will ever read; if it
-/// promises a bound the tool does not derive, every one of them will read the
-/// inconclusive result as a bug.
+/// This replaces `the_help_is_generated_and_does_not_promise_a_bound`, which
+/// pinned the blanket caveat "no bound is derived for any resource in this
+/// build". That sentence stopped being true when `queries` began deriving one,
+/// and a caveat left behind after it stopped being true is a lie the tool tells
+/// about itself - which sends every reader of `--resource queries` looking for
+/// a bug that is not there.
+///
+/// Three properties now, and the third is the one that rots quietly:
+///
+/// * every registered resource is listed, with the registry's own summary;
+/// * the help makes **no** claim about the registry as a whole; and
+/// * it says, for each resource by name, whether a bound is derived for it.
+///
+/// The third is checked without this file knowing which resources derive: each
+/// id must carry one of the two sentences, and never both.
 #[test]
-fn the_help_is_generated_and_does_not_promise_a_bound() -> io::Result<()> {
+fn the_help_is_generated_and_states_each_resource_status() -> io::Result<()> {
     let project = Project::new()?;
 
     let run = project.run(&["check", "--help"])?;
@@ -483,12 +549,31 @@ fn the_help_is_generated_and_does_not_promise_a_bound() -> io::Result<()> {
         );
     }
     assert!(
-        run.mentions("no bound is derived"),
-        "`--help` describes `--resource` without saying that no bound is \
-         derived for any resource in this build, so it promises an answer the \
-         tool does not have.\n{}",
+        !run.mentions("no bound is derived for any resource"),
+        "`--help` still makes one claim for the whole registry. That is the \
+         state LAN-86 exists to end: it tells a reader that everything is \
+         unavailable and never why, and it is now also false.\n{}",
         run.describe()
     );
+
+    for kind in ResourceKind::ALL {
+        let id = kind.id();
+        let denies = run.mentions(&format!("no bound is derived for `{id}`"));
+        let promises = run.mentions(&format!("a bound is derived for `{id}`"));
+        assert!(
+            denies || promises,
+            "`--help` lists `{id}` without saying whether a bound is derived \
+             for it. The long help is the only description of the flag most \
+             callers ever read, and a list of names with no status promises an \
+             answer for all of them.\n{}",
+            run.describe()
+        );
+        assert!(
+            !(denies && promises),
+            "`--help` both promises and denies a bound for `{id}`.\n{}",
+            run.describe()
+        );
+    }
     Ok(())
 }
 

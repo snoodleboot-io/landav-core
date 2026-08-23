@@ -116,10 +116,42 @@ pub enum SourceExpr {
     /// placed and cannot be charged soundly. A frontend that translates an
     /// expression it will not keep should therefore surface the refusal at a
     /// position in the statement tree rather than leaving the node orphaned.
+    ///
+    /// # A refusal that still knows how big the value is
+    ///
+    /// `bounded_by` is the one thing a refusal may carry beyond its name. It
+    /// names an expression whose **magnitude dominates this node's**, which is
+    /// strictly less than knowing the value: `n // 2` has no representation in
+    /// the polynomial fragment and never will, but `|n // 2| <= |n|` holds for
+    /// every divisor, so `n` is a legitimate over-approximation of it.
+    ///
+    /// The two consumers read that differently, and both stay right.
+    /// [`crate::lower`] refuses exactly as before - a transition system built
+    /// from an over-approximation admits executions the program does not have,
+    /// so there is no system to emit. `landav-engine`, which derives a *bound*
+    /// rather than a system, may read the named expression and mark what it
+    /// read **approximate**, so a loop counted by one is reported `O` and never
+    /// `Theta`.
+    ///
+    /// It is `None` for every refusal that has no such expression, which is
+    /// almost all of them: a call, an attribute, a comprehension have no
+    /// operand whose size dominates their value.
+    ///
+    /// # The operand must be *referenced*, not merely translated
+    ///
+    /// Whatever this names is part of the program: a walk reaches it, charges
+    /// the regions inside it, and accounts for them. A frontend that wants to
+    /// bound a node by an operand it does not otherwise keep must therefore
+    /// point at that operand here rather than translating and discarding it -
+    /// an `Unsupported` node nothing points at is the orphan
+    /// `SourceProgram::unsupported_nodes` exists to catch.
     Unsupported {
         /// What was refused.
         construct: Construct,
         /// Frontend-supplied specifics, if any.
         detail: Option<Symbol>,
+        /// An expression whose magnitude dominates this one's, if the frontend
+        /// knows one.
+        bounded_by: Option<ExprId>,
     },
 }

@@ -12,42 +12,86 @@
 //! deliberately in one place rather than twice, differently, in the text
 //! renderer and the JSON collector.
 
+use std::collections::BTreeSet;
+
 use landav_engine::TripCount;
+use landav_its::Unsupported;
 use landav_python::LoweredFunction;
 
-/// The cost this run may report for `function`, given whether it lowered.
+/// The cost this run may report for `function`, given whether it lowered and
+/// what the lowering refused.
 ///
 /// # The divergence invariant
 ///
-/// A function that did **not** lower may never be reported with a complete
-/// bound - `Theta` or `O`, `"exact"` or `"upper"`. Those are two-sided and
+/// A function that did **not** lower may not be reported with a complete bound
+/// (`Theta` or `O`, `"exact"` or `"upper"`) **unless the engine can be shown to
+/// have seen everything the lowering refused**. Those labels are two-sided and
 /// one-sided *claims*, and a consumer is entitled to compare either against a
 /// budget. A function analysed apart from a named region has made neither: its
 /// bound carries an unfilled hole, an unfilled hole denotes `omega`, and the
 /// honest label is `"partial"`.
 ///
-/// Usually that falls out on its own - a program that did not lower contains an
-/// `Unsupported` node, and the engine charges every one of them as a hole. It
-/// does not fall out in one case, and that case is the reason this function
-/// exists: [`landav_its::Construct::PolynomialDegree`],
-/// [`landav_its::Construct::PolynomialSize`] and
-/// [`landav_its::Construct::ArithmeticOverflow`] are raised by the **lowering**,
-/// from limits on the representation it emits into, and leave no node in the
-/// arena for the engine to see. `x = (a + b + c) ** 8` costs exactly one step
-/// and does not lower.
+/// # Why `lowered` alone is the wrong test
 ///
-/// The engine is not wrong there. But the run holds two answers that disagree
-/// about whether this function was analysed, and resolving that in favour of
-/// the stronger one is how an over-claim ships. So the complete bound is
-/// withheld, and the refusal - which the run does report, with its construct
-/// and position - stands on its own.
+/// It was the right test while every refusal was an `Unsupported` node the
+/// engine charged as a hole, because then "did not lower" and "the engine is
+/// missing something" coincided. `LAN-91` broke that coincidence in both
+/// directions:
+///
+/// * [`landav_its::Construct::PolynomialDegree`],
+///   [`landav_its::Construct::PolynomialSize`] and
+///   [`landav_its::Construct::ArithmeticOverflow`] are raised by the **lowering**
+///   from limits on the representation it emits into, and leave no node in the
+///   arena. `x = (a + b + c) ** 8` costs exactly one step and does not lower.
+///   The engine is not wrong there, but the run holds two answers that disagree
+///   about whether the function was analysed, and resolving that in favour of
+///   the stronger one is how an over-claim ships.
+/// * A refusal carrying [`landav_its::SourceExpr::Unsupported`]'s `bounded_by` -
+///   `n // 2`, a `set` display whose equal elements collapse - **is** in the
+///   arena, and the engine reads the expression that dominates it and reports a
+///   sound one-sided bound. Withholding that was pure loss: `range(n // 2)`
+///   reported no bound at all where it had previously reported a partial one,
+///   which is why the `integer-division` and `bitwise-operator` sole-blocker
+///   counts did not move when those constructs were implemented.
+///
+/// So the test is not "did it lower" but "could the engine see what stopped it".
+/// Every refusal the lowering recorded must correspond to a node in the
+/// program's arenas; [`landav_engine`]'s own reconciliation then guarantees each
+/// of those was charged.
+///
+/// # Why an empty refusal list still withholds
+///
+/// A lowering that failed without recording refusals failed for some other
+/// reason - an arena overflow, a structural error - and there is nothing to
+/// match against. Absence of evidence is not evidence here, so it withholds.
 #[must_use]
-pub fn cost_of(function: &LoweredFunction, lowered: bool) -> Option<TripCount> {
+pub fn cost_of(
+    function: &LoweredFunction,
+    lowered: bool,
+    refusals: &[Unsupported],
+) -> Option<TripCount> {
     let derived = landav_engine::cost(function.program());
     if lowered {
         return Some(derived);
     }
-    // See above: a complete claim about a function the toolchain refused is the
-    // one shape this run will not make.
-    (!derived.is_complete()).then_some(derived)
+    // A partial result makes no finite claim, so there is nothing to over-claim
+    // and it is always reported.
+    if !derived.is_complete() {
+        return Some(derived);
+    }
+    // Complete, but the toolchain refused the function. Report it only if every
+    // refusal is something the engine had in front of it - either an
+    // `Unsupported` node it charged as a hole, or a statement it models fully
+    // and the lowering refuses anyway.
+    let program = function.program();
+    let visible: BTreeSet<Unsupported> = program
+        .unsupported_nodes()
+        .map(|node| node.refusal())
+        .collect();
+    let modelled: BTreeSet<_> = program.natively_modelled_refusals().collect();
+    let accounted = !refusals.is_empty()
+        && refusals
+            .iter()
+            .all(|refusal| visible.contains(refusal) || modelled.contains(refusal.origin()));
+    accounted.then_some(derived)
 }

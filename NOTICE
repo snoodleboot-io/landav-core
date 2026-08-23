@@ -18,13 +18,65 @@ specific language governing permissions and limitations under the License.
 Third-party components
 --------------------------------------------------------------------------------
 
-Landav invokes the following external solvers. They are NOT distributed with
-this software; they are discovered on PATH or installed separately by the user.
+Landav distributes no third-party solver. Two are named below, and they are not
+a symmetric pair: one is invoked and one has been dropped. An earlier version of
+this file listed them side by side, which read as though the project depended on
+both equally. It does not.
 
-  KoAT  -- upper bound analysis for integer transition systems
-  LoAT  -- lower bound analysis for integer transition systems
+KoAT2 -- upper bounds for integer transition systems
+  https://github.com/aprove-developers/KoAT2-Releases
+  MIT.
 
-Their licences are their own. Before changing the distribution model from
-"discovered on PATH" to vendoring or bundling, their licence terms must be
-reviewed for compatibility with this project's Apache-2.0 licence. See
+  Landav invokes KoAT2 across a process boundary and nowhere else: the
+  transition system is written to a file, the solver is exec'd with that file
+  named on its command line, and the answer it prints is read back and parsed.
+  Nothing is linked, nothing is loaded into landav's address space, and nothing
+  of the solver's internals is visible to it. See crates/landav-solvers/.
+
+  KoAT2 is not required to run landav. The native engine in
+  crates/landav-engine/ derives bounds from source structure with no solver at
+  all, so KoAT2's remaining role is as a differential oracle: it and the native
+  engine reach the same programs by entirely different routes, so where they
+  disagree one of them is wrong. Continuous integration installs KoAT2 for that
+  cross-check alone -- see the `differential` job in .github/workflows/ci.yml --
+  and a user who wants the same cross-check locally installs it themselves.
+  Landav discovers it on PATH; it is never bundled, vendored or shipped.
+
+LoAT -- lower bounds for integer transition systems
+  GPL-3.0, forced rather than chosen by a statically linked Yices 2 and CLN.
+
+  Dropped. Landav never invokes LoAT, does not require it, and must not be
+  built or configured to link, embed or vendor it: GPL-3.0 reaching this
+  repository would relicense an Apache-2.0 core and would be fatal to the
+  commercial BSL 1.1 edition alongside it.
+
+  crates/landav-solvers/src/loat_answer.rs remains in the tree and is retained
+  deliberately as a parser with no caller. Reading an answer is pure, that half
+  is correct and tested, and it is what an ARI emitter would need if one were
+  ever written -- so it is kept rather than rewritten later. The presence of a
+  reader for a tool's output is not a dependency on that tool, and is not a
+  recommendation to install it. The module's own documentation says the same.
+
+--------------------------------------------------------------------------------
+Why KoAT2 is discovered on PATH and not bundled
+--------------------------------------------------------------------------------
+
+This is a settled project decision rather than a packaging default, and it is
+recorded here because the reasoning is not visible from the build files.
+
+This project has a hard constraint of no GPL, LGPL or AGPL anywhere, including
+transitively. KoAT2's own licence is MIT and raises nothing. Bundling it would,
+because a distributable KoAT2 build carries APRON, which is LGPL except for its
+PPL wrappers, which are GPL. Shipping someone else's binary is what turns their
+dependency graph into ours; discovering a binary the user chose to install does
+not.
+
+Against that exposure, bundling buys only install convenience. It does not buy
+capability: the native engine no longer needs a solver to produce a bound, so
+KoAT2 is a cross-check on the shipped analysis rather than a component of it. A
+convenience is not worth a licence obligation the project has committed to not
+carrying.
+
+Changing the distribution model from "discovered on PATH" to vendoring or
+bundling is therefore not a packaging change and cannot be made as one. See
 https://linear.app/snoodleboot/issue/LAN-7.

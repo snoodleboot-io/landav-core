@@ -15,12 +15,23 @@ use crate::{
 ///
 /// # The whole fragment is here
 ///
-/// Six variants, five of which do something and one of which refuses. That is
-/// the entire statement language this story covers, and the shortness is the
+/// Eight variants, seven of which do something and one of which refuses. That
+/// is the entire statement language this story covers, and the shortness is the
 /// point: the crate-level docs justify each inclusion and each exclusion, and
 /// a construct that is not in this enum is one a frontend must spell as
 /// [`SourceStmt::Unsupported`].
 /// Exhaustive on purpose; see [`crate::SourceExpr`].
+///
+/// # Two variants a consumer may cost but the lowering will not accept
+///
+/// [`SourceStmt::Raise`] and [`SourceStmt::Protected`] are here so a *cost*
+/// consumer can walk into an exception handler's body instead of treating the
+/// whole `try` as one opaque region. [`crate::lower`] refuses both: an
+/// [`crate::Update`] is a total map with no havoc, so a transition system
+/// admitting a `try` would assert the integer state is unchanged across a body
+/// that may have run only in part, which is worse than refusing it. The
+/// engine's reach and the transition system's are two different numbers, and
+/// this is where they differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceStmt {
     /// `target = value`, where `target` is a single integer variable.
@@ -72,6 +83,78 @@ pub enum SourceStmt {
     /// frontend must still translate that expression, because it may contain a
     /// construct that has to be refused.
     Return,
+    /// Abandon the current computation: one step, and an **edge out of every
+    /// region it stands in**.
+    ///
+    /// Carries no value, for the same reason [`SourceStmt::Return`] does not:
+    /// the emitted system models runtime rather than results. A frontend must
+    /// still translate the expression beside it, because it may contain a
+    /// construct that has to be refused, and the refusals become statements of
+    /// their own at the position the expression is evaluated.
+    ///
+    /// # Why this is not a region
+    ///
+    /// A `raise` costs one step and assigns to nothing, so charging it as an
+    /// unanalysable region would be both looser than necessary and *wrong in
+    /// the one way that matters*: a region forgets every value the analysis
+    /// knew, and a `raise` in a `try` body would then erase the trip count of a
+    /// loop in the handler beside it.
+    ///
+    /// What it does do is leave early, so a loop containing one may stop before
+    /// its counter is exhausted. That is the same shape as a `Return` and a
+    /// consumer must treat it the same way: the count still **dominates** the
+    /// number of iterations performed, but it is no longer attained, and an
+    /// equality claim over it is false.
+    Raise,
+    /// A body that may be abandoned partway through, with the statements that
+    /// run when it is.
+    ///
+    /// Covers `try`/`except`/`else`/`finally` and the context-manager
+    /// statement, whose implicit entry and exit calls a frontend spells as
+    /// ordinary refusals inside `body` and `cleanup`.
+    ///
+    /// # The cost rule, and why it is a sum rather than a maximum
+    ///
+    /// One execution costs at most `body + handler + cleanup`.
+    ///
+    /// * `handler` **adds to** `body` rather than replacing it. An exception is
+    ///   raised from *inside* the body, so the body's cost up to that point is
+    ///   already spent when the handler starts. Reading `except` as though it
+    ///   were the `else` arm of an `if` - a maximum over the two - understates
+    ///   by the whole of whichever is smaller, without limit as the two grow
+    ///   together.
+    /// * The maximum over prefixes of the body *is* the whole body, and nothing
+    ///   here says **where** the exception fired, so the whole body is the
+    ///   honest over-approximation. It is only an over-approximation, which is
+    ///   why a consumer must not report the result as an equality.
+    /// * `cleanup` is **outside** the choice, because it runs on the normal path
+    ///   and the exceptional one alike. Charging it to the exceptional path only
+    ///   understates every normal run by the whole of the `finally` body.
+    ///
+    /// Several `except` clauses concatenate into one `handler`: exactly one of
+    /// them runs, so their sum dominates it.
+    ///
+    /// # The obligation that comes with walking in
+    ///
+    /// Which statements of `body` ran at all depends on where the exception
+    /// hit, so **neither the entry value nor the post-body value of a name the
+    /// body writes is the one that holds afterwards**. A consumer that derives
+    /// a later loop's trip count from such a name publishes a bound the program
+    /// exceeds. There is no expression for the value, so there is no complete
+    /// bound; forgetting every name on the way out is the answer.
+    Protected {
+        /// The statements that may be abandoned partway through.
+        ///
+        /// A `try`'s `else` clause belongs here, appended: it runs after the
+        /// body exactly when the body completed.
+        body: Vec<StmtId>,
+        /// The statements that run when the body is abandoned; empty when there
+        /// is no handler.
+        handler: Vec<StmtId>,
+        /// The statements that run on **every** path out of the body; empty
+        /// when there are none.
+        cleanup: Vec<StmtId>,
+    },
     /// A statement the frontend could not translate.
     ///
     /// See [`crate::SourceExpr::Unsupported`] for why this is a node rather

@@ -343,6 +343,21 @@ impl<'a> Lowering<'a> {
                 );
             }
 
+            // Exceptional control flow is costable and not lowerable, and the
+            // two are different numbers. A `Raise` is an edge to a location
+            // this system does not have - the caller's handler - and a
+            // `Protected` body may have run in part, which an `Update` cannot
+            // say: it is a total map with no havoc, so admitting one would
+            // assert the integer state is unchanged across a body that changed
+            // it. Refusing is the sound answer, and it keeps
+            // `Coverage::lowered()` measuring what it always measured.
+            //
+            // The nested bodies need no traversal: `refuse_every_unsupported_node`
+            // scans the arena, so a refusal inside one is still reported.
+            SourceStmt::Raise | SourceStmt::Protected { .. } => {
+                self.refuse(Construct::ExceptionalControlFlow, origin, None);
+            }
+
             // Recorded by `refuse_every_unsupported_node`, not here. Doing it
             // in both places would leave one of them dead, and dead code that
             // looks load bearing is how a real gap gets overlooked.

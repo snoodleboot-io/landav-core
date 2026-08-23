@@ -34,6 +34,7 @@
 //! [`F-004`]: https://linear.app/snoodleboot/issue/LAN-3
 //! [`F-041`]: https://linear.app/snoodleboot/issue/LAN-24
 
+mod assumption;
 mod check;
 mod cli;
 mod config;
@@ -42,6 +43,7 @@ mod diagnostic;
 mod machine;
 mod outcome;
 mod resource;
+mod resource_bound;
 mod sources;
 
 use landav_bound::ExitCode;

@@ -1,5 +1,7 @@
 //! [`SourceProgramBuilder`] - the only way to build a [`SourceProgram`].
 
+use std::collections::BTreeSet;
+
 use landav_bound::{Origin, Symbol};
 
 use crate::{
@@ -38,6 +40,7 @@ pub struct SourceProgramBuilder {
     stmt_origins: Vec<Origin>,
     origin: Origin,
     overflowed: bool,
+    volatile: BTreeSet<VarName>,
 }
 
 impl SourceProgramBuilder {
@@ -56,7 +59,17 @@ impl SourceProgramBuilder {
             stmt_origins: Vec::new(),
             origin,
             overflowed: false,
+            volatile: BTreeSet::new(),
         }
+    }
+
+    /// Records that `name` denotes a property of an object rather than a value.
+    ///
+    /// See [`SourceProgram::is_volatile`]. Only the frontend knows which of its
+    /// variables are of that kind, and a consumer that guessed from the
+    /// spelling would be guessing.
+    pub fn mark_volatile(&mut self, name: VarName) {
+        self.volatile.insert(name);
     }
 
     // -- expressions --------------------------------------------------------
@@ -92,6 +105,7 @@ impl SourceProgramBuilder {
             SourceExpr::Unsupported {
                 construct,
                 detail: None,
+                bounded_by: None,
             },
             origin,
         )
@@ -108,6 +122,30 @@ impl SourceProgramBuilder {
             SourceExpr::Unsupported {
                 construct,
                 detail: Some(detail.into()),
+                bounded_by: None,
+            },
+            origin,
+        )
+    }
+
+    /// An expression the frontend could not translate, whose magnitude is
+    /// dominated by `bounded_by`.
+    ///
+    /// See [`SourceExpr::Unsupported`]: the named expression stays part of the
+    /// program, so a consumer walking it reaches and charges whatever regions
+    /// it contains.
+    pub fn unsupported_expr_bounded(
+        &mut self,
+        construct: Construct,
+        detail: impl Into<Symbol>,
+        bounded_by: ExprId,
+        origin: Origin,
+    ) -> ExprId {
+        self.push_expr(
+            SourceExpr::Unsupported {
+                construct,
+                detail: Some(detail.into()),
+                bounded_by: Some(bounded_by),
             },
             origin,
         )
@@ -221,6 +259,35 @@ impl SourceProgramBuilder {
         self.push_stmt(SourceStmt::Return, origin)
     }
 
+    /// Abandon the current computation.
+    ///
+    /// See [`SourceStmt::Raise`]: one step, and an edge out of every region it
+    /// stands in.
+    pub fn raise_stmt(&mut self, origin: Origin) -> StmtId {
+        self.push_stmt(SourceStmt::Raise, origin)
+    }
+
+    /// A body that may be abandoned partway through.
+    ///
+    /// See [`SourceStmt::Protected`] for the cost rule and for the obligation a
+    /// consumer takes on by walking into `body`.
+    pub fn protected(
+        &mut self,
+        body: Vec<StmtId>,
+        handler: Vec<StmtId>,
+        cleanup: Vec<StmtId>,
+        origin: Origin,
+    ) -> StmtId {
+        self.push_stmt(
+            SourceStmt::Protected {
+                body,
+                handler,
+                cleanup,
+            },
+            origin,
+        )
+    }
+
     /// A statement the frontend could not translate.
     ///
     /// The node stands for the whole statement, so a consumer that charges one
@@ -302,6 +369,7 @@ impl SourceProgramBuilder {
             body,
             origin: self.origin,
             overflowed: self.overflowed,
+            volatile: self.volatile,
         }
     }
 

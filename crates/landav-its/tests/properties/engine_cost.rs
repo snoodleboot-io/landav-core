@@ -51,7 +51,10 @@ use proptest::{prelude::*, strategy::ValueTree as _, test_runner::TestRunner};
 
 use crate::{
     reference::{Ending, State, interpret},
-    support::{ExprSpec, MUTABLE, Materialiser, PARAMS, StmtSpec, arb_body, arb_state},
+    support::{
+        ExprSpec, MUTABLE, Materialiser, PARAMS, StmtSpec, arb_body, arb_raising_body, arb_state,
+        raises_inside_a_loop,
+    },
 };
 
 /// How many source statements a generated program may execute.
@@ -203,6 +206,119 @@ proptest! {
         }
     }
 
+    /// **A run that ends by raising is not under-reported either.**
+    ///
+    /// The soundness half, extended to the corpus that raises. It was
+    /// unreachable while `raise` was a whole-statement refusal: every program
+    /// containing one came back `Partial`, whose unfilled hole denotes `omega`
+    /// and makes no finite claim, so both properties above skipped it. Now that
+    /// a `raise` costs one step and carries no hole, a raising program can
+    /// produce a *complete* bound - and a complete bound is exactly the thing a
+    /// budget gate compares against.
+    ///
+    /// [`Ending::Raised`] is a completed run: every step it performed is known,
+    /// so there is a number to dominate. It is admitted here alongside
+    /// [`Ending::Terminated`] for that reason, and kept apart from it in the
+    /// reference for the reason the next property gives.
+    #[test]
+    fn a_run_that_raises_is_not_under_reported(
+        body in arb_raising_body(),
+        initial in arb_state(),
+    ) {
+        let program = Materialiser::new("scored").finish(&body);
+        if !is_natural(&initial) {
+            return Ok(());
+        }
+        let run = interpret(&program, &initial, STEP_BUDGET);
+        if !matches!(run.ending, Ending::Terminated | Ending::Raised) {
+            return Ok(());
+        }
+        let Some((_, reported)) = reported(&program, &initial) else {
+            return Ok(());
+        };
+
+        prop_assert!(
+            reported.magnitude_cmp(Nat::Fin(run.charged)) != core::cmp::Ordering::Less,
+            "the engine reported {reported:?} for a run that costs {} steps at \
+             {initial:?} and ended {:?}",
+            run.charged,
+            run.ending
+        );
+    }
+
+    /// **A `raise` a loop can reach is never reported as an equality.**
+    ///
+    /// The claim is the *absence of the label*, not the value of the number,
+    /// and that is deliberate. `for i in range(n): raise` executes two steps for
+    /// every `n`; a bound of `1 + 2n` is perfectly sound and this property does
+    /// not object to it. What it forbids is `Theta(1 + 2n)`, which asserts the
+    /// program costs that much rather than at most that much, and at `n = 100`
+    /// it costs two. Complete, exact, no holes, offered to a budget gate: the
+    /// `LAN-88` failure class reached through a different construct.
+    ///
+    /// Extending [`an_exact_bound_equals_the_truth`] to raising programs would
+    /// be the wrong test. An early exit makes exactness *unattainable*, so
+    /// there is no number for the equality to hold at; what has to be checked
+    /// is that the engine stops claiming one.
+    ///
+    /// # Why `exact_outside_holes` is not asserted here
+    ///
+    /// It is asserted in
+    /// [`a_countable_loop_that_can_raise_is_not_exact_outside_its_holes`], over
+    /// a generator that guarantees the loop was *counted*. This corpus does
+    /// not: a `for` whose start is a mutable local has no expressible trip
+    /// count, so the engine holes the whole loop - body, `raise` and all - and
+    /// "exact outside the holes" is then a true statement about the three
+    /// prologue assignments beside it. Asserting the flag here would be
+    /// asserting that the engine failed to hole a loop it cannot count.
+    #[test]
+    fn a_raise_a_loop_can_reach_is_never_an_equality(
+        body in arb_raising_body(),
+    ) {
+        if !raises_inside_a_loop(&body) {
+            return Ok(());
+        }
+        let program = Materialiser::new("scored").finish(&body);
+        let derived = cost(&program);
+
+        prop_assert!(
+            !derived.is_exact(),
+            "a loop whose body can raise may stop before its counter is \
+             exhausted, so its trip count is an over-estimate rather than an \
+             equality: {:?}",
+            derived.bound().map(ToString::to_string)
+        );
+    }
+
+    /// **A loop the engine *counted* whose body can raise is not exact outside
+    /// its holes either.**
+    ///
+    /// `exact_elsewhere` is the same equality claim as `Exact`, made about the
+    /// derived part of a partial result, and a report renders it as "exact
+    /// except for the region at line N". A loop an exception can leave is not
+    /// among the things derived exactly, so the flag has to come down - and
+    /// `TripCount::relax` is what clears it.
+    ///
+    /// The generator pins the loop to `range(0, e)` in unit steps with `e`
+    /// literal or the parameter, which is the shape `count_of` can actually
+    /// count. That is the whole difference from the property above: here the
+    /// trip count really is in the bound, so there is an equality to withdraw.
+    #[test]
+    fn a_countable_loop_that_can_raise_is_not_exact_outside_its_holes(
+        body in arb_countable_raising_loop(),
+    ) {
+        let program = Materialiser::new("scored").finish(&body);
+        let derived = cost(&program);
+
+        prop_assert!(
+            !derived.is_exact() && !derived.exact_outside_holes(),
+            "the trip count of this loop is in the bound and an exception can \
+             end the loop before it is exhausted, so nothing enclosing it was \
+             derived exactly: {:?}",
+            derived.bound().map(ToString::to_string)
+        );
+    }
+
     /// **A strided or offset loop whose body reads its counter is not
     /// under-approximated.**
     ///
@@ -242,6 +358,53 @@ proptest! {
             run.charged
         );
     }
+}
+
+/// `for a in range(0, e): <assigns> raise` — a loop the engine can count whose
+/// body can raise.
+///
+/// `range(0, e)` in unit steps with `e` a literal or the parameter is exactly
+/// the shape `count_of` reads as a trip count, so the loop reaches the bound
+/// instead of becoming one opaque hole. The `raise` is placed under a
+/// condition half the time, because a guarded raise is what the corpus
+/// actually contains and the engine performs no reachability analysis: it has
+/// no evidence the loop runs to completion either way.
+fn arb_countable_raising_loop() -> impl Strategy<Value = Vec<StmtSpec>> {
+    (
+        prop_oneof![
+            (0_i64..=6).prop_map(ExprSpec::Int),
+            // `READABLE` ends with the parameter.
+            Just(ExprSpec::Var(3)),
+        ],
+        prop::collection::vec(
+            (0_usize..MUTABLE.len(), 0_i64..4).prop_map(|(target, value)| StmtSpec::Assign {
+                target,
+                value: ExprSpec::Int(value),
+            }),
+            0..2,
+        ),
+        prop::bool::ANY,
+        crate::support::arb_cond(),
+    )
+        .prop_map(|(stop, mut body, guarded, cond)| {
+            let raise = if guarded {
+                StmtSpec::If {
+                    cond,
+                    then_body: vec![StmtSpec::Raise],
+                    else_body: Vec::new(),
+                }
+            } else {
+                StmtSpec::Raise
+            };
+            body.push(raise);
+            vec![StmtSpec::For {
+                target: 0,
+                start: ExprSpec::Int(0),
+                stop,
+                step: 1,
+                body,
+            }]
+        })
 }
 
 /// `for i in range(start, stop, step): for j in range(0, i): a = 0`
@@ -402,5 +565,66 @@ fn the_engine_unit_is_not_the_interpreters_unit() {
         cost(&program).bound().map(ToString::to_string),
         Some("9".to_owned()),
         "and the engine agrees with the scoring, exactly"
+    );
+}
+
+/// **The raising corpus contains the shapes the two new properties need.**
+///
+/// The vacuity guard for [`a_run_that_raises_is_not_under_reported`] and
+/// [`a_raise_a_loop_can_reach_is_never_an_equality`]. The first skips any run
+/// the reference cannot follow; the second skips any body with no `raise`
+/// inside a loop. A generator drifting away from either shape would leave both
+/// green and measuring nothing, which is the failure mode a raised case count
+/// exposes and a passing CI run hides.
+#[test]
+fn the_raising_corpus_contains_raises_a_loop_can_reach() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = (arb_raising_body(), arb_state());
+
+    let mut programs = 0_usize;
+    let mut in_a_loop = 0_usize;
+    let mut raised = 0_usize;
+    let mut complete = 0_usize;
+    for _ in 0..512 {
+        let Ok(case) = strategy.new_tree(&mut runner) else {
+            continue;
+        };
+        let (body, initial): (Vec<StmtSpec>, State) = case.current();
+        if !is_natural(&initial) {
+            continue;
+        }
+        programs += 1;
+        if raises_inside_a_loop(&body) {
+            in_a_loop += 1;
+        }
+        let program = Materialiser::new("scored").finish(&body);
+        let run = interpret(&program, &initial, STEP_BUDGET);
+        if run.ending == Ending::Raised {
+            raised += 1;
+            if reported(&program, &initial).is_some() {
+                complete += 1;
+            }
+        }
+    }
+
+    assert!(
+        programs > 0,
+        "the raising generator produced nothing at all"
+    );
+    assert!(
+        in_a_loop * 10 >= programs,
+        "only {in_a_loop} of {programs} generated bodies put a `raise` where a \
+         loop can reach it, so `a_raise_a_loop_can_reach_is_never_an_equality` \
+         asserted almost nothing"
+    );
+    assert!(
+        raised * 10 >= programs,
+        "only {raised} of {programs} generated runs actually ended by raising, \
+         so `a_run_that_raises_is_not_under_reported` was close to vacuous"
+    );
+    assert!(
+        complete > 0,
+        "no run that ended by raising produced a *complete* bound, so nothing \
+         was compared: a partial result makes no finite claim and is skipped"
     );
 }

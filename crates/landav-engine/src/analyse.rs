@@ -135,7 +135,7 @@ impl<'a> Walk<'a> {
 
     /// The cost of a statement list, in sequence.
     ///
-    /// # A `return` in the middle is not an equality
+    /// # An early exit in the middle is not an equality
     ///
     /// The sum charges every statement in the list. That is the whole cost only
     /// when every statement runs, and a `return` before the end of the block is
@@ -144,14 +144,17 @@ impl<'a> Walk<'a> {
     /// direction that matters - but it is no longer attained, and `Exact` is a
     /// two-sided claim that says it is.
     ///
-    /// So a body whose tail is reachable only past a `return` is relaxed. A
-    /// `return` as the last statement changes nothing and stays exact, which is
-    /// the shape almost every real function has.
+    /// So a body whose tail is reachable only past an early exit is relaxed.
+    /// One as the last statement changes nothing and stays exact, which is the
+    /// shape almost every real function has.
+    ///
+    /// A `return` is not the only such exit: a `raise`, and a `try` whose body
+    /// or handler can raise, leave the same way. See [`exits_within`].
     fn body_cost(&mut self, body: &[StmtId]) -> TripCount {
         let mut total = TripCount::Exact(Bound::zero());
         let mut unreachable_tail = false;
         for (position, id) in body.iter().enumerate() {
-            if position + 1 < body.len() && returns_within(self.program, *id) {
+            if position + 1 < body.len() && exits_within(self.program, *id) {
                 unreachable_tail = true;
             }
             let next = self.stmt_cost(*id);
@@ -182,6 +185,23 @@ impl<'a> Walk<'a> {
             }
 
             SourceStmt::Return => TripCount::Exact(Bound::one()),
+
+            // One step, and nothing forgotten. A `raise` assigns to nothing, so
+            // charging it as a region would erase the trip count of a loop in
+            // the handler beside it for no gain. What it *does* do is leave
+            // early, which is a fact about the count of an enclosing loop and
+            // not about this statement's own cost: `exits_within` reports it and
+            // `loop_cost` and `body_cost` both act on that.
+            SourceStmt::Raise => TripCount::Exact(Bound::one()),
+
+            SourceStmt::Protected {
+                body,
+                handler,
+                cleanup,
+            } => {
+                let (body, handler, cleanup) = (body.clone(), handler.clone(), cleanup.clone());
+                self.protected_cost(&body, &handler, &cleanup)
+            }
 
             SourceStmt::If {
                 cond,
@@ -260,6 +280,57 @@ impl<'a> Walk<'a> {
                 }
             }
         }
+    }
+
+    /// The cost of a body that may be abandoned partway through.
+    ///
+    /// # The arithmetic
+    ///
+    /// `body + handler + cleanup`, and every term is deliberate. See
+    /// [`landav_its::SourceStmt::Protected`], where the argument for each one
+    /// lives; in short, the handler *adds to* a prefix of the body rather than
+    /// replacing it, the maximum over prefixes is the whole body, and the
+    /// cleanup is outside the choice because it runs whichever way the body
+    /// went.
+    ///
+    /// # Why it is never an equality
+    ///
+    /// The whole body is charged and only a prefix of it runs on the
+    /// exceptional path, so the sum dominates without being attained. That is
+    /// the same thing [`Walk::body_cost`] says about a statement list whose tail
+    /// sits past a `return`, and it is answered the same way. Relaxing here also
+    /// relaxes every enclosing count, because exactness is conjunctive through
+    /// `TripCount::combine`.
+    ///
+    /// # The obligation taken on by walking in
+    ///
+    /// A `try` used to reach this engine as one `Unsupported` statement, and
+    /// `Walk::region` cleared `readable` at it. Nothing routes through `region`
+    /// any more, so the rule is restated here: **which statements of the body
+    /// ran at all depends on where the exception hit**, so neither the entry
+    /// value nor the post-body value of anything is the one that holds
+    /// afterwards, and the caller's values do not survive.
+    ///
+    /// The clearing happens *after* the three walks, which is the entire point
+    /// of the ticket: a loop inside the body still reads the endpoints it was
+    /// entered with, and a handler still reads the ones the body left. Both are
+    /// sound - a prefix of the body writes no more names than the whole of it,
+    /// and `readable` only ever shrinks - and both are what makes the derived
+    /// bound a function of `n` rather than a number that has never heard of it.
+    fn protected_cost(
+        &mut self,
+        body: &[StmtId],
+        handler: &[StmtId],
+        cleanup: &[StmtId],
+    ) -> TripCount {
+        let body = self.body_cost(body);
+        let handler = self.body_cost(handler);
+        let cleanup = self.body_cost(cleanup);
+        // No value the caller supplied survives a region that may have run in
+        // part. See the doc comment: this is the enforcement point that
+        // `Walk::region` used to be for this construct.
+        self.readable.clear();
+        body.then(handler).then(cleanup).relax()
     }
 
     /// The whole cost of a counted loop, endpoints included.
@@ -349,14 +420,20 @@ impl<'a> Walk<'a> {
     /// ascending loop from zero is dominated by its trip count and [`Bound`] is
     /// weakly monotone by construction.
     ///
-    /// # A `return` in the body is an edge out of the count
+    /// # An early exit in the body is an edge out of the count
     ///
     /// The trip count is arithmetic rather than inference *because* nothing can
-    /// leave the loop early - the fragment refuses `break`, `continue` and
-    /// exceptions. A `return` is the one thing it does not refuse that can, so a
+    /// leave the loop early - the fragment refuses `break` and `continue`. Two
+    /// things it does not refuse can: a `return`, and an exceptional exit -
+    /// either a `raise` or a `try` whose body, handler or cleanup can raise. A
     /// body containing one makes the count an over-estimate rather than an
     /// equality, and the result is relaxed. Sound either way; the change is to
     /// the claim, not to the number.
+    ///
+    /// Charging the exit its step without also relaxing here is the whole of the
+    /// hazard: `for i in range(n): raise` executes two steps for every `n`, and
+    /// `Theta(2n)` for it is complete, exact, carries no holes, and is a bound
+    /// the program does not meet.
     fn loop_cost(
         &mut self,
         target: &VarName,
@@ -365,7 +442,7 @@ impl<'a> Walk<'a> {
         count: TripCount,
         ceiling: Option<&Bound>,
     ) -> TripCount {
-        let leaves_early = body.iter().any(|id| returns_within(self.program, *id));
+        let leaves_early = body.iter().any(|id| exits_within(self.program, *id));
         let body = self.body_cost(body);
         let counter = VarId::new(target.symbol().clone());
 
@@ -444,9 +521,24 @@ impl<'a> Walk<'a> {
         // Symbolic stop, unit ascending step, and a start pinned to zero: the
         // count *is* the stop expression. This is `for i in range(n)`, which is
         // the overwhelming majority of counted loops in real Python.
+        //
+        // *Is*, and only when the reading is the value. An endpoint like
+        // `n // 2` reads as `n`, which dominates it; a loop counted by that
+        // runs fewer times than the number says, so it is an `AtMost` and not
+        // a `Theta`. Wrapping every reading in `Exact` was sound only while
+        // every reading was exact, and `LAN-91` is where that stopped being
+        // true. See [`expr_bound::Reading`].
         if step == 1 && matches!(start, Some(SourceExpr::Int { value: 0 })) {
-            return expr_bound::read(self.program, range.stop, &self.readable)
-                .map_or(TripCount::Unknown, TripCount::Exact);
+            return expr_bound::read(self.program, range.stop, &self.readable).map_or(
+                TripCount::Unknown,
+                |reading| {
+                    if reading.is_exact() {
+                        TripCount::Exact(reading.into_bound())
+                    } else {
+                        TripCount::AtMost(reading.into_bound())
+                    }
+                },
+            );
         }
 
         // A symbolic start would need `stop - start`, and a stride above one
@@ -482,7 +574,10 @@ impl<'a> Walk<'a> {
         } else {
             range.start
         };
+        // Only the magnitude matters here - this dominates the counter, and an
+        // over-approximation of the endpoint still does.
         expr_bound::read(self.program, endpoint, &self.readable)
+            .map(expr_bound::Reading::into_bound)
     }
 
     // -- regions ------------------------------------------------------------
@@ -509,7 +604,19 @@ impl<'a> Walk<'a> {
     /// converse reason: a `RangeSpec` really is evaluated before the first
     /// iteration, so a region inside the loop does not change the trip count.
     fn region(&mut self, construct: Construct, origin: Origin) -> TripCount {
-        self.readable.clear();
+        if construct.may_rebind_locals() {
+            self.readable.clear();
+        } else {
+            // A read runs foreign code, and foreign code cannot rebind a name in
+            // *this* frame - see `Construct::may_rebind_locals`, where that
+            // argument lives. What it can do is mutate an object, so anything
+            // standing for a property of one goes: a `property` getter is free
+            // to call `items.append(...)`, and `len(items)` on entry is then not
+            // the length the loop below runs over. Which names are of that kind
+            // is the frontend's to say, and it says so in the program.
+            let program = self.program;
+            self.readable.retain(|name| !program.is_volatile(name));
+        }
         let hole = self.holes.next(construct.tag(), origin);
         let charged = TripCount::opaque(hole);
         match construct.cost_effect() {
@@ -530,12 +637,30 @@ impl<'a> Walk<'a> {
     fn expr_regions(&mut self, root: ExprId) -> TripCount {
         let mut total = TripCount::Exact(Bound::zero());
         for id in expr_nodes(self.program, root) {
-            if let Some(SourceExpr::Unsupported { construct, .. }) = self.program.expr(id) {
-                let (construct, origin) = (*construct, self.expr_origin(id));
+            let Some(SourceExpr::Unsupported {
+                construct,
+                bounded_by,
+                ..
+            }) = self.program.expr(id)
+            else {
+                continue;
+            };
+            // A refusal that names a dominating expression is **not** a region.
+            // It is arithmetic this engine cannot write down - `n // 2` - not
+            // code it cannot see into: it costs nothing beyond the statement
+            // evaluating it and it assigns to nothing, so no hole is charged
+            // and `readable` survives. It is still accounted for, because
+            // `reconciled` checks every `Unsupported` node whatever its shape,
+            // and the operand it names has already been walked above so any
+            // real region inside it was charged where it stands.
+            if bounded_by.is_some() {
                 self.charged.insert(NodeId::Expr(id));
-                let region = self.region(construct, origin);
-                total = total.then(region);
+                continue;
             }
+            let (construct, origin) = (*construct, self.expr_origin(id));
+            self.charged.insert(NodeId::Expr(id));
+            let region = self.region(construct, origin);
+            total = total.then(region);
         }
         total
     }
@@ -586,7 +711,14 @@ impl<'a> Walk<'a> {
                     let value = *value;
                     self.absorb_expr(value);
                 }
-                SourceStmt::Return => {}
+                SourceStmt::Return | SourceStmt::Raise => {}
+                SourceStmt::Protected {
+                    body,
+                    handler,
+                    cleanup,
+                } => {
+                    work.extend(body.iter().chain(handler).chain(cleanup).copied());
+                }
                 SourceStmt::If {
                     cond,
                     then_body,
@@ -741,7 +873,19 @@ fn expr_nodes(program: &SourceProgram, root: ExprId) -> Vec<ExprId> {
             SourceExpr::Arith { left, right, .. } => work.extend([*right, *left]),
             SourceExpr::Neg { operand } => work.push(*operand),
             SourceExpr::Pow { base, .. } => work.push(*base),
-            SourceExpr::Int { .. } | SourceExpr::Var { .. } | SourceExpr::Unsupported { .. } => {}
+            // A refusal that names an expression bounding its magnitude keeps
+            // that expression in the program, so the walk must reach it: the
+            // regions inside `g(n) // 2` are charged because the walk descends
+            // here. See [`SourceExpr::Unsupported`].
+            SourceExpr::Unsupported {
+                bounded_by: Some(operand),
+                ..
+            } => work.push(*operand),
+            SourceExpr::Int { .. }
+            | SourceExpr::Var { .. }
+            | SourceExpr::Unsupported {
+                bounded_by: None, ..
+            } => {}
         }
     }
     ordered
@@ -801,7 +945,21 @@ fn writes_of(program: &SourceProgram, body: &[StmtId]) -> Option<BTreeSet<VarNam
                 }
                 names.insert(target.clone());
             }
-            SourceStmt::Return => {}
+            // Neither leaving the function nor abandoning a body assigns to
+            // anything; what a `Protected` writes is what the statements inside
+            // it write, so the walk descends rather than giving up. Answering
+            // `None` here would be sound and would cost the ticket its point:
+            // it clears `readable` before the loop body is walked, so a nested
+            // counted loop inside a `try` would lose the endpoint it is counted
+            // by.
+            SourceStmt::Return | SourceStmt::Raise => {}
+            SourceStmt::Protected {
+                body,
+                handler,
+                cleanup,
+            } => {
+                work.extend(body.iter().chain(handler).chain(cleanup).copied());
+            }
             SourceStmt::If {
                 cond,
                 then_body,
@@ -835,13 +993,30 @@ fn writes_of(program: &SourceProgram, body: &[StmtId]) -> Option<BTreeSet<VarNam
     Some(names)
 }
 
-/// Whether executing the statement `id` can return from the function.
+/// Whether executing the statement `id` can leave the region it stands in
+/// early - by returning, or by raising.
 ///
 /// A `return` ends the run, so anything charged after it - the rest of a block,
 /// the remaining iterations of a loop - is charged and not executed. That keeps
 /// the number an over-approximation and stops it being an equality, which is
 /// the difference between `Theta` and `O`.
-fn returns_within(program: &SourceProgram, id: StmtId) -> bool {
+///
+/// # A `raise` is the same edge, and it is the one that can go wrong quietly
+///
+/// The trip count of a counted loop is arithmetic rather than inference
+/// *because* nothing can leave the iteration space early. An exceptional exit
+/// can. `for i in range(n): raise ValueError` executes two steps for every `n`,
+/// and reporting `Theta(2n)` for it - complete, exact, no holes, offered to a
+/// budget gate - is a bound the program does not meet in the one direction a
+/// bound may not move. Charging the `raise` its step without also reporting the
+/// edge is exactly how that answer is produced.
+///
+/// A [`landav_its::SourceStmt::Protected`] answers `true` unconditionally, and
+/// deliberately without inspecting its handlers. Nothing in the fragment says
+/// which exceptions a handler catches, a handler may raise on its own account,
+/// and so may a cleanup - so there is no evidence that the enclosing loop runs
+/// to completion, whatever the source text looks like.
+fn exits_within(program: &SourceProgram, id: StmtId) -> bool {
     let mut seen: BTreeSet<StmtId> = BTreeSet::new();
     let mut work = vec![id];
     while let Some(id) = work.pop() {
@@ -852,7 +1027,7 @@ fn returns_within(program: &SourceProgram, id: StmtId) -> bool {
             continue;
         };
         match stmt {
-            SourceStmt::Return => return true,
+            SourceStmt::Return | SourceStmt::Raise | SourceStmt::Protected { .. } => return true,
             SourceStmt::If {
                 then_body,
                 else_body,
@@ -868,10 +1043,23 @@ fn returns_within(program: &SourceProgram, id: StmtId) -> bool {
 }
 
 /// Whether an expression contains a node this engine cannot read.
+///
+/// A refusal that names an expression dominating its magnitude does not count.
+/// It is an arithmetic operator with no representation here, not an unknown
+/// *effect*: it cannot assign to anything, so an assignment whose value
+/// contains one still writes exactly its own target. See
+/// [`SourceExpr::Unsupported`] and `Walk::expr_regions`, which draws the same
+/// line for the same reason.
 fn expr_has_region(program: &SourceProgram, root: ExprId) -> bool {
-    expr_nodes(program, root)
-        .into_iter()
-        .any(|id| matches!(program.expr(id), Some(SourceExpr::Unsupported { .. })))
+    expr_nodes(program, root).into_iter().any(|id| {
+        matches!(
+            program.expr(id),
+            Some(SourceExpr::Unsupported {
+                bounded_by: None,
+                ..
+            })
+        )
+    })
 }
 
 /// Whether a condition contains a node this engine cannot read.

@@ -46,6 +46,7 @@ pub struct SourceProgram {
     pub(crate) body: Vec<StmtId>,
     pub(crate) origin: Origin,
     pub(crate) overflowed: bool,
+    pub(crate) volatile: BTreeSet<VarName>,
 }
 
 impl SourceProgram {
@@ -112,6 +113,29 @@ impl SourceProgram {
         self.stmt_origins.get(index_of(id.index()))
     }
 
+    /// Whether `name` denotes a property of an object rather than a value.
+    ///
+    /// # What the distinction is for
+    ///
+    /// A consumer that derives a bound has to decide, at every region, which of
+    /// the values it knows survive it. [`crate::Construct::may_rebind_locals`]
+    /// answers that for the *construct*: an attribute access and a subscript run
+    /// foreign code, but foreign code cannot rebind a name in this frame.
+    ///
+    /// That argument holds for a name bound to a number and fails for a name
+    /// standing for something *about an object*. A frontend that turns a `list`
+    /// parameter into a variable meaning "how long it is on entry" has created
+    /// exactly such a name: a `property` getter free to call `items.append(...)`
+    /// changes what it denotes without rebinding anything.
+    ///
+    /// The frontend is the only layer that knows which of its variables are of
+    /// that kind, so it says so here rather than leaving a consumer to guess
+    /// from the spelling.
+    #[must_use]
+    pub fn is_volatile(&self, name: &VarName) -> bool {
+        self.volatile.contains(name)
+    }
+
     /// Whether the builder that produced this program exceeded
     /// [`crate::MAX_ARENA_NODES`].
     ///
@@ -150,7 +174,10 @@ impl SourceProgram {
     /// costs.
     pub fn unsupported_nodes(&self) -> impl Iterator<Item = UnsupportedNode> + '_ {
         let exprs = self.exprs.iter().enumerate().filter_map(|(index, node)| {
-            let SourceExpr::Unsupported { construct, detail } = node else {
+            let SourceExpr::Unsupported {
+                construct, detail, ..
+            } = node
+            else {
                 return None;
             };
             Some(UnsupportedNode::new(
@@ -188,6 +215,36 @@ impl SourceProgram {
         exprs.chain(conds).chain(stmts)
     }
 
+    /// Where this program carries a statement a **cost** consumer models fully
+    /// but [`crate::lower`] refuses.
+    ///
+    /// # Why these are not `Unsupported` nodes, and why that matters downstream
+    ///
+    /// [`SourceStmt::Raise`] and [`SourceStmt::Protected`] are real statements
+    /// with real cost rules: one step and an early exit for the first, a sum of
+    /// three bodies for the second. `landav-engine` walks and charges both. The
+    /// lowering refuses them anyway, because a transition system's `Update` is a
+    /// total map with no havoc and cannot express a body abandoned partway
+    /// through.
+    ///
+    /// So they occupy a position no other refusal does: the toolchain refused
+    /// the function, and the cost consumer nevertheless saw everything there was
+    /// to see. A consumer deciding what a run may *claim* about a refused
+    /// function needs to tell that apart from a refusal raised inside the
+    /// lowering's own representation - [`crate::Construct::PolynomialDegree`] and
+    /// its neighbours - which leaves no node anywhere and which the engine
+    /// therefore never learns about.
+    ///
+    /// Yielded as positions rather than nodes because that is what a refusal
+    /// record carries, and matching on position is what lets the two be joined.
+    pub fn natively_modelled_refusals(&self) -> impl Iterator<Item = Origin> + '_ {
+        self.stmts
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| matches!(node, SourceStmt::Raise | SourceStmt::Protected { .. }))
+            .map(|(index, _)| origin_at(&self.stmt_origins, index, &self.origin))
+    }
+
     /// Every variable name the program mentions, read or written, in canonical
     /// order.
     ///
@@ -212,9 +269,13 @@ impl SourceProgram {
                 SourceStmt::ForRange { target, .. } => {
                     names.insert(target.clone());
                 }
+                // The nested bodies need no descent: this loop is over the
+                // whole arena, so every statement they name is visited anyway.
                 SourceStmt::If { .. }
                 | SourceStmt::While { .. }
                 | SourceStmt::Return
+                | SourceStmt::Raise
+                | SourceStmt::Protected { .. }
                 | SourceStmt::Unsupported { .. } => {}
             }
         }

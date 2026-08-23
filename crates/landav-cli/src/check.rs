@@ -188,7 +188,7 @@ fn analyse(
     // so the two cannot disagree about what the run found. In JSON mode the
     // text is withheld at the point of writing, not skipped at the point of
     // computing - a second code path would be a second thing to keep correct.
-    let mut collected = json.then(machine::Collector::default);
+    let mut collected = json.then(|| machine::Collector::for_resource(resource));
     let mut report = Report::new_gated(std::io::stdout().lock(), !json);
 
     for path in &walk.sources {
@@ -223,6 +223,7 @@ fn analyse(
                     &text,
                     &mut coverage,
                     &mut analysed,
+                    resource,
                     bounds.then_some(&mut report),
                     collected.as_mut(),
                 ) {
@@ -271,8 +272,9 @@ fn analyse(
     let unaccounted = resource_unaccounted(resource, statements);
     if let Some(kind) = resource
         && unaccounted
+        && let Some(line) = crate::resource::unaccounted(kind)
     {
-        report.line(format_args!("{}", crate::resource::unaccounted(kind)));
+        report.line(format_args!("{line}"));
     }
 
     // The full report, only when it was asked for. Printed before the summary,
@@ -597,18 +599,28 @@ impl<W: std::io::Write> Report<W> {
 
 /// Whether the run owes the operator an unaccounted-for-resource result.
 ///
-/// True when a resource was named and there was code to account for it in.
+/// True when a resource **this build derives nothing for** was named, and there
+/// was code to account for it in.
 ///
-/// The `statements` qualification is the whole content of this function, and it
-/// is why it is a function rather than an expression inline in [`analyse`]: a
-/// run that analysed no code at all has a stronger and more actionable thing to
-/// say about itself, and [`classify`] says it. Announcing that a resource was
-/// left unaccounted for over a tree that held no code buries "this path matches
-/// nothing" — a stale glob the caller can fix today — under a milestone
-/// limitation that will be equally true of every run until bound inference
-/// lands.
+/// Two qualifications, and each is why this is a function rather than an
+/// expression inline in [`analyse`].
+///
+/// The `statements` one: a run that analysed no code at all has a stronger and
+/// more actionable thing to say about itself, and [`classify`] says it.
+/// Announcing that a resource was left unaccounted for over a tree that held no
+/// code buries "this path matches nothing" — a stale glob the caller can fix
+/// today — under a limitation the caller cannot act on at all.
+///
+/// The [`crate::resource::derives`] one is LAN-86: the question is asked per
+/// resource now. `queries` derives a number, so a run that asked for it and got
+/// one has nothing unaccounted for. Reporting it inconclusive anyway would
+/// train callers to ignore the verdict on the one resource that works, which is
+/// worse than never having answered.
 const fn resource_unaccounted(resource: Option<ResourceKind>, statements: usize) -> bool {
-    resource.is_some() && statements > 0
+    match resource {
+        Some(kind) => !crate::resource::derives(kind) && statements > 0,
+        None => false,
+    }
 }
 
 /// Turn the counts into exactly one outcome.
@@ -744,6 +756,7 @@ fn accumulate<W: std::io::Write>(
     text: &str,
     coverage: &mut Coverage,
     analysed: &mut usize,
+    resource: Option<ResourceKind>,
     mut bounds: Option<&mut Report<W>>,
     mut collected: Option<&mut machine::Collector>,
 ) -> Result<(), ToolError> {
@@ -759,11 +772,20 @@ fn accumulate<W: std::io::Write>(
     })?;
     for function in &functions {
         let lowered = landav_its::lower(function.program());
+        // The frontend's own refusal records, joined against the hole ledger to
+        // name the assumption each hole left undischarged. See
+        // `crate::assumption`.
+        let records = lowered
+            .as_ref()
+            .err()
+            .and_then(landav_its::LoweringError::refusals);
+        let records: &[landav_its::Unsupported] =
+            records.map_or(&[], landav_its::Refusals::as_slice);
         // The engine is asked about every function, whether or not it lowered.
         // A function whose only obstacle is a call still has a cost apart from
         // that call, and reporting it with the call named is the deliverable;
         // reporting nothing reads as a bound of zero.
-        let derived = crate::derived::cost_of(function, lowered.is_ok());
+        let derived = crate::derived::cost_of(function, lowered.is_ok(), records);
         // Counted on the bound, not on the call: `TripCount::Unknown` is the
         // engine saying it could not read the function at all, and counting it
         // would make the reach number mean "was asked about", which every
@@ -774,7 +796,7 @@ fn accumulate<W: std::io::Write>(
         if let Some(report) = bounds.as_deref_mut() {
             report.line(format_args!(
                 "{}",
-                describe_bound(function, derived.as_ref())
+                describe_bound(function, derived.as_ref(), records, resource)
             ));
         }
         if let Some(sink) = collected.as_deref_mut() {
@@ -808,9 +830,19 @@ fn accumulate<W: std::io::Write>(
 /// call is derived apart from the call, and the call is named and placed. What
 /// the run may claim about such a function is decided in [`crate::derived`];
 /// `None` here means it may claim nothing.
+///
+/// # Two things beside the cost, both LAN-86 and LAN-14
+///
+/// Each hole now carries the **assumption** it left undischarged as well as the
+/// construct it was, and the line carries the **selected resource's** count for
+/// this function when one was selected and this build derives it. Both are
+/// rendered from the same values [`crate::machine`] serialises, so a person at a
+/// terminal and a gate parsing the JSON cannot be told different things.
 fn describe_bound(
     function: &landav_python::LoweredFunction,
     derived: Option<&landav_engine::TripCount>,
+    records: &[landav_its::Unsupported],
+    resource: Option<ResourceKind>,
 ) -> String {
     let at = function.location();
     let where_ = format!("{}:{}:{}", at.file().display(), at.line(), at.column());
@@ -821,6 +853,50 @@ fn describe_bound(
             function.name()
         );
     };
+    let line = describe_cost(&where_, function, derived, records);
+    match resource_clause(derived, resource) {
+        Some(clause) => format!("{line}; {clause}"),
+        None => line,
+    }
+}
+
+/// The selected resource's count for one function, as a clause, or `None` when
+/// no resource was selected or this build derives none for it.
+///
+/// Rendered from the same [`crate::resource_bound::ResourceBound`] the JSON
+/// carries, so a reader at a terminal and a gate parsing the machine output
+/// cannot be given different numbers for the same function.
+fn resource_clause(
+    derived: &landav_engine::TripCount,
+    resource: Option<ResourceKind>,
+) -> Option<String> {
+    let kind = resource.filter(|kind| crate::resource::derives(*kind))?;
+    let descriptor = kind.descriptor();
+    let projected = crate::resource_bound::ResourceBound::queries_of(derived);
+    // Silence would read as zero, which is the one reading this whole surface
+    // exists to prevent, so a function the projection could not read says so on
+    // its own line rather than dropping the clause.
+    let Some(bound) = projected.bound else {
+        return Some(format!(
+            "no {} count derived for this function",
+            descriptor.unit()
+        ));
+    };
+    Some(format!(
+        "{bound} {} ({})",
+        descriptor.unit(),
+        projected.kind.unwrap_or("not derived")
+    ))
+}
+
+/// The cost half of a bound line.
+fn describe_cost(
+    where_: &str,
+    function: &landav_python::LoweredFunction,
+    derived: &landav_engine::TripCount,
+    records: &[landav_its::Unsupported],
+) -> String {
+    let file = function.location().file().display().to_string();
     match derived {
         landav_engine::TripCount::Exact(bound) => format!(
             "{where_}: {}: Theta({bound}) - derived exactly",
@@ -841,7 +917,7 @@ fn describe_bound(
             } else {
                 "O"
             },
-            describe_holes(holes, &at.file().display().to_string())
+            describe_holes(holes, &file, records, function.name())
         ),
         landav_engine::TripCount::Unknown => format!(
             "{where_}: {}: no bound: the native engine could not read this function \
@@ -856,7 +932,12 @@ fn describe_bound(
 /// This is the blame. "No bound" tells a user nothing they can act on; naming
 /// the construct and the line tells them exactly what to change, or what to
 /// point a solver at.
-fn describe_holes(holes: &[landav_engine::Hole], file: &str) -> String {
+fn describe_holes(
+    holes: &[landav_engine::Hole],
+    file: &str,
+    records: &[landav_its::Unsupported],
+    enclosing: &str,
+) -> String {
     holes
         .iter()
         .map(|hole| {
@@ -867,7 +948,17 @@ fn describe_holes(holes: &[landav_engine::Hole], file: &str) -> String {
             let at = origin
                 .strip_prefix(file)
                 .map_or(origin, |rest| rest.trim_start_matches(':'));
-            format!("{} ({} at {at})", hole.var().symbol(), hole.construct())
+            // LAN-14's second half. The construct says what the region is; this
+            // says what could not be *established* about it, which is the part a
+            // reader can act on - a `while` needs a ranking function and a call
+            // needs a cost contract, and both read as "not derived" without it.
+            let assumption = crate::assumption::undischarged(hole, records, enclosing);
+            format!(
+                "{} ({} at {at}, {})",
+                hole.var().symbol(),
+                hole.construct(),
+                crate::assumption::describe(&assumption)
+            )
         })
         .collect::<Vec<String>>()
         .join(", ")
