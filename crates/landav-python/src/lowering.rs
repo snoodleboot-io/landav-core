@@ -105,9 +105,19 @@ fn lower_function(
     let location = position(path, index, function);
     let origin = origin_of(path, index, function);
 
+    let collections: BTreeSet<String> = collection_parameters(function).into_iter().collect();
+
+    // A collection parameter contributes its **length** rather than itself: the
+    // fragment has no value for a list, and the length is the only thing about
+    // one that a cost can be a function of. `LAN-89`.
     let params: Vec<VarName> = integer_parameters(function)
         .into_iter()
         .map(VarName::new)
+        .chain(
+            collection_parameters(function)
+                .iter()
+                .map(|it| length_var(it)),
+        )
         .collect();
 
     let mut translator = Translator {
@@ -115,6 +125,8 @@ fn lower_function(
         index,
         builder: SourceProgramBuilder::new(name.clone(), origin, params),
         integers,
+        collections,
+        walks: 0,
     };
     let body = translator.block(&function.body);
     let program = translator.builder.build(body);
@@ -148,6 +160,66 @@ fn annotation_is_int(annotation: Option<&Expr>) -> bool {
     matches!(annotation, Some(Expr::Name(name)) if name.id.as_str() == "int")
 }
 
+/// The builtin types whose `len` counts exactly the values `for` walks.
+///
+/// The equality is the point. `len` and iteration have to agree, or a loop
+/// counted by the length runs a different number of times than the bound says.
+/// For each of these Python guarantees they do: a `dict` iterates its keys and
+/// there are `len(d)` of them, a `str` iterates its characters and there are
+/// `len(s)` of them.
+///
+/// Deliberately absent: `Iterable`, `Iterator`, `Generator` and `Sequence`. The
+/// first three need not have a `len` at all and iterating one may consume it;
+/// `Sequence` is a protocol any user class may claim, and its `__len__` and
+/// `__iter__` are two methods that need not agree.
+const SIZED_BUILTINS: [&str; 7] = ["list", "tuple", "set", "frozenset", "dict", "str", "bytes"];
+
+/// Whether an annotation names a builtin collection whose length bounds
+/// iteration over it.
+///
+/// Accepts the bare name and the subscripted form, so `list` and `list[int]`
+/// are both collections - the element type says nothing about how many there
+/// are, which is the only question here.
+///
+/// This trusts the annotation exactly as far as [`annotation_is_int`] trusts
+/// `int`: Python does not enforce either at runtime, and a frontend that
+/// declines to trust annotations has nothing left to reason from.
+fn annotation_is_collection(annotation: Option<&Expr>) -> bool {
+    let named = match annotation {
+        Some(Expr::Name(name)) => name.id.as_str(),
+        // `list[int]`, `dict[str, int]` - the value is what is subscripted.
+        Some(Expr::Subscript(subscript)) => match subscript.value.as_ref() {
+            Expr::Name(name) => name.id.as_str(),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    SIZED_BUILTINS.contains(&named)
+}
+
+/// The parameters annotated with a sized builtin collection, in declaration
+/// order.
+fn collection_parameters(function: &ast::StmtFunctionDef) -> Vec<String> {
+    let arguments = &function.args;
+    arguments
+        .posonlyargs
+        .iter()
+        .chain(arguments.args.iter())
+        .filter(|parameter| annotation_is_collection(parameter.def.annotation.as_deref()))
+        .map(|parameter| parameter.def.arg.to_string())
+        .collect()
+}
+
+/// The bound variable standing for the length of collection parameter `name`.
+///
+/// Spelled `len(items)` because that is what the caller would write to compute
+/// it, and because no Python identifier contains a parenthesis - so this can
+/// never collide with a name the source could have bound. The same reasoning
+/// `Hole` uses for `#hole0`.
+fn length_var(name: &str) -> VarName {
+    VarName::new(format!("len({name})"))
+}
+
 /// The names that provably hold integers throughout `function`.
 ///
 /// A least fixed point: start with every assigned name plus the `int`
@@ -168,6 +240,7 @@ fn integer_names(function: &ast::StmtFunctionDef) -> BTreeSet<String> {
         .map(|parameter| parameter.def.arg.to_string())
         .collect();
 
+    let collections: BTreeSet<String> = collection_parameters(function).into_iter().collect();
     let mut candidates: BTreeSet<String> = integer_parameters(function).into_iter().collect();
     for statement in crate::syntax::stmt_tree(&function.body) {
         for name in assigned_names(statement) {
@@ -182,7 +255,7 @@ fn integer_names(function: &ast::StmtFunctionDef) -> BTreeSet<String> {
     for _ in 0..=candidates.len() {
         let mut doomed: BTreeSet<String> = BTreeSet::new();
         for statement in crate::syntax::stmt_tree(&function.body) {
-            collect_non_integer_bindings(statement, &candidates, &mut doomed);
+            collect_non_integer_bindings(statement, &candidates, &collections, &mut doomed);
         }
         if doomed.is_empty() {
             break;
@@ -215,6 +288,7 @@ fn assigned_names(statement: &Stmt) -> Vec<String> {
 fn collect_non_integer_bindings(
     statement: &Stmt,
     candidates: &BTreeSet<String>,
+    collections: &BTreeSet<String>,
     doomed: &mut BTreeSet<String>,
 ) {
     let mut condemn = |target: &Expr| {
@@ -229,7 +303,7 @@ fn collect_non_integer_bindings(
 
     match statement {
         Stmt::Assign(assign) => {
-            if !is_integer_expr(&assign.value, candidates) {
+            if !is_integer_expr(&assign.value, candidates, collections) {
                 for target in &assign.targets {
                     condemn(target);
                 }
@@ -244,7 +318,7 @@ fn collect_non_integer_bindings(
         }
         Stmt::AugAssign(assign) => {
             let arithmetic = arith_of(&assign.op).is_some();
-            if !arithmetic || !is_integer_expr(&assign.value, candidates) {
+            if !arithmetic || !is_integer_expr(&assign.value, candidates, collections) {
                 condemn(&assign.target);
             }
         }
@@ -253,14 +327,17 @@ fn collect_non_integer_bindings(
                 condemn(&assign.target);
             }
             if let Some(value) = &assign.value
-                && !is_integer_expr(value, candidates)
+                && !is_integer_expr(value, candidates, collections)
             {
                 condemn(&assign.target);
             }
         }
         Stmt::For(loop_stmt)
-            if range_arguments(&loop_stmt.iter)
-                .is_none_or(|args| !args.iter().all(|arg| is_integer_expr(arg, candidates))) =>
+            if range_arguments(&loop_stmt.iter).is_none_or(|args| {
+                !args
+                    .iter()
+                    .all(|arg| is_integer_expr(arg, candidates, collections))
+            }) =>
         {
             condemn(&loop_stmt.target);
         }
@@ -273,32 +350,72 @@ fn collect_non_integer_bindings(
 /// Conservative in the safe direction throughout: an expression this cannot
 /// prove integral is treated as non-integral, which costs coverage and never
 /// soundness.
-fn is_integer_expr(expr: &Expr, candidates: &BTreeSet<String>) -> bool {
+fn is_integer_expr(
+    expr: &Expr,
+    candidates: &BTreeSet<String>,
+    collections: &BTreeSet<String>,
+) -> bool {
     match expr {
+        // `len(items)` is a natural number, so a name bound from it is an
+        // integer and a `range` over it has an integer counter. `LAN-89`.
+        Expr::Call(call) => length_of_collection(call, collections).is_some(),
         Expr::Constant(constant) => {
             matches!(constant.value, Constant::Int(_) | Constant::Bool(_))
         }
         Expr::Name(name) => candidates.contains(name.id.as_str()),
         Expr::BinOp(binary) => match binary.op {
             ast::Operator::Add | ast::Operator::Sub | ast::Operator::Mult => {
-                is_integer_expr(&binary.left, candidates)
-                    && is_integer_expr(&binary.right, candidates)
+                is_integer_expr(&binary.left, candidates, collections)
+                    && is_integer_expr(&binary.right, candidates, collections)
             }
             ast::Operator::Pow => {
                 literal_exponent(&binary.right).is_some()
-                    && is_integer_expr(&binary.left, candidates)
+                    && is_integer_expr(&binary.left, candidates, collections)
             }
             _ => false,
         },
         Expr::UnaryOp(unary) => {
             matches!(unary.op, ast::UnaryOp::USub | ast::UnaryOp::UAdd)
-                && is_integer_expr(&unary.operand, candidates)
+                && is_integer_expr(&unary.operand, candidates, collections)
         }
         _ => false,
     }
 }
 
 /// The arguments of a `range(...)` call, or `None` if this is not one.
+/// The collection parameter whose length this call computes, if it is one.
+///
+/// `len(items)` and nothing else: a keyword argument, a second argument, or an
+/// argument that is not a bare name all mean this is some other call. `len` is
+/// matched by name because the fragment has no way to know it was rebound, and
+/// a module that shadows `len` is doing something this analysis cannot follow
+/// anyway - the same trust the `int` annotation already gets.
+fn length_of_collection(call: &ast::ExprCall, collections: &BTreeSet<String>) -> Option<String> {
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if callee.id.as_str() != "len" || !call.keywords.is_empty() {
+        return None;
+    }
+    let [Expr::Name(argument)] = call.args.as_slice() else {
+        return None;
+    };
+    collections
+        .contains(argument.id.as_str())
+        .then(|| argument.id.to_string())
+}
+
+/// The collection parameter this expression iterates, if it is a bare name for
+/// one.
+fn walked_collection(expr: &Expr, collections: &BTreeSet<String>) -> Option<String> {
+    let Expr::Name(name) = expr else {
+        return None;
+    };
+    collections
+        .contains(name.id.as_str())
+        .then(|| name.id.to_string())
+}
+
 fn range_arguments(expr: &Expr) -> Option<&[Expr]> {
     let call = match expr {
         Expr::Call(call) => call,
@@ -366,6 +483,14 @@ struct Translator<'a> {
     index: &'a LineIndex,
     builder: SourceProgramBuilder,
     integers: BTreeSet<String>,
+    /// The parameters annotated with a sized builtin collection.
+    ///
+    /// Parameters only. A local holding a collection has no length the caller
+    /// can supply, and one assigned from a region may have any length at all.
+    collections: BTreeSet<String>,
+    /// How many collection walks have been lowered, to keep their synthetic
+    /// counters apart.
+    walks: u32,
 }
 
 impl Translator<'_> {
@@ -557,6 +682,38 @@ impl Translator<'_> {
         statements
     }
 
+    /// `for x in items:` where `items` is a collection parameter.
+    ///
+    /// # Why the counter is synthetic rather than the loop's own target
+    ///
+    /// The target binds an **element**, and an element of a `list` may be a
+    /// string. [`landav_its::VarName`] promises a mathematical integer, so the
+    /// target may not become one - `integer_names` already dooms it, which is
+    /// what makes a read of it in the body refuse.
+    ///
+    /// But [`landav_its::SourceStmt::ForRange`] needs *some* counter, and the
+    /// engine adds it to the values it may read while deriving the body. Giving
+    /// it the element's name would mean one name standing for two things: a
+    /// counter the engine may read, and an element it may not. They stay apart
+    /// here instead. `#` is not legal in a Python identifier, so the synthetic
+    /// name cannot collide with the one the source bound.
+    fn walk_collection(&mut self, loop_stmt: &ast::StmtFor, collection: &str) -> Vec<StmtId> {
+        let origin = self.origin(loop_stmt);
+        let start = self.builder.int(0, origin.clone());
+        let stop = self.builder.var(length_var(collection), origin.clone());
+        let counter = VarName::new(format!("#walk{}", self.walks));
+        self.walks += 1;
+
+        let body = self.block(&loop_stmt.body);
+        let Some(stride) = core::num::NonZeroI64::new(1) else {
+            unreachable!("1 is non-zero")
+        };
+        vec![
+            self.builder
+                .for_range(counter, RangeSpec::new(start, stop, stride), body, origin),
+        ]
+    }
+
     fn for_loop(&mut self, loop_stmt: &ast::StmtFor) -> Vec<StmtId> {
         if !loop_stmt.orelse.is_empty() {
             return vec![self.refuse_stmt_detailed(
@@ -569,8 +726,13 @@ impl Translator<'_> {
             return vec![self.refuse_stmt(Construct::ComplexAssignmentTarget, loop_stmt)];
         };
         let Some(arguments) = range_arguments(&loop_stmt.iter) else {
-            // Iteration over a container, a generator, `enumerate`, `zip`: all
-            // need a size model this fragment does not have.
+            // Walking a collection **parameter** is counted by its length.
+            // `LAN-89`.
+            if let Some(collection) = walked_collection(&loop_stmt.iter, &self.collections) {
+                return self.walk_collection(loop_stmt, &collection);
+            }
+            // Iteration over any other container, a generator, `enumerate`,
+            // `zip`: all need a size model this fragment does not have.
             return vec![self.refuse_stmt(Construct::UnboundedIteration, loop_stmt)];
         };
         if !self.integers.contains(target.id.as_str()) {
@@ -807,14 +969,43 @@ impl Translator<'_> {
 
     fn comparison(&mut self, comparison: &ast::ExprCompare) -> CondId {
         let origin = self.origin(comparison);
+
+        // Decide **before** translating an operand. `in`, `not in`, `is` and
+        // `is not` are membership and identity, both of which need a model this
+        // fragment does not have - and the refusal that stands in for them is a
+        // fresh node that references neither side. An operand translated first
+        // and then abandoned is an `Unsupported` node in the arena with nothing
+        // pointing at it, which `Walk::reconciled` answers with `Unknown` for
+        // the entire function rather than a region for the comparison. `LAN-90`.
+        //
+        // Only the *refused* operators need this. An operand of a comparison
+        // that is understood stays referenced by the `compare` node below, so it
+        // is reachable and gets charged where it stands.
+        if let Some(refused) = comparison
+            .ops
+            .iter()
+            .find(|candidate| compare_of(candidate).is_none())
+        {
+            let construct = match refused {
+                ast::CmpOp::In | ast::CmpOp::NotIn => Construct::Collection,
+                _ => Construct::NonIntegerValue,
+            };
+            return self.builder.unsupported_cond_detailed(
+                construct,
+                "membership or identity comparison",
+                origin,
+            );
+        }
+
         let mut left = self.expression(&comparison.left);
         let mut combined: Option<CondId> = None;
 
         for (op, right_expr) in comparison.ops.iter().zip(comparison.comparators.iter()) {
             let right = self.expression(right_expr);
             let Some(operator) = compare_of(op) else {
-                // `in`, `not in`, `is`, `is not`: membership and identity, both
-                // of which need a model this fragment does not have.
+                // Unreachable: every operator was checked above. Kept as a
+                // refusal rather than a panic - a frontend that grows an
+                // operator and forgets the guard must still refuse, not abort.
                 let construct = match op {
                     ast::CmpOp::In | ast::CmpOp::NotIn => Construct::Collection,
                     _ => Construct::NonIntegerValue,
@@ -935,6 +1126,12 @@ impl Translator<'_> {
             },
 
             Expr::Call(call) => {
+                // `len(items)` for a collection **parameter** is the one call
+                // this fragment can read, because its value is a natural number
+                // the caller already knows. Everything else is a region.
+                if let Some(name) = length_of_collection(call, &self.collections) {
+                    return self.builder.var(length_var(&name), origin);
+                }
                 let detail = match call.func.as_ref() {
                     Expr::Name(name) => name.id.to_string(),
                     Expr::Attribute(attribute) => attribute.attr.to_string(),
