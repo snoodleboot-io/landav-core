@@ -31,8 +31,8 @@ use landav_bound::{Origin, Symbol};
 
 use crate::{
     MAX_DNF_CLAUSES, arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId,
-    constraint::Constraint, construct::Construct, cost::Cost, expr_id::ExprId, guard::Guard,
-    its::Its, its_var::ItsVar, location::Location, location_id::LocationId,
+    constraint::Constraint, construct::Construct, cost::Cost, expr_id::ExprId, extent::Extent,
+    guard::Guard, its::Its, its_var::ItsVar, location::Location, location_id::LocationId,
     lowering_error::LoweringError, polynomial::Polynomial, refusals::Refusals, relation::Relation,
     source_cond::SourceCond, source_expr::SourceExpr, source_program::SourceProgram,
     source_stmt::SourceStmt, stmt_id::StmtId, transition::Transition, unsupported::Unsupported,
@@ -199,6 +199,16 @@ impl<'a> Lowering<'a> {
     /// A frontend therefore cannot lose a refusal by forgetting to hang a node
     /// off something, which is the easiest mistake in the whole translation to
     /// make and the hardest to notice.
+    ///
+    /// # The one node that is not a refusal
+    ///
+    /// A node carrying a [`crate::DeclaredEffect`] is skipped here. The frontend
+    /// has said what it costs and that it rebinds no local, which is exactly the
+    /// pair of facts a transition needs, so `lower_stmt` emits one for it. That
+    /// is a claim the frontend makes and this crate takes: nothing here checks
+    /// it, and nothing here could. What is *not* relaxed is everything else -
+    /// a node without a declaration refuses exactly as before, which is what
+    /// keeps an unknown callee unknown.
     fn refuse_every_unsupported_node(&mut self) {
         // One implementation, shared with every other consumer that has to
         // account for these nodes. `landav-engine` charges each one as a hole
@@ -208,6 +218,15 @@ impl<'a> Lowering<'a> {
         // test failure.
         let found: Vec<_> = self.program.unsupported_nodes().collect();
         for node in found {
+            // A node carrying a `DeclaredEffect` is not a refusal: the frontend
+            // has said what it costs and what it may change, and this lowering
+            // emits a transition for it below. Skipping it here is the whole of
+            // that - everything else about the scan is unchanged, and a node
+            // *without* a declaration refuses exactly as it always did, which is
+            // what keeps an unknown callee an unknown callee.
+            if node.declared().is_some() {
+                continue;
+            }
             self.refuse(
                 node.construct(),
                 node.origin().clone(),
@@ -361,7 +380,28 @@ impl<'a> Lowering<'a> {
             // Recorded by `refuse_every_unsupported_node`, not here. Doing it
             // in both places would leave one of them dead, and dead code that
             // looks load bearing is how a real gap gets overlooked.
-            SourceStmt::Unsupported { .. } => {}
+            //
+            // Unless the frontend declared what it costs, in which case there is
+            // nothing to record and there **is** something to emit: bounded work
+            // that rebinds no local is an ordinary step with an identity update,
+            // which is a transition this system can hold. `extent` decides
+            // whether the source step is charged here or by the statement beside
+            // it, exactly as it does for the cost consumer - a fragment lifted
+            // out of `raise ValueError("x")` must not charge the step the
+            // `raise` is already charging.
+            SourceStmt::Unsupported {
+                extent, declared, ..
+            } => {
+                let Some(effect) = *declared else {
+                    return;
+                };
+                let own: u32 = match extent {
+                    Extent::Statement => 1,
+                    Extent::Fragment => 0,
+                };
+                let cost = Cost::constant(own.saturating_add(effect.steps()));
+                self.emit(from, to, Guard::always(), Update::identity(), cost, origin);
+            }
         }
     }
 
@@ -555,7 +595,25 @@ impl<'a> Lowering<'a> {
                         // a placeholder that keeps the traversal total; it is
                         // never observed, because a program with a refusal in
                         // it never yields a system.
-                        SourceExpr::Unsupported { .. } => {
+                        //
+                        // A **declared** node is the one case where that is not
+                        // already true - the scan lets it through - and reaching
+                        // one here means it was put where its value is read.
+                        // Zero would then be a value invented for a call, so it
+                        // refuses instead. `SourceExpr::Unsupported` states the
+                        // rule; this is where it is enforced rather than hoped
+                        // for.
+                        SourceExpr::Unsupported {
+                            construct,
+                            detail,
+                            declared,
+                            ..
+                        } => {
+                            if declared.is_some() {
+                                let (construct, detail) = (*construct, detail.clone());
+                                let origin = self.expr_origin(id);
+                                self.refuse(construct, origin, detail);
+                            }
                             self.store_expr(slot, Polynomial::zero());
                         }
                     }
@@ -646,8 +704,29 @@ impl<'a> Lowering<'a> {
                     };
                     match node {
                         SourceCond::Compare { op, left, right } => {
-                            let left = self.expr_poly(*left);
-                            let right = self.expr_poly(*right);
+                            // A comparison over a node the frontend declared
+                            // rather than translated has no polynomial to
+                            // compare: `isinstance(x, int) != 0` is the truth
+                            // test a frontend spells for `if isinstance(...)`,
+                            // and reading the left operand as the zero
+                            // `expr_poly` hands out for an `Unsupported` node
+                            // would make the guard *false* and the `then` arm
+                            // unreachable - a system admitting fewer executions
+                            // than the program has.
+                            //
+                            // Both normal forms are `true`: either branch may be
+                            // taken, which admits more executions rather than
+                            // fewer and is the same answer this lowering already
+                            // gives a `SourceCond::Unsupported`. The declaration
+                            // is what makes it safe - the *effect* is known, and
+                            // only the truth value is not.
+                            let (left, right) = (*left, *right);
+                            if self.expr_holds_declared(left) || self.expr_holds_declared(right) {
+                                self.store_cond(slot, (dnf_true(), dnf_true()));
+                                continue;
+                            }
+                            let left = self.expr_poly(left);
+                            let right = self.expr_poly(right);
                             let origin = self.cond_origin(id);
                             let built = self.compare_dnf(*op, &left, &right, &origin);
                             self.store_cond(slot, built);
@@ -706,6 +785,37 @@ impl<'a> Lowering<'a> {
         }
 
         self.recall_cond(root)
+    }
+
+    /// Whether `root`'s value depends on a node the frontend declared rather
+    /// than translated.
+    ///
+    /// Walks exactly where [`Lowering::expr_poly`] walks - `Arith`, `Neg` and
+    /// `Pow` - because the question is precisely "would `expr_poly` reach one".
+    /// It deliberately does not descend into `bounded_by` or `evaluates`:
+    /// neither contributes to this node's value, and `expr_poly` does not read
+    /// them either.
+    fn expr_holds_declared(&self, root: ExprId) -> bool {
+        let program = self.program;
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        let mut work = vec![root];
+        while let Some(id) = work.pop() {
+            if !seen.insert(id.index()) {
+                continue;
+            }
+            match program.expr(id) {
+                Some(SourceExpr::Arith { left, right, .. }) => work.extend([*left, *right]),
+                Some(SourceExpr::Neg { operand }) => work.push(*operand),
+                Some(SourceExpr::Pow { base, .. }) => work.push(*base),
+                Some(SourceExpr::Unsupported { declared, .. }) => {
+                    if declared.is_some() {
+                        return true;
+                    }
+                }
+                Some(SourceExpr::Int { .. } | SourceExpr::Var { .. }) | None => {}
+            }
+        }
+        false
     }
 
     /// The two normal forms of one comparison. Exact in both polarities.

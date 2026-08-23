@@ -213,6 +213,16 @@ impl Construct {
     /// list's length afterwards. Whether a particular name is of that kind is a
     /// fact about the program, not about the construct, so it is recorded
     /// there: see [`crate::SourceProgram::is_volatile`].
+    ///
+    /// # This is the answer for a *kind*, and a node may have a better one
+    ///
+    /// `Call` answers `true` because it has to speak for every callee at once,
+    /// and `foo(x)` may be a closure over this frame's namespace. That is the
+    /// right answer for the construct and the wrong one for `isinstance`, whose
+    /// argument is the same one made above for `x.y`. A frontend that can tell
+    /// the two apart says so on the node rather than here, and this stays the
+    /// **default** that a node with nothing to declare inherits. See
+    /// [`crate::DeclaredEffect`].
     #[must_use]
     pub const fn may_rebind_locals(self) -> bool {
         match self {

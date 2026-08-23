@@ -47,14 +47,16 @@
 use std::{
     collections::{BTreeSet, HashMap},
     path::Path,
+    sync::OnceLock,
 };
 
 use landav_bound::{Origin, Symbol};
+use landav_fdk::{Signature, SignaturePack};
 use landav_its::{
-    ArithOp, CompareOp, CondId, Construct, ExprId, Extent, RangeSpec, SourceProgramBuilder, StmtId,
-    VarName,
+    ArithOp, CompareOp, CondId, Construct, DeclaredEffect, ExprId, Extent, RangeSpec,
+    SourceProgramBuilder, StmtId, VarName,
 };
-use rustpython_parser::ast::{self, Constant, Expr, Ranged, Stmt};
+use rustpython_parser::ast::{self, Constant, Expr, Ranged, Stmt, text_size::TextRange};
 
 use crate::{
     analysis::parse_guarded, location::Location, lowered_function::LoweredFunction,
@@ -85,25 +87,110 @@ const MAX_EXPONENT: u32 = landav_its::MAX_DEGREE;
 /// fragment is not an error here, it is an `Unsupported` node in the program.
 pub fn lower_module(path: &Path, source: &str) -> Result<Vec<LoweredFunction>, PythonError> {
     let (module, index) = parse_guarded(path, source)?;
+    // Which names this module binds for itself, computed once. A signature pack
+    // is keyed by *name*, and a module that writes `def isinstance(...)` is not
+    // calling the builtin - see `SignaturePack` for the whole caveat and for
+    // what this does not cover.
+    let module_bound = bindings_of(&module);
+    // `None` means "this scope binds names this pass could not enumerate", and
+    // it disqualifies every signature rather than being silently treated as an
+    // empty set.
     let mut lowered = Vec::new();
     for statement in &module {
-        if let Stmt::FunctionDef(function) = statement {
-            lowered.push(lower_function(path, &index, function));
+        if let Some(definition) = Definition::of(statement) {
+            lowered.push(lower_function(
+                path,
+                &index,
+                definition,
+                module_bound.as_ref(),
+            ));
         }
     }
     Ok(lowered)
 }
 
-/// Translates one `def`.
+/// The parts of a top-level definition that translating it depends on.
+///
+/// # Why a borrowed view and not two code paths
+///
+/// `def` and `async def` are two node types in the parser -
+/// [`ast::StmtFunctionDef`] and [`ast::StmtAsyncFunctionDef`] - carrying
+/// field-for-field the same thing, and nothing below this point has any reason
+/// to know which it was handed: parameters are annotated the same way, the body
+/// holds the same statements, and `async` describes how the function is
+/// *called* rather than what its body costs. Every async-flavoured construct
+/// that does cost something different - `await`, `async for`, `async with` -
+/// is already refused where it stands, by the statement and expression arms
+/// that a plain `def` reaches too.
+///
+/// `LAN-93` was that the module walk matched only the first of the two, so an
+/// `async def` produced no [`LoweredFunction`]: not refused, not holed, not in
+/// the coverage denominator. Reaching both by duplicating [`lower_function`],
+/// [`integer_names`], [`integer_parameters`] and [`collection_parameters`]
+/// would fix the count and leave four pairs of functions to drift apart - and
+/// the copy that drifted would be the async one, which is the one nobody reads.
+/// One view, constructed once, keeps a single body of logic.
+///
+/// Borrowed and [`Copy`]: the AST stays the sole owner of every part, and
+/// building one of these costs nothing.
+#[derive(Clone, Copy)]
+struct Definition<'a> {
+    /// The name as written.
+    name: &'a str,
+    /// The parameter list, which is where `int` and collection annotations are
+    /// read from.
+    args: &'a ast::Arguments,
+    /// The statements to translate.
+    body: &'a [Stmt],
+    /// The extent of the **whole statement**. For an `async def` that starts at
+    /// the `async` keyword, not at the `def` five characters later, so a report
+    /// points at the line as the reader sees it.
+    range: TextRange,
+}
+
+impl<'a> Definition<'a> {
+    /// The definition `statement` is, or `None` if it is not one.
+    ///
+    /// Both arms live here, together, deliberately: this function is the only
+    /// place that decides what counts as a top-level function, so a node type
+    /// missing from it is missing from the denominator and says nothing about
+    /// itself anywhere in the output. That silence is the whole of `LAN-93`.
+    fn of(statement: &'a Stmt) -> Option<Self> {
+        match statement {
+            Stmt::FunctionDef(function) => Some(Self {
+                name: function.name.as_str(),
+                args: function.args.as_ref(),
+                body: &function.body,
+                range: function.range,
+            }),
+            Stmt::AsyncFunctionDef(function) => Some(Self {
+                name: function.name.as_str(),
+                args: function.args.as_ref(),
+                body: &function.body,
+                range: function.range,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl Ranged for Definition<'_> {
+    fn range(&self) -> TextRange {
+        self.range
+    }
+}
+
+/// Translates one `def` or `async def`.
 fn lower_function(
     path: &Path,
     index: &LineIndex,
-    function: &ast::StmtFunctionDef,
+    function: Definition<'_>,
+    module_bound: Option<&BTreeSet<String>>,
 ) -> LoweredFunction {
     let integers = integer_names(function);
-    let name = function.name.to_string();
-    let location = position(path, index, function);
-    let origin = origin_of(path, index, function);
+    let name = function.name.to_owned();
+    let location = position(path, index, &function);
+    let origin = origin_of(path, index, &function);
 
     let collections: BTreeSet<String> = collection_parameters(function).into_iter().collect();
 
@@ -131,20 +218,249 @@ fn lower_function(
         builder.mark_volatile(length_var(&collection));
     }
 
+    // Every name that is bound anywhere this call site can see it: the module's
+    // own bindings, this function's parameters, and everything its body binds.
+    // A callee found here gets no signature, whatever the pack says.
+    let shadowed = module_bound
+        .zip(bindings_of(function.body))
+        .map(|(module_names, mut names)| {
+            names.extend(module_names.iter().cloned());
+            names.extend(parameter_names(function));
+            names
+        });
+
     let mut translator = Translator {
         path,
         index,
         builder,
         integers,
         collections,
+        shadowed,
+        pack: builtin_pack(),
         walks: 0,
         discarding: false,
         value_discarded: false,
+        truth_test: false,
     };
-    let body = translator.block(&function.body);
+    let body = translator.block(function.body);
     let program = translator.builder.build(body);
 
     LoweredFunction::new(name, location, program)
+}
+
+// ---------------------------------------------------------------------------
+// the signature pack, and the names that disqualify it
+// ---------------------------------------------------------------------------
+
+/// The OSS builtin signature pack, read once.
+///
+/// Parsed lazily rather than per module: `lower_module` runs once per file and
+/// a corpus is thousands of files, so re-reading the same TOML each time would
+/// be the analysis's own hot loop.
+///
+/// A pack that fails to parse yields an **empty** pack rather than a panic, and
+/// an empty pack resolves nothing: every call stays the hole it was before this
+/// ticket. Failing closed is the only failure mode available to a library that
+/// may not abort, and it is the right one - the cost of a broken pack is lost
+/// coverage, never an unsound bound. `landav-fdk`'s own tests keep the shipped
+/// file parsing.
+fn builtin_pack() -> &'static SignaturePack {
+    static PACK: OnceLock<SignaturePack> = OnceLock::new();
+    PACK.get_or_init(|| SignaturePack::builtin().unwrap_or_default())
+}
+
+/// The declaration a resolvable signature makes about a call site.
+fn effect_of(row: &Signature) -> DeclaredEffect {
+    DeclaredEffect::new(row.cost.steps(), row.rebinds_locals, row.mutates_arguments)
+}
+
+/// Every name a parameter list binds.
+fn parameter_names(function: Definition<'_>) -> Vec<String> {
+    let arguments = function.args;
+    arguments
+        .posonlyargs
+        .iter()
+        .chain(arguments.args.iter())
+        .chain(arguments.kwonlyargs.iter())
+        .map(|parameter| parameter.def.arg.to_string())
+        .chain(
+            arguments
+                .vararg
+                .iter()
+                .chain(arguments.kwarg.iter())
+                .map(|parameter| parameter.arg.to_string()),
+        )
+        .collect()
+}
+
+/// Every name `statements` bind **in their own scope**.
+///
+/// # What this is for
+///
+/// A signature pack is keyed by callee name, and matching by name is unsound
+/// the moment a name means something else. `def isinstance(x, t): ...`,
+/// `from mymod import isinstance` and `isinstance = my_check` all rebind it, and
+/// a pack that resolved the call anyway would be publishing a bounded cost for
+/// code it has never seen. This is the set that disqualifies a row - see
+/// [`landav_fdk::SignaturePack`], where the whole caveat is written including
+/// the one case this cannot catch.
+///
+/// # Why it does not descend into a nested definition
+///
+/// A nested `def` or `class` binds its own *name* in this scope, and that name
+/// is recorded. What its body binds is local to it and cannot change what a name
+/// means out here, so descending would over-refuse for no soundness gain. Every
+/// other block - `if`, `for`, `while`, `with`, `try` - shares this scope and is
+/// descended into.
+///
+/// # Deliberately over-approximate
+///
+/// A name bound on one branch of an `if` counts as bound. Being wrong in this
+/// direction costs a signature and nothing else.
+fn bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let mut work: Vec<&Stmt> = statements.iter().rev().collect();
+    while let Some(statement) = work.pop() {
+        match statement {
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    collect_target_names(target, &mut names);
+                }
+            }
+            Stmt::AnnAssign(assign) => collect_target_names(&assign.target, &mut names),
+            Stmt::AugAssign(assign) => collect_target_names(&assign.target, &mut names),
+            Stmt::FunctionDef(node) => {
+                names.insert(node.name.to_string());
+            }
+            Stmt::AsyncFunctionDef(node) => {
+                names.insert(node.name.to_string());
+            }
+            Stmt::ClassDef(node) => {
+                names.insert(node.name.to_string());
+            }
+            Stmt::Import(node) => {
+                for alias in &node.names {
+                    // `import a.b` binds `a`; `import a.b as c` binds `c`.
+                    let bound = alias.asname.as_ref().map_or_else(
+                        || {
+                            alias
+                                .name
+                                .split('.')
+                                .next()
+                                .unwrap_or(alias.name.as_str())
+                                .to_owned()
+                        },
+                        |name| name.to_string(),
+                    );
+                    names.insert(bound);
+                }
+            }
+            Stmt::ImportFrom(node) => {
+                for alias in &node.names {
+                    // `from m import *` binds names this pass cannot enumerate.
+                    // Recorded as the residual risk in `SignaturePack` rather
+                    // than guessed at here.
+                    let bound = alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| alias.name.to_string(), |name| name.to_string());
+                    names.insert(bound);
+                }
+            }
+            Stmt::Global(node) => names.extend(node.names.iter().map(ToString::to_string)),
+            Stmt::Nonlocal(node) => names.extend(node.names.iter().map(ToString::to_string)),
+            Stmt::For(node) => {
+                collect_target_names(&node.target, &mut names);
+                work.extend(node.body.iter().chain(node.orelse.iter()));
+            }
+            Stmt::AsyncFor(node) => {
+                collect_target_names(&node.target, &mut names);
+                work.extend(node.body.iter().chain(node.orelse.iter()));
+            }
+            Stmt::While(node) => work.extend(node.body.iter().chain(node.orelse.iter())),
+            Stmt::If(node) => work.extend(node.body.iter().chain(node.orelse.iter())),
+            Stmt::With(node) => {
+                for item in &node.items {
+                    if let Some(target) = &item.optional_vars {
+                        collect_target_names(target, &mut names);
+                    }
+                }
+                work.extend(node.body.iter());
+            }
+            Stmt::AsyncWith(node) => {
+                for item in &node.items {
+                    if let Some(target) = &item.optional_vars {
+                        collect_target_names(target, &mut names);
+                    }
+                }
+                work.extend(node.body.iter());
+            }
+            Stmt::Try(node) => {
+                for handler in &node.handlers {
+                    let ast::ExceptHandler::ExceptHandler(clause) = handler;
+                    if let Some(name) = &clause.name {
+                        names.insert(name.to_string());
+                    }
+                    work.extend(clause.body.iter());
+                }
+                work.extend(
+                    node.body
+                        .iter()
+                        .chain(node.orelse.iter())
+                        .chain(node.finalbody.iter()),
+                );
+            }
+            Stmt::TryStar(node) => {
+                for handler in &node.handlers {
+                    let ast::ExceptHandler::ExceptHandler(clause) = handler;
+                    if let Some(name) = &clause.name {
+                        names.insert(name.to_string());
+                    }
+                    work.extend(clause.body.iter());
+                }
+                work.extend(
+                    node.body
+                        .iter()
+                        .chain(node.orelse.iter())
+                        .chain(node.finalbody.iter()),
+                );
+            }
+            // A `case` pattern binds capture names, and enumerating them needs
+            // the pattern grammar this pass does not walk. Rather than guess,
+            // the whole scope answers "names I could not enumerate", which
+            // disqualifies every signature in it. `match` is refused as a
+            // construct anyway, so the coverage this costs is a function that
+            // was already blocked.
+            Stmt::Match(_) => return None,
+            Stmt::TypeAlias(node) => collect_target_names(&node.name, &mut names),
+            Stmt::Return(_)
+            | Stmt::Delete(_)
+            | Stmt::Raise(_)
+            | Stmt::Assert(_)
+            | Stmt::Expr(_)
+            | Stmt::Pass(_)
+            | Stmt::Break(_)
+            | Stmt::Continue(_) => {}
+        }
+    }
+    Some(names)
+}
+
+/// Every plain name an assignment target binds, through tuples and stars.
+fn collect_target_names(target: &Expr, names: &mut BTreeSet<String>) {
+    let mut work = vec![target];
+    while let Some(node) = work.pop() {
+        match node {
+            Expr::Name(name) => {
+                names.insert(name.id.to_string());
+            }
+            Expr::Tuple(tuple) => work.extend(tuple.elts.iter()),
+            Expr::List(list) => work.extend(list.elts.iter()),
+            Expr::Starred(starred) => work.push(starred.value.as_ref()),
+            // `obj.field = ...` and `table[k] = ...` bind no name.
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -152,8 +468,8 @@ fn lower_function(
 // ---------------------------------------------------------------------------
 
 /// The parameters annotated `int`, in declaration order.
-fn integer_parameters(function: &ast::StmtFunctionDef) -> Vec<String> {
-    let arguments = &function.args;
+fn integer_parameters(function: Definition<'_>) -> Vec<String> {
+    let arguments = function.args;
     arguments
         .posonlyargs
         .iter()
@@ -212,8 +528,8 @@ fn annotation_is_collection(annotation: Option<&Expr>) -> bool {
 
 /// The parameters annotated with a sized builtin collection, in declaration
 /// order.
-fn collection_parameters(function: &ast::StmtFunctionDef) -> Vec<String> {
-    let arguments = &function.args;
+fn collection_parameters(function: Definition<'_>) -> Vec<String> {
+    let arguments = function.args;
     arguments
         .posonlyargs
         .iter()
@@ -239,8 +555,8 @@ fn length_var(name: &str) -> VarName {
 /// parameters, then repeatedly drop any name with an assignment whose
 /// right-hand side is not an integer under the current set. Shrinking only, so
 /// it terminates in at most as many rounds as there are names.
-fn integer_names(function: &ast::StmtFunctionDef) -> BTreeSet<String> {
-    let arguments = &function.args;
+fn integer_names(function: Definition<'_>) -> BTreeSet<String> {
+    let arguments = function.args;
     // A parameter without an `int` annotation can never be an integer,
     // whatever the body later assigns to it: it holds whatever the caller
     // passed on entry, and that is the value a loop guard would read.
@@ -255,7 +571,7 @@ fn integer_names(function: &ast::StmtFunctionDef) -> BTreeSet<String> {
 
     let collections: BTreeSet<String> = collection_parameters(function).into_iter().collect();
     let mut candidates: BTreeSet<String> = integer_parameters(function).into_iter().collect();
-    for statement in crate::syntax::stmt_tree(&function.body) {
+    for statement in crate::syntax::stmt_tree(function.body) {
         for name in assigned_names(statement) {
             if !unannotated.contains(&name) {
                 candidates.insert(name);
@@ -267,7 +583,7 @@ fn integer_names(function: &ast::StmtFunctionDef) -> BTreeSet<String> {
     // one or stops.
     for _ in 0..=candidates.len() {
         let mut doomed: BTreeSet<String> = BTreeSet::new();
-        for statement in crate::syntax::stmt_tree(&function.body) {
+        for statement in crate::syntax::stmt_tree(function.body) {
             collect_non_integer_bindings(statement, &candidates, &collections, &mut doomed);
         }
         if doomed.is_empty() {
@@ -730,6 +1046,15 @@ struct Translator<'a> {
     /// Parameters only. A local holding a collection has no length the caller
     /// can supply, and one assigned from a region may have any length at all.
     collections: BTreeSet<String>,
+    /// Every name the module and this function bind, or `None` when this pass
+    /// could not enumerate them.
+    ///
+    /// A callee found here is not the builtin the signature pack is describing.
+    /// `None` disqualifies every signature: see [`bindings_of`], and
+    /// [`landav_fdk::SignaturePack`] for the residual case neither covers.
+    shadowed: Option<BTreeSet<String>>,
+    /// The signatures a call may be resolved against.
+    pack: &'static SignaturePack,
     /// How many collection walks have been lowered, to keep their synthetic
     /// counters apart.
     walks: u32,
@@ -776,6 +1101,21 @@ struct Translator<'a> {
     /// `return a and b` can no more publish a bound variable than `return [a]`
     /// can, because there is nowhere for the value to go.
     value_discarded: bool,
+    /// Whether the expression being translated is the subject of a **truth
+    /// test** rather than a value the fragment will read as a number.
+    ///
+    /// The third member of the family above, and the narrowest. `if f(x):`
+    /// spells as `f(x) != 0` here because truthiness is a Python fact this
+    /// crate owns, and the comparison is what the fragment holds - but nothing
+    /// reads the *number*: the guard it produces is `either branch`, which is
+    /// what `landav_its::lower` already emits for a condition it cannot
+    /// translate.
+    ///
+    /// That is exactly the position where a signature may be resolved outside a
+    /// scratch builder. `x = isinstance(a, b)` may not: the binding names a
+    /// value, and this fragment has none for a `bool`. See
+    /// [`Translator::declaration_for`].
+    truth_test: bool,
 }
 
 impl Translator<'_> {
@@ -1503,14 +1843,120 @@ impl Translator<'_> {
                 } else {
                     Extent::Fragment
                 };
-                self.builder.unsupported_stmt_with(
-                    node.construct(),
-                    node.detail().cloned(),
-                    extent,
-                    node.origin().clone(),
-                )
+                // A declared node stays declared on the way across. Losing the
+                // declaration here would turn every bare `isinstance(x, int)`
+                // line back into a hole, which is where they all are.
+                match node.declared() {
+                    Some(effect) => self.builder.declared_stmt(
+                        node.construct(),
+                        node.detail().cloned(),
+                        extent,
+                        effect,
+                        node.origin().clone(),
+                    ),
+                    None => self.builder.unsupported_stmt_with(
+                        node.construct(),
+                        node.detail().cloned(),
+                        extent,
+                        node.origin().clone(),
+                    ),
+                }
             })
             .collect()
+    }
+
+    /// What the signature pack declares about this call site, if anything.
+    ///
+    /// # Four conditions, and every one of them is load bearing
+    ///
+    /// 1. **Nothing reads the value.** Either the nodes are going to a scratch
+    ///    builder ([`Translator::discarding`]) or the call is the subject of a
+    ///    truth test ([`Translator::truth_test`]). `x = isinstance(a, b)` is
+    ///    neither: it names a value, and this fragment has none for a `bool`, so
+    ///    a declared node there would be read as the zero `expr_poly` hands out
+    ///    for an `Unsupported` node.
+    /// 2. **The callee is a bare name.** `x.append(1)` is a method on an object
+    ///    whose class this analysis has never seen; matching *any* object's
+    ///    `.decode` against a row keyed `decode` would be a far weaker claim
+    ///    than matching a module-level `isinstance` against one keyed
+    ///    `isinstance`. The pack's method rows are refusals and stay documentary.
+    /// 3. **The name is not bound in this module or this function.** See
+    ///    [`bindings_of`].
+    /// 4. **Every argument is accounted for.** This is the condition the
+    ///    soundness of the whole ticket turns on: an unresolved call *denotes
+    ///    omega*, which covers for anything hiding inside it, and resolving the
+    ///    call takes that cover away. See [`Self::arguments_are_accounted`].
+    ///
+    /// # `getattr` is the one arity check, and it is a Python fact
+    ///
+    /// The pack says what a callee costs; which *spellings* of a call site are
+    /// that callee is the frontend's question, because arity and keywords are
+    /// language grammar. `getattr(x, name)` is one attribute lookup;
+    /// `getattr(x, name, default)` is that plus a caught `AttributeError` and a
+    /// third expression, and the row was written for the two-argument form.
+    fn declaration_for(&self, call: &ast::ExprCall) -> Option<DeclaredEffect> {
+        if !(self.discarding || self.truth_test) {
+            return None;
+        }
+        let Expr::Name(callee) = call.func.as_ref() else {
+            return None;
+        };
+        let callee = callee.id.as_str();
+        if callee == "getattr" && (call.args.len() != 2 || !call.keywords.is_empty()) {
+            return None;
+        }
+        let row = self.pack.signature(callee, |name| self.is_shadowed(name))?;
+        if !self.arguments_are_accounted(call) {
+            return None;
+        }
+        Some(effect_of(row))
+    }
+
+    /// Whether `name` means something in this source other than the builtin.
+    ///
+    /// A scope whose bindings could not be enumerated answers `true` for every
+    /// name, which disqualifies every signature. Failing closed costs coverage
+    /// and never soundness.
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.shadowed
+            .as_ref()
+            .is_none_or(|names| names.contains(name))
+    }
+
+    /// Whether every argument of `call` either costs nothing or is translated.
+    ///
+    /// # The cover that resolving a call removes
+    ///
+    /// `isinstance(x, obj.kind)` reports one `call` region today, and that
+    /// region denotes `omega`: it dominates whatever the attribute access costs,
+    /// so nothing is lost by not translating `obj.kind`. Declare `isinstance` a
+    /// constant and the cover is gone - the function becomes a complete bound
+    /// with a `property` getter missing from it, which is a bound below the
+    /// truth.
+    ///
+    /// [`expression_children`] translates exactly the arguments that **reach a
+    /// call**, for a measured reason recorded there, and widening that for every
+    /// call site is not this ticket's change to make. So the rule here is the
+    /// other way round: an argument that is not translated must be one that
+    /// costs nothing, and a call site with any other kind of argument keeps its
+    /// hole.
+    ///
+    /// A name and a literal cost nothing; a tuple or list of them costs nothing
+    /// either, which is what `isinstance(x, (int, str))` needs. Everything else
+    /// costs something or runs user code - an attribute runs a `property`, a
+    /// subscript runs a `__getitem__`, an f-string runs `__format__` - and is
+    /// refused here rather than assumed free.
+    fn arguments_are_accounted(&self, call: &ast::ExprCall) -> bool {
+        call_arguments(call).into_iter().all(|argument| {
+            costs_nothing(argument)
+                || reaches_a_call(
+                    argument,
+                    &self.integers,
+                    &self.collections,
+                    self.discarding,
+                    self.value_discarded,
+                )
+        })
     }
 
     fn refuse_stmt<T: Ranged>(&mut self, construct: Construct, node: &T) -> StmtId {
@@ -1593,7 +2039,16 @@ impl Translator<'_> {
             // is not an integer the translation of it refuses, and the
             // comparison simply carries that refusal.
             other => {
+                // Nothing reads this as a number: the comparison below is how
+                // truthiness is spelled, and `landav_its::lower` answers a
+                // comparison over a declared node with "either branch". So a
+                // signature may be resolved here even though the nodes are kept
+                // - which is what makes `if isinstance(x, int):` the shape the
+                // corpus actually writes rather than a shape only a bare
+                // statement gets. See [`Translator::truth_test`].
+                let outer = core::mem::replace(&mut self.truth_test, true);
                 let value = self.expression(other);
+                self.truth_test = outer;
                 let zero = self.builder.int(0, origin.clone());
                 self.builder.compare(CompareOp::Ne, value, zero, origin)
             }
@@ -1790,12 +2245,37 @@ impl Translator<'_> {
                     self.builder
                         .unsupported_expr(Construct::NonIntegerValue, origin)
                 }),
+                // `~n` is a bitwise operator whose result the fragment has no
+                // rule for, and it stays refused wherever it is written. It is
+                // the arm next door on purpose: `Not` and `Invert` are one
+                // character apart in Python and one variant apart here, and the
+                // widening below must not reach this one.
                 ast::UnaryOp::Invert => self
                     .builder
                     .unsupported_expr(Construct::BitwiseOperator, origin),
-                ast::UnaryOp::Not => self
-                    .builder
-                    .unsupported_expr(Construct::ConditionalExpression, origin),
+                // `not x`, in a position that reads no value from it. The
+                // fourth member of the family below - see the `IfExp | BoolOp`
+                // arm for the argument, which is identical and if anything
+                // easier here: `not` has one operand, evaluates it exactly once
+                // and never short-circuits, so charging its operand is the
+                // truth rather than an upper bound. `build_condition` has
+                // always handled `Not` in full, so nothing new is being taught
+                // about negation; what changes is that a `return not f(n)` now
+                // names `f` instead of blaming the negation.
+                //
+                // Value position stays refused, for the report rather than for
+                // soundness: `x = not n` condemns `x` as `non-integer-value`
+                // either way - `is_integer_expr` has no `Not` arm and must not
+                // gain one - and "`x` is not a proven integer" without "because
+                // of the negation" names a symptom and withholds the cause. See
+                // [`Translator::value_discarded`].
+                ast::UnaryOp::Not => {
+                    if self.value_discarded {
+                        return self.builder.int(0, origin);
+                    }
+                    self.builder
+                        .unsupported_expr(Construct::ConditionalExpression, origin)
+                }
             },
 
             Expr::Call(call) => {
@@ -1810,8 +2290,39 @@ impl Translator<'_> {
                     Expr::Attribute(attribute) => attribute.attr.to_string(),
                     _ => "call".to_owned(),
                 };
+                // The arguments are evaluated whether or not the callee can be
+                // read, so a call among them is a call this program issues.
+                // Charging them is what makes `fetch(g(n))` two regions rather
+                // than one; *referencing* them is what keeps the inner one from
+                // being an orphan in the position that is not hoisted through a
+                // scratch builder - a condition, where `Walk::reconciled` would
+                // otherwise fail the whole function closed to `Unknown`. See
+                // [`landav_its::SourceExpr::Unsupported`]'s `evaluates`.
+                //
+                // `recall` is what keeps this in step with
+                // `expression_children`, which descends into some arguments and
+                // not others: only a translated argument is in `built`, so this
+                // references exactly what exists and cannot name a node that was
+                // never made or leave one that was.
+                let evaluated: Vec<_> = call_arguments(call)
+                    .into_iter()
+                    .filter_map(recall)
+                    .collect();
+                // A callee the signature pack accounts for. `LAN-94`: the node
+                // is still an `Unsupported` node - this fragment has no value
+                // for a `bool` - but it is no longer a *hole*, so it costs a
+                // constant and the loop below the guard keeps its trip count.
+                if let Some(effect) = self.declaration_for(call) {
+                    return self.builder.declared_expr(
+                        Construct::Call,
+                        detail,
+                        evaluated,
+                        effect,
+                        origin,
+                    );
+                }
                 self.builder
-                    .unsupported_expr_detailed(Construct::Call, detail, origin)
+                    .unsupported_expr_evaluating(Construct::Call, detail, evaluated, origin)
             }
             Expr::Attribute(attribute) => self.builder.unsupported_expr_detailed(
                 Construct::Attribute,
@@ -1982,11 +2493,158 @@ fn membership_or_identity(comparison: &ast::ExprCompare) -> Option<Construct> {
 
 /// The children of an expression that the fragment translates.
 ///
-/// Only the forms that survive into the fragment have children here. A refused
-/// form has none, because it becomes one `Unsupported` node and its interior is
-/// never inspected -- which is also what keeps a refused comprehension from
-/// producing a refusal per node inside it.
+/// Almost only the forms that survive into the fragment have children here. A
+/// refused form has none, because it becomes one `Unsupported` node whose
+/// interior is never inspected -- which is what keeps a refused comprehension
+/// from producing a refusal per node inside it.
+///
+/// The one exception is a refused **call**, whose arguments are evaluated
+/// before it whatever the callee turns out to be. It is an exception because
+/// the call's node *references* what is translated under it, so nothing is
+/// orphaned; see the arm below for what is descended into and what is not.
 fn expression_children<'e>(
+    expr: &'e Expr,
+    candidates: &BTreeSet<String>,
+    collections: &BTreeSet<String>,
+    discarding: bool,
+    value_discarded: bool,
+) -> Vec<&'e Expr> {
+    // A refused call's arguments. The call itself stays refused in every
+    // position - nothing here widens the fragment - but its arguments are
+    // evaluated before it whatever it turns out to be, so a call written among
+    // them is a call this program issues and has to be named where it stands.
+    // Leaving them untranslated is how `fetch(g(n))` came to be byte-for-byte
+    // the report of `fetch(n)`: `g` was in no arena, no ledger and no bound,
+    // and `Walk::reconciled` cannot notice a node that was never built.
+    //
+    // This is the only arm whose parent is a *refused* form, and it is sound
+    // only because `build_expression`'s `Expr::Call` arm points the refusal at
+    // whatever this returns, through `SourceExpr::Unsupported`'s `evaluates`.
+    // Translating without referencing leaves the orphan `LAN-90` closed;
+    // referencing without translating leaves a dangling identifier.
+    //
+    // # Why only the arguments that reach a call
+    //
+    // Because an argument's **value** is read by nothing here - the call's own
+    // node stands for the result - and its **cost** is the only question left.
+    // A name lookup and a literal cost nothing, so translating them buys no
+    // region and volunteers an answer to the question nobody asked: measured
+    // over `/usr/lib/python3.12`, descending into every argument moves 488
+    // functions out of "blocked solely by a call", 440 of them onto
+    // `non-integer-value` for an argument whose value is never read. Naming a
+    // construct that is not the obstacle sends the reader to the wrong line,
+    // which is the same argument `negated_expressions.rs` makes.
+    //
+    // An argument that reaches an *attribute* or a *subscript* is a real cost
+    // this still does not name - `x.y` runs a `property` - and that is a
+    // deliberate omission with a measurement attached (148 and 31 functions),
+    // not an oversight: the enclosing call's region denotes `omega` and
+    // dominates it exactly as it did before, so nothing here is unsound. It is
+    // a separate widening, to be argued for and measured on its own.
+    if let Expr::Call(call) = expr
+        && length_of_collection(call, collections).is_none()
+    {
+        return call_arguments(call)
+            .into_iter()
+            .filter(|argument| {
+                reaches_a_call(
+                    argument,
+                    candidates,
+                    collections,
+                    discarding,
+                    value_discarded,
+                )
+            })
+            .collect();
+    }
+    translated_children(expr, candidates, collections, discarding, value_discarded)
+}
+
+/// The expressions a call evaluates before the call itself.
+///
+/// Positional and keyword arguments alike: `fetch(key=g(n))` runs `g` exactly
+/// as `fetch(g(n))` does, and the two live in different lists in the AST.
+///
+/// Deliberately **not** the callee. `inspect.ismodule(x)` evaluates
+/// `inspect.ismodule` - an attribute access, which runs a `property` and so
+/// costs something - and naming that is a real improvement, but it is a
+/// separate widening with its own measurement: it renames functions the corpus
+/// counts as blocked by a call, and this change is not the place to do that
+/// quietly.
+fn call_arguments(call: &ast::ExprCall) -> Vec<&Expr> {
+    call.args
+        .iter()
+        .chain(call.keywords.iter().map(|keyword| &keyword.value))
+        .collect()
+}
+
+/// Whether evaluating `expr` costs nothing at all.
+///
+/// A name lookup and a literal are free, and a display of free things is free -
+/// building one costs no source step, which is the same judgement
+/// `build_expression` already makes for a display in a discarded position.
+///
+/// Deliberately a short whitelist rather than a blacklist. An attribute runs a
+/// `property`, a subscript runs a `__getitem__`, a comprehension runs a loop, an
+/// f-string runs `__format__`, and `a + b` on two lists runs `__add__`: the set
+/// of Python expressions that genuinely cost nothing is small, and guessing
+/// wrong in the other direction publishes a bound the program exceeds. See
+/// [`Translator::arguments_are_accounted`], its only caller.
+fn costs_nothing(expr: &Expr) -> bool {
+    let mut work = vec![expr];
+    while let Some(node) = work.pop() {
+        match node {
+            Expr::Name(_) | Expr::Constant(_) => {}
+            Expr::Tuple(tuple) => work.extend(tuple.elts.iter()),
+            Expr::List(list) => work.extend(list.elts.iter()),
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether translating `root` would produce at least one `call` region.
+///
+/// The filter on [`expression_children`]'s call arm, and it is written against
+/// [`translated_children`] rather than against [`expression_children`] for two
+/// reasons. It answers exactly the question asked - *this* traversal reaches a
+/// call, so `table[g(n)]` is `false` because the subscript has no children and
+/// the descent would stop there having named a subscript and no call - and it
+/// terminates without recursion, which matters: expression depth is capped at
+/// ten thousand, and a version of this that recursed through the call arm would
+/// nest one stack frame per `f(f(f(...)))` and abort.
+///
+/// The one call the fragment accepts, `len(items)` over a collection
+/// parameter, is not a call region: it becomes a variable read.
+fn reaches_a_call(
+    root: &Expr,
+    candidates: &BTreeSet<String>,
+    collections: &BTreeSet<String>,
+    discarding: bool,
+    value_discarded: bool,
+) -> bool {
+    let mut work = vec![root];
+    while let Some(node) = work.pop() {
+        if let Expr::Call(call) = node
+            && length_of_collection(call, collections).is_none()
+        {
+            return true;
+        }
+        work.extend(translated_children(
+            node,
+            candidates,
+            collections,
+            discarding,
+            value_discarded,
+        ));
+    }
+    false
+}
+
+/// The children of an expression that survive into the fragment, ignoring the
+/// arguments of a refused call. See [`expression_children`], its only caller
+/// besides [`reaches_a_call`].
+fn translated_children<'e>(
     expr: &'e Expr,
     candidates: &BTreeSet<String>,
     collections: &BTreeSet<String>,
@@ -2017,6 +2675,15 @@ fn expression_children<'e>(
                     .chain(comparison.comparators.iter())
                     .collect(),
             ),
+            // The operand of a negation, for the same reason and under the same
+            // obligation: `build_expression` accepts `not` here, so `return not
+            // f(n)` would publish a complete bound that omits a call unless the
+            // operand is translated in the same change. `~n` is deliberately
+            // absent - it stays a `bitwise-operator` region, and a region's
+            // interior is not translated.
+            Expr::UnaryOp(unary) if matches!(unary.op, ast::UnaryOp::Not) => {
+                Some(vec![unary.operand.as_ref()])
+            }
             _ => None,
         };
         if let Some(operands) = operands {

@@ -1,0 +1,340 @@
+# The OSS builtin signature pack — LAN-94.
+#
+# This file is DATA. Nothing in this workspace has a Rust arm per callee; adding
+# a callee is adding a table here, and a reviewer reads the diff as a table.
+#
+# ---------------------------------------------------------------------------
+# What a row means
+# ---------------------------------------------------------------------------
+#
+#   callee             the name as the source writes it: a bare name, or a bare
+#                      attribute for a method.
+#   cost               constant | linear-in-argument | loglinear | unbounded.
+#                      Only `constant` is resolvable. The others are here so a
+#                      refusal is written down rather than merely absent.
+#   rebinds_locals     can calling it change what a local of the CALLER's frame
+#                      denotes? `false` is what buys coverage: a region in this
+#                      analysis forgets every value the caller supplied, so a
+#                      type test above a loop costs that loop its trip count.
+#   mutates_arguments  can it mutate an object reachable from its arguments?
+#                      `true` for everything here — an `__instancecheck__` is
+#                      user code and may call `items.append(...)` — which keeps
+#                      LAN-89's collection-length variables volatile.
+#   why                required, on refusing rows as much as admitting ones.
+#
+# ---------------------------------------------------------------------------
+# What is NOT here, and will not be
+# ---------------------------------------------------------------------------
+#
+#   len         LAN-89 already reads `len(items)` for a collection PARAMETER as
+#               a bound variable that SCALES with the input. A row declaring
+#               `len` constant would replace that with a constant, which is the
+#               opposite of what this tool is for. `len` of anything else is not
+#               a value the caller supplied and there is nothing to declare.
+#   __enter__   96 sites each on the typed corpus, which makes them the most
+#   __exit__    tempting rows in the file and the two that must not be added.
+#               They are landav's OWN holes, emitted by LAN-92's `with` support
+#               rather than written by the user, and they call arbitrary user
+#               code: a lock's `__enter__` can block indefinitely.
+#
+# Measurements below are from the pass-2 corpus run: functions blocked SOLELY by
+# `call`, over /usr/lib/python3.12 (stdlib) and a typed application corpus.
+
+# ---------------------------------------------------------------------------
+# admitted — bounded cost, cannot rebind a local
+# ---------------------------------------------------------------------------
+
+[[signature]]
+callee = "isinstance"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+Walks the MRO of the class hierarchy, whose depth is a property of the program's
+own class declarations and not of any input, so it is O(1) in this analysis's
+variables. It runs in its own frame, and no Python expression rebinds a local of
+the frame it is evaluated in except the walrus — which is a binding-form and is
+refused separately. A `__instancecheck__` is still user code that may mutate an
+object, hence mutates_arguments. 30 stdlib / 134 typed sole-blocked sites, the
+head of the whole distribution.
+"""
+
+[[signature]]
+callee = "issubclass"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+The same walk over the same hierarchy, with a class rather than an instance on
+the left. Admitting one without the other would leave a user rewriting
+`issubclass(t, X)` as `isinstance(x, X)` to get a bound, which is a worse program
+for a better report.
+"""
+
+[[signature]]
+callee = "hasattr"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+One attribute lookup and a caught exception. That claims nothing beyond what
+Construct::Attribute already claims — `x.y` is not a hole for its cost either,
+and `may_rebind_locals` already returns false for it — so refusing `hasattr`
+while accepting `x.y` was an inconsistency rather than a safeguard. 12 stdlib /
+76 typed sole-blocked sites.
+"""
+
+[[signature]]
+callee = "getattr"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+The two-argument form is one attribute lookup: exactly `x.y` with the name
+computed. Nothing is claimed about a third-argument default or about a
+`__getattr__` beyond what Construct::Attribute already claims for the dotted
+form. The frontend admits only the two-argument spelling; a call with a default
+or a keyword stays a hole. 34 typed sole-blocked sites.
+"""
+
+[[signature]]
+callee = "bool"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+One `__bool__` or one `__len__`. `__len__` on a user container is the loose end,
+and it is the same loose end `if items:` already has: a truth test in a condition
+runs it today and is not holed for it. 56 typed sole-blocked sites.
+"""
+
+[[signature]]
+callee = "callable"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+One type check — whether the object's type has a `__call__` — and it runs no user
+code at all, which makes it the least contentious row in the file.
+"""
+
+# ---------------------------------------------------------------------------
+# admitted — exception constructors
+# ---------------------------------------------------------------------------
+#
+# After LAN-92 a `raise` is a real statement costing one step, so `raise
+# ValueError` with a bare class name already reports Theta(1) and `raise
+# ValueError("x")` reports Partial(1 + #hole0). Constructing a builtin exception
+# from already-evaluated arguments is bounded work, so the parentheses cost
+# nothing beyond evaluating what is inside them — and a call written inside them
+# is still translated, still named, and still a hole. 11 stdlib / 44 typed
+# sole-blocked sites for the three commonest.
+#
+# Only the builtin hierarchy. A user-defined exception has a user-defined
+# `__init__` and gets no row.
+
+[[signature]]
+callee = "Exception"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "BaseException"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "TypeError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ValueError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "NotImplementedError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "RuntimeError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "AttributeError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "KeyError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "IndexError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "StopIteration"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "OverflowError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ZeroDivisionError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "OSError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "AssertionError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ArithmeticError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "LookupError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+# ---------------------------------------------------------------------------
+# refused — written down so a later contributor argues rather than appends
+# ---------------------------------------------------------------------------
+
+[[signature]]
+callee = "join"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+Walks its argument and allocates a result whose length is the sum of the parts.
+Linear in a size this analysis cannot see. That is LAN-11's size analysis, not a
+signature, and a constant declared here would be a bound the program exceeds. 56
+typed sole-blocked sites — the temptation is the point of writing this down.
+"""
+
+[[signature]]
+callee = "sorted"
+cost = "loglinear"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+n log n in its argument's length, plus a comparison per step which may itself be
+user code. Two unbounded things at once.
+"""
+
+[[signature]]
+callee = "list"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+Copies its argument. 14 stdlib sole-blocked sites and every one of them is linear
+in something. `list()` with no argument is constant, but a row keyed by name
+cannot tell the two apart and the frontend does not look at arity for a refused
+row.
+"""
+
+[[signature]]
+callee = "print"
+cost = "unbounded"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+I/O. Formats every argument — which runs their `__str__`, arbitrary user code —
+and then writes to a stream that may block. Unbounded by anything this analysis
+can see. 12 stdlib sole-blocked sites.
+"""
+
+[[signature]]
+callee = "append"
+cost = "unbounded"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+Not merely unbounded — not SAFE. It mutates the collection, so a length read
+before it is not the length a loop after it walks, and collection_length.rs
+depends on that entry length being forgotten. Amortised O(1) is the right answer
+to a different question.
+"""
+
+[[signature]]
+callee = "decode"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+Allocates a string whose size is the input's length, and the codec doing it may
+be a user-registered one. Linear at best.
+"""
+
+[[signature]]
+callee = "__enter__"
+cost = "unbounded"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+96 typed sole-blocked sites, the most tempting row in the file, and it must stay
+refused: this is landav's own hole from LAN-92's `with` support, not something
+the user wrote, and it is a call to arbitrary user code. A lock's `__enter__`
+blocks indefinitely. There is no bound to declare.
+"""
+
+[[signature]]
+callee = "__exit__"
+cost = "unbounded"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+The other half of the same statement, with the same 96 sites and the same
+argument. A `__exit__` that suppresses an exception also changes the control
+flow, which is a second reason beyond the cost.
+"""

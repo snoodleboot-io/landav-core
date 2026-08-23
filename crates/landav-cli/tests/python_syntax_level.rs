@@ -439,29 +439,40 @@ def greet(name) -> int:
 }
 
 // ---------------------------------------------------------------------------
-// the hole a parser upgrade will not close
+// the hole a parser upgrade would not have closed, and no longer exists
 // ---------------------------------------------------------------------------
 
-/// **A top-level `async def` produces no lowered function at all.**
+/// **A top-level `async def` produces a lowered function.** `LAN-93`, closed.
 ///
-/// Measured while sizing this ticket, and it belongs in this file because it
-/// is the *same* failure — a function that never enters the denominator, so it
-/// can be neither covered nor refused — reached by a different route. This one
-/// is not the parser's doing: `async def drain(...)` parses cleanly, and the
-/// lowering simply has no arm for the node.
+/// This assertion used to run the other way, and said so: it pinned as current
+/// behaviour that `lower_module` matched `Stmt::FunctionDef` and had no arm for
+/// `Stmt::AsyncFunctionDef`, so an `async def` parsed cleanly and produced no
+/// function at all — not refused, not holed, not counted, and so absent from
+/// the denominator every coverage number on this project is computed over. It
+/// belongs in this file because that is the *same* failure as an unreadable
+/// file, a function that can be neither covered nor refused, reached by a
+/// different route rather than by the parser. It also said that whoever closed
+/// it had to come here and say so. This is that.
 ///
-/// It is also the larger number. Losing every PEP 701 file costs 51 top-level
-/// functions on the 3.12 stdlib; `async def` costs 15 there and **219** across
-/// momentum's backend, where an async web framework makes it the dominant way
-/// a function is written. Upgrading the parser will not move either count.
+/// `lower_module` now recognises both node types through one borrowed view of
+/// the parts they share. Measured over both corpora with nothing else changed:
 ///
-/// Pinned as current behaviour rather than asserted as a requirement because
-/// it is a different ticket: closing it is a lowering change with real
-/// questions behind it (what an `await` costs), not a dependency choice. What
-/// this test buys is that the number stops being invisible, and that whoever
-/// closes it has to come here and say so.
+/// | corpus | `functions` before | after |
+/// |---|---|---|
+/// | `/usr/lib/python3.12` | 3057 | 3072 (+15) |
+/// | momentum's backend | 14952 | 15305 (+353) |
+///
+/// The 353 is 219 distinct functions counted twice, because that corpus's
+/// `.venv` carries a `lib64 -> lib` symlink the directory walk follows. That is
+/// a separate defect and has its own ticket; it is quoted here as what landav's
+/// own walk sees, which is what the denominator is made of.
+///
+/// What the body of an async function *reports* — an `await` as a placed
+/// `coroutine` hole, a counted loop around it still counted — is `LAN-93`'s
+/// subject and is pinned in `async_functions.rs`. All that is pinned here is
+/// that the function arrives at all.
 #[test]
-fn an_async_def_is_not_lowered_and_that_is_a_separate_ticket() {
+fn a_top_level_async_def_is_lowered() {
     let source = "\
 async def drain(source, n: int) -> int:
     total = 0
@@ -469,13 +480,11 @@ async def drain(source, n: int) -> int:
         total = total + 1
     return total
 ";
-    let names = lowered_names(source).expect("`async def` parses - the gap is in the lowering");
+    let names = lowered_names(source).expect("`async def` parses - it always did");
     assert!(
-        names.is_empty(),
-        "an `async def` now lowers ({names:?}), which is a real improvement \
-         and makes this test wrong: replace it with the assertion that \
-         `drain` is present, and check that the coverage denominator grew by \
-         the number of async functions in the corpus rather than staying \
-         put:\n{source}"
+        names.iter().any(|name| name == "drain"),
+        "an `async def` produced no lowered function ({names:?}), which puts it \
+         outside the coverage denominator rather than inside it as a \
+         refusal:\n{source}"
     );
 }
