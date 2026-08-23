@@ -179,6 +179,11 @@ fn analyse(
     let mut statements = 0usize;
     let mut waived = Tally::default();
     let mut coverage = Coverage::new();
+    // The engine's reach, counted separately from `coverage.lowered()`. Two
+    // numbers, never one: the headline is how many functions became a
+    // transition system, and it must not move because the engine started
+    // deriving partial bounds for the rest.
+    let mut analysed = 0usize;
     // Structured output is built alongside the text rather than instead of it,
     // so the two cannot disagree about what the run found. In JSON mode the
     // text is withheld at the point of writing, not skipped at the point of
@@ -217,6 +222,7 @@ fn analyse(
                     path,
                     &text,
                     &mut coverage,
+                    &mut analysed,
                     bounds.then_some(&mut report),
                     collected.as_mut(),
                 ) {
@@ -287,6 +293,7 @@ fn analyse(
         inconclusive,
         resource,
         &coverage,
+        analysed,
     );
     // Printed *after* the summary rather than before it, so that the summary
     // remains the first `landav:` line of the run — a contract the suppression
@@ -327,6 +334,7 @@ fn analyse(
                 statements,
                 functions: coverage.units(),
                 lowered: coverage.lowered(),
+                analysed,
                 coverage_percent: coverage.percent(),
                 refusals: coverage.refusals(),
                 findings,
@@ -735,6 +743,7 @@ fn accumulate<W: std::io::Write>(
     path: &Path,
     text: &str,
     coverage: &mut Coverage,
+    analysed: &mut usize,
     mut bounds: Option<&mut Report<W>>,
     mut collected: Option<&mut machine::Collector>,
 ) -> Result<(), ToolError> {
@@ -750,13 +759,22 @@ fn accumulate<W: std::io::Write>(
     })?;
     for function in &functions {
         let lowered = landav_its::lower(function.program());
-        // A function that did not lower has no bound to report either, and
-        // saying so is the point: the coverage line counts it, and a `--bounds`
-        // run that simply omitted it would read as a bound of zero.
+        // The engine is asked about every function, whether or not it lowered.
+        // A function whose only obstacle is a call still has a cost apart from
+        // that call, and reporting it with the call named is the deliverable;
+        // reporting nothing reads as a bound of zero.
+        let derived = crate::derived::cost_of(function, lowered.is_ok());
+        // Counted on the bound, not on the call: `TripCount::Unknown` is the
+        // engine saying it could not read the function at all, and counting it
+        // would make the reach number mean "was asked about", which every
+        // function is.
+        if derived.as_ref().is_some_and(|cost| cost.bound().is_some()) {
+            *analysed += 1;
+        }
         if let Some(report) = bounds.as_deref_mut() {
             report.line(format_args!(
                 "{}",
-                describe_bound(function, lowered.is_ok())
+                describe_bound(function, derived.as_ref())
             ));
         }
         if let Some(sink) = collected.as_deref_mut() {
@@ -781,18 +799,29 @@ fn accumulate<W: std::io::Write>(
 /// needs to be installed. Where it has no answer the line says that too - the
 /// external solver may still find an upper bound, and silence here would be
 /// read as zero.
-fn describe_bound(function: &landav_python::LoweredFunction, lowered: bool) -> String {
+///
+/// # A refusal is no longer the end of the line
+///
+/// This used to open with "this function did not lower, so nothing was derived
+/// for it", which was true of the whole toolchain and is no longer true of the
+/// engine. `LAN-87` makes the engine total: a function whose only obstacle is a
+/// call is derived apart from the call, and the call is named and placed. What
+/// the run may claim about such a function is decided in [`crate::derived`];
+/// `None` here means it may claim nothing.
+fn describe_bound(
+    function: &landav_python::LoweredFunction,
+    derived: Option<&landav_engine::TripCount>,
+) -> String {
     let at = function.location();
     let where_ = format!("{}:{}:{}", at.file().display(), at.line(), at.column());
-    if !lowered {
+    let Some(derived) = derived else {
         return format!(
-            "{where_}: {}: no bound: this function did not lower, so nothing was \
-             derived for it",
+            "{where_}: {}: no bound: this function did not lower, and what the engine \
+             derived does not account for the refusal, so nothing is claimed for it",
             function.name()
         );
-    }
-    let derived = landav_engine::cost(function.program());
-    match &derived {
+    };
+    match derived {
         landav_engine::TripCount::Exact(bound) => format!(
             "{where_}: {}: Theta({bound}) - derived exactly",
             function.name()
@@ -871,8 +900,9 @@ fn partial_analysis(coverage: &Coverage, detail: bool) -> String {
         ));
     }
     line.push_str(
-        "; a function that did not lower produces no transition system, so nothing is \
-         derived from it and no bound reported here covers it",
+        "; a function that did not lower produces no transition system, so no complete \
+         bound covers it - what the native engine derived for it is qualified by the \
+         regions it named",
     );
     if !detail {
         line.push_str(" — run again with --coverage for the construct list and positions");
@@ -932,10 +962,11 @@ fn summarise<W: std::io::Write>(
     inconclusive: usize,
     resource: Option<ResourceKind>,
     coverage: &Coverage,
+    analysed: usize,
 ) {
     report.line(format_args!(
         "landav: {} analysed under {} — {} finding(s), {} suppressed, {}, {} inconclusive; \
-         {}; resource: {}; configuration: {}",
+         {}; {}; resource: {}; configuration: {}",
         plural(sources.len(), "file"),
         target.display(),
         findings,
@@ -943,9 +974,37 @@ fn summarise<W: std::io::Write>(
         plural(waived.stale, "stale waiver"),
         inconclusive,
         coverage.summary(),
+        engine_reach(analysed, coverage.units()),
         describe_resource(resource),
         config.source()
     ));
+}
+
+/// The engine's reach, as a clause, next to the lowered count and never merged
+/// into it.
+///
+/// # Two numbers, because they mean two different things
+///
+/// `coverage: k of n lowered` counts transition systems: functions the *whole*
+/// toolchain can handle, and the number a solver, a differential check or a
+/// budget gate is entitled to act on. The native engine reads the structured
+/// source directly, so it reaches functions that will never lower - but every
+/// bound it derives for one of those carries an unfilled hole, and an unfilled
+/// hole denotes `omega`.
+///
+/// Folding the second into the first would turn "441 functions are now analysed
+/// apart from a named call" into "441 functions now have bounds", which is the
+/// claim this deliberately does not make. Printed on every run, including the
+/// ones where the two numbers agree, so that the day they diverge there is a
+/// baseline to notice against.
+fn engine_reach(analysed: usize, units: usize) -> String {
+    if units == 0 {
+        return "engine: no function was offered for analysis".to_owned();
+    }
+    format!(
+        "engine: {analysed} of {units} function(s) analysed, exactly or apart from \
+         named regions"
+    )
 }
 
 /// The summary's resource clause.

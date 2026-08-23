@@ -266,9 +266,19 @@ fn every_construct_is_reported_by_name_and_by_reason() {
 /// **The report says what a refusal means for the result.**
 ///
 /// Naming the construct is half of criterion 2. The other half is the
-/// consequence: a refused unit produced no transition system, so nothing is
-/// derived from it and no bound covers it. Without that sentence the reader
-/// has a list of constructs and no reason to care.
+/// consequence: a refused unit produced no transition system, so no solver was
+/// asked about it and no *complete* bound covers it. Without that sentence the
+/// reader has a list of constructs and no reason to care.
+///
+/// # Why the consequence is narrower than it was
+///
+/// It used to read "nothing is derived from it and no bound covers it". That
+/// was true while the only route to a bound went through a transition system.
+/// `LAN-87` added a second route - the native engine reads the structured
+/// source directly - so a refused unit may well have a bound, carrying an
+/// unfilled hole for each region that caused the refusal. This crate cannot see
+/// that engine and must not describe it, but it must also not assert its
+/// absence, so the sentence says only what a missing transition system costs.
 #[test]
 fn the_report_says_what_a_refusal_means_for_the_result() {
     let mut coverage = Coverage::new();
@@ -283,7 +293,7 @@ fn the_report_says_what_a_refusal_means_for_the_result() {
         "the report does not say a refused unit produced no system:\n{report}"
     );
     assert!(
-        report.contains("no bound"),
+        report.contains("no complete bound"),
         "the report does not say what that means for a bound:\n{report}"
     );
 }

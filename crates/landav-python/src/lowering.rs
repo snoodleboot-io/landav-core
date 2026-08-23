@@ -51,7 +51,8 @@ use std::{
 
 use landav_bound::Origin;
 use landav_its::{
-    ArithOp, CompareOp, CondId, Construct, ExprId, RangeSpec, SourceProgramBuilder, StmtId, VarName,
+    ArithOp, CompareOp, CondId, Construct, ExprId, Extent, RangeSpec, SourceProgramBuilder, StmtId,
+    VarName,
 };
 use rustpython_parser::ast::{self, Constant, Expr, Ranged, Stmt};
 
@@ -410,14 +411,20 @@ impl Translator<'_> {
             Stmt::For(loop_stmt) => self.for_loop(loop_stmt),
             Stmt::Return(ret) => {
                 // The returned value contributes nothing to runtime, but it may
-                // *contain* something that has to be refused, so it is
-                // translated. The node has no parent; `landav_its::lower`
-                // scans the arenas, so an unattached refusal is still reported.
-                if let Some(value) = &ret.value {
-                    let _ = self.expression(value);
-                }
+                // *contain* something that has to be refused. It is translated
+                // for that reason alone, and the refusals are hoisted to
+                // statements **here**, at the position the expression is
+                // evaluated - see `refusals_of`. Dropping the handle instead
+                // left the refusal in the arena with nothing pointing at it,
+                // which `landav_its::lower` still reported but which a consumer
+                // walking the control structure could not place.
+                let mut statements = match &ret.value {
+                    Some(value) => self.refusals_of(value),
+                    None => Vec::new(),
+                };
                 let origin = self.origin(ret);
-                vec![self.builder.return_stmt(origin)]
+                statements.push(self.builder.return_stmt(origin));
+                statements
             }
             Stmt::Pass(_) => Vec::new(),
             Stmt::Expr(bare) => self.bare_expression(bare),
@@ -451,32 +458,49 @@ impl Translator<'_> {
     fn assign(&mut self, assign: &ast::StmtAssign) -> Vec<StmtId> {
         let [target] = assign.targets.as_slice() else {
             // `a = b = 0` binds two names; the fragment's assignment binds one.
-            let _ = self.expression(&assign.value);
-            return vec![self.refuse_stmt(Construct::ComplexAssignmentTarget, assign)];
+            let mut statements = self.refusals_of(&assign.value);
+            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            return statements;
         };
         let Expr::Name(name) = target else {
-            let _ = self.expression(&assign.value);
-            return vec![self.refuse_stmt(Construct::ComplexAssignmentTarget, assign)];
+            let mut statements = self.refusals_of(&assign.value);
+            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            return statements;
         };
+        if !self.integers.contains(name.id.as_str()) {
+            return self.refuse_binding(name.id.as_str(), target, &assign.value);
+        }
         let value = self.expression(&assign.value);
-        self.bind(name.id.as_str(), value, assign, target)
+        self.bind(name.id.as_str(), value, assign)
     }
 
     fn aug_assign(&mut self, assign: &ast::StmtAugAssign) -> Vec<StmtId> {
         let Expr::Name(name) = assign.target.as_ref() else {
-            let _ = self.expression(&assign.value);
-            return vec![self.refuse_stmt(Construct::ComplexAssignmentTarget, assign)];
+            let mut statements = self.refusals_of(&assign.value);
+            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            return statements;
         };
         let Some(op) = arith_of(&assign.op) else {
             return vec![self.refuse_stmt(refusal_for(&assign.op), assign)];
         };
+        if !self.integers.contains(name.id.as_str()) {
+            // `x += e` reads `x` as well as writing it, so the read is a
+            // refusal of its own and is hoisted alongside the value's.
+            let target = assign.target.as_ref();
+            let mut statements = self.hoisted(Extent::Fragment, |this| {
+                let _ = this.read(name.id.as_str(), target);
+                let _ = this.expression(&assign.value);
+            });
+            statements.extend(self.refuse_binding(name.id.as_str(), target, &assign.value));
+            return statements;
+        }
         // `x += e` is `x = x + e`. The expansion is a Python fact, and it
         // stays on this side of the boundary.
         let origin = self.origin(assign);
         let read = self.read(name.id.as_str(), assign.target.as_ref());
         let value = self.expression(&assign.value);
         let combined = self.builder.arith(op, read, value, origin);
-        self.bind(name.id.as_str(), combined, assign, assign.target.as_ref())
+        self.bind(name.id.as_str(), combined, assign)
     }
 
     fn ann_assign(&mut self, assign: &ast::StmtAnnAssign) -> Vec<StmtId> {
@@ -485,41 +509,52 @@ impl Translator<'_> {
             return Vec::new();
         };
         let Expr::Name(name) = assign.target.as_ref() else {
-            let _ = self.expression(value);
-            return vec![self.refuse_stmt(Construct::ComplexAssignmentTarget, assign)];
+            let mut statements = self.refusals_of(value);
+            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            return statements;
         };
         if !annotation_is_int(Some(&assign.annotation)) {
-            let _ = self.expression(value);
-            return vec![self.refuse_stmt_detailed(
+            let mut statements = self.refusals_of(value);
+            statements.push(self.refuse_stmt_detailed(
                 Construct::NonIntegerValue,
                 name.id.as_str(),
                 assign,
-            )];
+            ));
+            return statements;
+        }
+        if !self.integers.contains(name.id.as_str()) {
+            return self.refuse_binding(name.id.as_str(), assign.target.as_ref(), value);
         }
         let translated = self.expression(value);
-        self.bind(name.id.as_str(), translated, assign, assign.target.as_ref())
+        self.bind(name.id.as_str(), translated, assign)
     }
 
-    /// Emits `name = value`, or refuses if `name` is not a proven integer.
-    fn bind<T: Ranged>(
-        &mut self,
-        name: &str,
-        value: ExprId,
-        node: &T,
-        target: &Expr,
-    ) -> Vec<StmtId> {
-        if !self.integers.contains(name) {
-            // The variable's value after this statement is unknown, so every
-            // later guard mentioning it would be wrong. Refuse, naming it.
-            let origin = self.origin(target);
-            return vec![self.builder.unsupported_stmt_detailed(
-                Construct::NonIntegerValue,
-                name,
-                origin,
-            )];
-        }
+    /// Emits `name = value`.
+    ///
+    /// The caller has already established that `name` is a proven integer;
+    /// [`Translator::refuse_binding`] is the path for when it has not.
+    fn bind<T: Ranged>(&mut self, name: &str, value: ExprId, node: &T) -> Vec<StmtId> {
         let origin = self.origin(node);
         vec![self.builder.assign(VarName::new(name), value, origin)]
+    }
+
+    /// Refuses a binding whose target is not a proven integer, keeping the
+    /// value's own refusals as statements in front of it.
+    ///
+    /// The variable's value after this statement is unknown, so every later
+    /// guard mentioning it would be wrong. That is one refusal; a call on the
+    /// right-hand side is another, and both are real. Hoisting the second means
+    /// the arena holds no node that the statement tree cannot reach - see
+    /// [`Translator::refusals_of`].
+    fn refuse_binding(&mut self, name: &str, target: &Expr, value: &Expr) -> Vec<StmtId> {
+        let mut statements = self.refusals_of(value);
+        let origin = self.origin(target);
+        statements.push(self.builder.unsupported_stmt_detailed(
+            Construct::NonIntegerValue,
+            name,
+            origin,
+        ));
+        statements
     }
 
     fn for_loop(&mut self, loop_stmt: &ast::StmtFor) -> Vec<StmtId> {
@@ -595,10 +630,92 @@ impl Translator<'_> {
             return Vec::new();
         }
         // Anything else is translated; if it is pure arithmetic it is a no-op,
-        // and if it is not, the `Unsupported` node it produces is refused by
-        // the arena scan even though nothing points at it.
-        let _ = self.expression(&bare.value);
-        Vec::new()
+        // and if it is not, the refusals it produces become statements **in
+        // this body, at this position**. That is the whole of `LAN-87`'s
+        // coverage claim: a bare `f(n)` is where the calls in the corpus live,
+        // and a refusal charged inside the loop that runs it costs once per
+        // iteration rather than once.
+        //
+        // `Extent::Statement` on the first of them, because here the region
+        // really is the statement: unlike `return f(n)` or `x = f(n)`, there is
+        // no other node in the arena to charge the step that executing this line
+        // costs. Any further refusals are fragments of the same statement, which
+        // executes once however many of them it contains.
+        self.hoisted(Extent::Statement, |this| {
+            let _ = this.expression(&bare.value);
+        })
+    }
+
+    /// The statements that record what `value` refuses, without leaving any of
+    /// its nodes in the program.
+    ///
+    /// # Why the nodes must not be left behind
+    ///
+    /// A translated-and-discarded expression is an **orphan**: it sits in the
+    /// arena with nothing in the statement tree pointing at it.
+    /// [`landav_its::lower`] copes, because it scans the arenas - but a
+    /// consumer that derives a *cost* has to walk the control structure, and it
+    /// cannot place a node the walk never reaches. It has no sound charge for
+    /// one either: charged at the top level, an orphan that really belonged in
+    /// a loop body is counted once instead of once per iteration, which
+    /// understates.
+    ///
+    /// So the translation happens against a scratch program that is thrown
+    /// away, and every refusal it found is re-emitted here as a statement at
+    /// the same position, naming the same construct with the same detail. The
+    /// refusal ledger [`landav_its::lower`] produces is unchanged; what changes
+    /// is that the node is now somewhere a walk can find it.
+    fn refusals_of(&mut self, value: &Expr) -> Vec<StmtId> {
+        self.hoisted(Extent::Fragment, |this| {
+            let _ = this.expression(value);
+        })
+    }
+
+    /// Runs `translate` against a scratch program and returns its refusals as
+    /// statements. See [`Translator::refusals_of`].
+    ///
+    /// `first` is the [`Extent`] of the leading refusal, and it is the only one
+    /// a caller ever has a choice about. A refusal lifted out of a `return`, an
+    /// assignment or an augmented assignment is a **fragment**: the statement it
+    /// came from is in the arena beside it and pays its own step. A refusal
+    /// lifted out of a bare expression statement is the **statement**, because
+    /// nothing else stands for that line. Whichever it is, only the first can be
+    /// it - a statement executes once no matter how many unanalysable parts it
+    /// has - so the rest are fragments.
+    fn hoisted(&mut self, first: Extent, translate: impl FnOnce(&mut Self)) -> Vec<StmtId> {
+        // Every node `translate` builds carries its own position, so this
+        // fallback origin is never the one reported.
+        let scratch =
+            SourceProgramBuilder::new("<discarded>", Origin::new("<discarded>"), Vec::new());
+        let kept = std::mem::replace(&mut self.builder, scratch);
+        translate(self);
+        let scratch = std::mem::replace(&mut self.builder, kept);
+        let discarded = scratch.build(Vec::new());
+
+        if discarded.overflowed() {
+            // The scratch ran out of arena, so its refusals are short and this
+            // program is missing at least one. Refusing beats reporting a
+            // truncated ledger.
+            self.builder.mark_overflowed();
+        }
+        let refusals: Vec<_> = discarded.unsupported_nodes().collect();
+        refusals
+            .into_iter()
+            .enumerate()
+            .map(|(position, node)| {
+                let extent = if position == 0 {
+                    first
+                } else {
+                    Extent::Fragment
+                };
+                self.builder.unsupported_stmt_with(
+                    node.construct(),
+                    node.detail().cloned(),
+                    extent,
+                    node.origin().clone(),
+                )
+            })
+            .collect()
     }
 
     fn refuse_stmt<T: Ranged>(&mut self, construct: Construct, node: &T) -> StmtId {

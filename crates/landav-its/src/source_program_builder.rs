@@ -4,9 +4,9 @@ use landav_bound::{Origin, Symbol};
 
 use crate::{
     MAX_ARENA_NODES, arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId,
-    construct::Construct, expr_id::ExprId, range_spec::RangeSpec, source_cond::SourceCond,
-    source_expr::SourceExpr, source_program::SourceProgram, source_stmt::SourceStmt,
-    stmt_id::StmtId, var_name::VarName,
+    construct::Construct, expr_id::ExprId, extent::Extent, range_spec::RangeSpec,
+    source_cond::SourceCond, source_expr::SourceExpr, source_program::SourceProgram,
+    source_stmt::SourceStmt, stmt_id::StmtId, var_name::VarName,
 };
 
 /// Builds a [`SourceProgram`] node by node.
@@ -222,14 +222,13 @@ impl SourceProgramBuilder {
     }
 
     /// A statement the frontend could not translate.
+    ///
+    /// The node stands for the whole statement, so a consumer that charges one
+    /// step per statement charges that step as well as the region. See
+    /// [`Extent`] for the case where it should not, and
+    /// [`SourceProgramBuilder::unsupported_stmt_with`] for how to say so.
     pub fn unsupported_stmt(&mut self, construct: Construct, origin: Origin) -> StmtId {
-        self.push_stmt(
-            SourceStmt::Unsupported {
-                construct,
-                detail: None,
-            },
-            origin,
-        )
+        self.unsupported_stmt_with(construct, None, Extent::Statement, origin)
     }
 
     /// A statement the frontend could not translate, with specifics.
@@ -239,13 +238,50 @@ impl SourceProgramBuilder {
         detail: impl Into<Symbol>,
         origin: Origin,
     ) -> StmtId {
+        self.unsupported_stmt_with(construct, Some(detail.into()), Extent::Statement, origin)
+    }
+
+    /// A statement the frontend could not translate, saying how much of a source
+    /// statement it stands for.
+    ///
+    /// The arena has no expression slot on `Return` and none at all on a refused
+    /// assignment, so something unanalysable inside one of those has to become a
+    /// statement of its own. [`Extent::Fragment`] is how a frontend says that
+    /// this is what happened - the statement it came from is in the arena beside
+    /// it, paying its own step, so this node is charged for the region alone.
+    pub fn unsupported_stmt_with(
+        &mut self,
+        construct: Construct,
+        detail: Option<Symbol>,
+        extent: Extent,
+        origin: Origin,
+    ) -> StmtId {
         self.push_stmt(
             SourceStmt::Unsupported {
                 construct,
-                detail: Some(detail.into()),
+                detail,
+                extent,
             },
             origin,
         )
+    }
+
+    /// Records that this program is incomplete for a reason the builder could
+    /// not see.
+    ///
+    /// # The one legitimate caller
+    ///
+    /// A frontend that translates an expression it will not keep - to record
+    /// what the expression refuses, without leaving the nodes dangling in the
+    /// program - does that translation into a *separate* builder and hoists the
+    /// refusals across. If that separate builder hit [`MAX_ARENA_NODES`], its
+    /// refusals are short, and the program the frontend is really building must
+    /// carry that fact or [`crate::lower`] would accept a program with a
+    /// silently dropped refusal in it.
+    ///
+    /// There is deliberately no way to clear the flag.
+    pub const fn mark_overflowed(&mut self) {
+        self.overflowed = true;
     }
 
     // -- finishing ----------------------------------------------------------

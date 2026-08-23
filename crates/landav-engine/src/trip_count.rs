@@ -1,6 +1,6 @@
 //! [`TripCount`] - how many times a counted loop runs, and how well we know it.
 
-use landav_bound::Bound;
+use landav_bound::{Bound, VarId};
 
 use crate::hole::Hole;
 
@@ -130,6 +130,44 @@ impl TripCount {
                 exact_elsewhere: false,
             },
             other => other,
+        }
+    }
+
+    /// Replace `var` by something that **dominates** it, keeping the ledger.
+    ///
+    /// # Why this is a method rather than a caller's `match`
+    ///
+    /// A result is a tagged union whose tag carries metadata - the holes it
+    /// names, and whether what it did derive was derived exactly. The only
+    /// accessor is [`TripCount::bound`], which strips the tag, so a caller that
+    /// wants to *transform* the bound has to re-choose a tag by hand, and
+    /// nothing in the type stops it choosing a more confident one than it had.
+    ///
+    /// That is not hypothetical. `close_over_counter` did exactly this: it
+    /// pulled the bound out of a `Partial`, substituted, and rebuilt an
+    /// `AtMost`. The hole *variables* stayed in the bound while the ledger that
+    /// named them was thrown away, so a nested loop beside a `while` reported
+    /// `O(2 + n * (1 + #hole0 + 2n))` as a **complete** upper bound with no
+    /// holes - a finite-looking claim a budget gate may act on, whose omega-
+    /// valued variable any consumer supplying only the parameters reads as
+    /// zero. Threading the substitution through the type is what makes that
+    /// unrepresentable.
+    ///
+    /// # Why the result is relaxed
+    ///
+    /// The replacement dominates rather than equals, and [`Bound`] is weakly
+    /// monotone by construction, so the new bound is an over-approximation of
+    /// the old one. Whatever two-sided claim held before does not hold after.
+    #[must_use]
+    pub fn substituting(self, var: &VarId, replacement: &Bound) -> Self {
+        match self {
+            Self::Exact(bound) | Self::AtMost(bound) => Self::AtMost(bound.subst(var, replacement)),
+            Self::Partial { bound, holes, .. } => Self::Partial {
+                bound: bound.subst(var, replacement),
+                holes,
+                exact_elsewhere: false,
+            },
+            Self::Unknown => Self::Unknown,
         }
     }
 

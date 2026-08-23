@@ -198,11 +198,25 @@ fn a_refused_function_reports_every_construct_and_where() -> io::Result<()> {
     let f = function(&run, "refused");
 
     assert_eq!(f["lowered"], false);
+    // Reporting a bound here is no longer inventing a conclusion. `LAN-87` made
+    // the native engine total over the structured source: it derives the cost
+    // apart from each region it cannot read, and names and places every one of
+    // them. What it must never do is offer a **complete** claim for a function
+    // the toolchain refused - `"exact"` and `"upper"` are both comparable
+    // against a budget, and this function's cost was never established.
+    let kind = f["bound_kind"].as_str().unwrap_or("null");
     assert!(
-        f["bound"].is_null(),
-        "a function that did not lower has no bound, and reporting one would \
-         be inventing a conclusion: {f}"
+        kind != "exact" && kind != "upper",
+        "`refused` did not lower and reports a `{kind}` bound, which a budget \
+         gate may act on: {f}"
     );
+    if kind == "partial" {
+        assert!(
+            !f["holes"].as_array().expect("holes is an array").is_empty(),
+            "a partial bound without a hole is a complete bound wearing the \
+             wrong label: {f}"
+        );
+    }
 
     let refused = f["refused"].as_array().expect("refused is an array");
     assert!(!refused.is_empty(), "a refusal must say why: {f}");

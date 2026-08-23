@@ -25,11 +25,17 @@
 //! | 1. every unsupported construct maps to a named diagnostic | `refusal`, `coverage` |
 //! | 2. a coverage report lists which constructs were skipped and why | `coverage` |
 //!
+//! `LAN-87` adds the second engine's side of the same discipline:
+//!
+//! | `LAN-87` AC | file |
+//! |---|---|
+//! | the native engine never understates, and `Exact` means exact | `engine_cost` |
+//!
 //! and the non-negotiable that outranks all four:
 //!
 //! | Non-negotiable | file |
 //! |---|---|
-//! | 1. soundness has a zero target | `soundness` |
+//! | 1. soundness has a zero target | `soundness`, `engine_cost` |
 //! | 2. never panic; no recursion on untrusted input | `refusal::deep_input` |
 //! | 3. failure carries blame | `refusal` |
 //!
@@ -63,6 +69,7 @@ mod support;
 mod algebra;
 mod corpus;
 mod coverage;
+mod engine_cost;
 mod fragment;
 mod koat_format;
 mod refusal;

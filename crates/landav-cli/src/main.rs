@@ -37,6 +37,7 @@
 mod check;
 mod cli;
 mod config;
+mod derived;
 mod diagnostic;
 mod machine;
 mod outcome;

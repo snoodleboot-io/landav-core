@@ -181,7 +181,40 @@
 //! refusal by forgetting to hang a node off something, which is the easiest
 //! mistake in a translation to make and the hardest to notice: the program
 //! would lower cleanly and the bound would silently omit whatever the node
-//! stood for.
+//! stood for. That scan is [`SourceProgram::unsupported_nodes`], and it is
+//! published so that a second consumer with the same obligation can be built on
+//! the same implementation rather than on a second walk that drifts.
+//!
+//! ## All-or-nothing is a property of *this path*, not of the toolchain
+//!
+//! It is worth being exact about the scope, because it narrowed. All-or-nothing
+//! is a statement about [`lower`] and about what [`Coverage::lowered`] counts:
+//! either the whole program becomes an [`Its`] or none of it does, and there is
+//! no partial system for a solver to be misled by.
+//!
+//! It is **not** a statement about whether anything can be said about a refused
+//! program. `landav-engine` derives costs from [`SourceProgram`] directly,
+//! without a transition system, and treats each `Unsupported` node as a *hole*:
+//! a named variable standing for that region's cost, blamed on its
+//! [`Construct`] and its position. The cost around the hole is still derived,
+//! and an unfilled hole denotes `omega`, so nothing complete is ever claimed.
+//!
+//! That second consumer needs one thing of a refusal that [`lower`] does not:
+//! how much of a source statement the node stands for. A frontend has nowhere
+//! but a statement of its own to record something unanalysable inside a `return`
+//! or a refused assignment, so the same node kind arrives for "this line is a
+//! call" and for "there is a call inside the line beside this one" - and a
+//! consumer charging one step per statement must tell them apart. [`Extent`]
+//! is that field. It is inert on this path: [`lower`] refuses either way.
+//! A function whose only obstacle is a call therefore has no transition system
+//! and does have a partial bound naming the call - two different answers to two
+//! different questions, and this crate answers only the first.
+//!
+//! This crate gains no representation for unknown cost from that. [`Cost`] stays
+//! a polynomial, [`Update`] stays a total map with no havoc, and a call still
+//! refuses - because a call has an unknown *effect* on the integer state as well
+//! as an unknown value, and there is no sound over-approximation of an unknown
+//! effect.
 //!
 //! # The coverage report
 //!
@@ -224,8 +257,10 @@ pub mod cond_id;
 pub mod constraint;
 pub mod construct;
 pub mod cost;
+pub mod cost_effect;
 pub mod coverage;
 pub mod expr_id;
+pub mod extent;
 pub mod guard;
 pub mod its;
 pub mod its_var;
@@ -235,6 +270,7 @@ pub mod location_id;
 pub mod lowering;
 pub mod lowering_error;
 pub mod monomial;
+pub mod node_id;
 pub mod polynomial;
 pub mod range_spec;
 pub mod refusals;
@@ -247,18 +283,20 @@ pub mod source_stmt;
 pub mod stmt_id;
 pub mod transition;
 pub mod unsupported;
+pub mod unsupported_node;
 pub mod update;
 pub mod var_name;
 
 pub use crate::{
     arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId, constraint::Constraint,
-    construct::Construct, cost::Cost, coverage::Coverage, expr_id::ExprId, guard::Guard, its::Its,
-    its_var::ItsVar, location::Location, location_id::LocationId, lowering::lower,
-    lowering_error::LoweringError, monomial::Monomial, polynomial::Polynomial,
-    range_spec::RangeSpec, refusals::Refusals, relation::Relation, source_cond::SourceCond,
-    source_expr::SourceExpr, source_program::SourceProgram,
-    source_program_builder::SourceProgramBuilder, source_stmt::SourceStmt, stmt_id::StmtId,
-    transition::Transition, unsupported::Unsupported, update::Update, var_name::VarName,
+    construct::Construct, cost::Cost, cost_effect::CostEffect, coverage::Coverage, expr_id::ExprId,
+    extent::Extent, guard::Guard, its::Its, its_var::ItsVar, location::Location,
+    location_id::LocationId, lowering::lower, lowering_error::LoweringError, monomial::Monomial,
+    node_id::NodeId, polynomial::Polynomial, range_spec::RangeSpec, refusals::Refusals,
+    relation::Relation, source_cond::SourceCond, source_expr::SourceExpr,
+    source_program::SourceProgram, source_program_builder::SourceProgramBuilder,
+    source_stmt::SourceStmt, stmt_id::StmtId, transition::Transition, unsupported::Unsupported,
+    unsupported_node::UnsupportedNode, update::Update, var_name::VarName,
 };
 
 /// The highest total degree a [`Polynomial`] may reach.
