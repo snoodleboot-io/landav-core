@@ -1,4 +1,26 @@
-//! External solver bridge — KoAT (upper bounds) and LoAT (lower bounds).
+//! External solver bridge — KoAT2, as a differential oracle.
+//!
+//! # The pair is no longer a pair
+//!
+//! This crate was written to invoke two solvers: KoAT for upper bounds and
+//! LoAT for lower bounds. **LoAT has been dropped** — GPL-3.0, forced rather
+//! than chosen by a statically linked Yices 2 and CLN, and the invocation
+//! never worked anyway because LoAT reads only SMT-LIB and ARI while this
+//! crate emits KoAT format. Lower bounds come from `landav-engine`, which
+//! derives exact `Theta` for the counted-loop fragment without consulting
+//! anything. See [`loat_answer`], which is a parser deliberately kept without
+//! a caller, and the repository `NOTICE`.
+//!
+//! **KoAT2 is also no longer on the critical path.** The native engine is
+//! total over the structured fragment and answers without a solver, so what
+//! KoAT2 buys is a second opinion: it reaches the same programs by a different
+//! route, and a disagreement means one of the two is wrong. It runs in CI as a
+//! differential oracle and is discovered on `PATH` rather than bundled — see
+//! the `NOTICE` section on why shipping someone else's binary would turn their
+//! dependency graph into ours.
+//!
+//! The licence section below still holds in full and is the reason the process
+//! boundary is not negotiable.
 //!
 //! # Scope
 //!

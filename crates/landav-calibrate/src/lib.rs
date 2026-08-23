@@ -21,6 +21,35 @@
 //! requirement: it is what makes the number auditable and what lets a stale
 //! profile be detected rather than silently trusted.
 //!
+//! # What is waiting on this crate, and what is not
+//!
+//! Exactly one registered `--resource` is: **`ops`**. It is the only one of the
+//! four that is a *scaling* of a number the engine already derives, so it is
+//! the only one whose blocker is a measurement rather than an analysis. The CLI
+//! says so in its own words - `landav check --help` names this component under
+//! `--resource ops`, and a run that selects `ops` reports that it is waiting on
+//! the profile this crate emits. That sentence is generated from
+//! `landav-cli`'s `resource::awaiting`, which is the single place any statement
+//! about a resource's status is made.
+//!
+//! The other three are not waiting on a profile and must not be told they are:
+//! `alloc` and `peak-mem` need an IR that can represent data - nothing in an
+//! integer-scalar fragment allocates - and `queries` already derives, because a
+//! call became a named hole rather than a refusal. A blanket "calibration is
+//! not implemented" would be true of one resource and misleading about three,
+//! which is the drift LAN-86 was filed to end.
+//!
+//! # The shape of the edge, so it is not mistaken for a stub
+//!
+//! `landav-cli` declares this crate as a dependency and calls nothing in it
+//! yet. That edge is real and deliberate rather than decorative: it is where
+//! the profile *loader* is consumed the moment `LAN-5` lands, and the CLI
+//! already carries the sentence saying what it is for. What arrives here is a
+//! benchmark harness, a versioned profile format, and a loader - and the
+//! contract that **every concrete estimate names the calibration id it used**,
+//! so that a stale profile is detectable in the report rather than silently
+//! trusted.
+//!
 //! # ⚠️ Verify before designing
 //!
 //! The CPython 3.14 JIT and free-threading characteristics above come from 2026

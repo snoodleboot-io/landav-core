@@ -49,7 +49,7 @@ use std::{
     path::Path,
 };
 
-use landav_bound::Origin;
+use landav_bound::{Origin, Symbol};
 use landav_its::{
     ArithOp, CompareOp, CondId, Construct, ExprId, Extent, RangeSpec, SourceProgramBuilder, StmtId,
     VarName,
@@ -120,13 +120,26 @@ fn lower_function(
         )
         .collect();
 
+    let mut builder = SourceProgramBuilder::new(name.clone(), origin, params);
+    // A length is a property of an object, not a value bound to a name: a
+    // `property` getter or a `__getitem__` is free to call `items.append(...)`,
+    // so foreign code changes what `len(items)` denotes without rebinding
+    // anything. An integer parameter cannot be moved that way. Core needs the
+    // difference to decide what survives a read; see
+    // `landav_its::SourceProgram::is_volatile`.
+    for collection in collection_parameters(function) {
+        builder.mark_volatile(length_var(&collection));
+    }
+
     let mut translator = Translator {
         path,
         index,
-        builder: SourceProgramBuilder::new(name.clone(), origin, params),
+        builder,
         integers,
         collections,
         walks: 0,
+        discarding: false,
+        value_discarded: false,
     };
     let body = translator.block(&function.body);
     let program = translator.builder.build(body);
@@ -273,15 +286,53 @@ fn assigned_names(statement: &Stmt) -> Vec<String> {
     match statement {
         Stmt::Assign(assign) => {
             for target in &assign.targets {
-                crate::syntax::target_names(target, &mut names);
+                written_names(target, &mut names);
             }
         }
-        Stmt::AugAssign(assign) => crate::syntax::target_names(&assign.target, &mut names),
-        Stmt::AnnAssign(assign) => crate::syntax::target_names(&assign.target, &mut names),
-        Stmt::For(loop_stmt) => crate::syntax::target_names(&loop_stmt.target, &mut names),
+        Stmt::AugAssign(assign) => written_names(&assign.target, &mut names),
+        Stmt::AnnAssign(assign) => written_names(&assign.target, &mut names),
+        Stmt::For(loop_stmt) => written_names(&loop_stmt.target, &mut names),
         _ => {}
     }
     names
+}
+
+/// The names an assignment to `target` changes the meaning of.
+///
+/// # Why this is not every name the target mentions
+///
+/// `a[i] = 0` writes through `a` and **reads** `i`. Walking the whole target
+/// expression cannot tell those apart, so it condemned the index alongside the
+/// container - and when the index is a loop counter, condemning it makes the
+/// counter a non-integer, which refuses the whole `for` statement, throws away
+/// its body, and takes any loop nested inside that body out of the program with
+/// it. Measured: 29 of the standard library's 166 `range` loops write through
+/// their own counter, and every one of them was refused whole. The same write
+/// with a literal index kept its count, which is the shape of the bug.
+///
+/// Condemning the container is right - the analysis cannot see what `a` holds
+/// afterwards. Condemning the index is not: a read of a name proves nothing
+/// about it either way.
+fn written_names(target: &Expr, out: &mut Vec<String>) {
+    match target {
+        Expr::Name(name) => out.push(name.id.as_str().to_owned()),
+        // The object whose state changes, never the index or the attribute.
+        Expr::Subscript(subscript) => written_names(&subscript.value, out),
+        Expr::Attribute(attribute) => written_names(&attribute.value, out),
+        Expr::Tuple(tuple) => {
+            for element in &tuple.elts {
+                written_names(element, out);
+            }
+        }
+        Expr::List(list) => {
+            for element in &list.elts {
+                written_names(element, out);
+            }
+        }
+        Expr::Starred(starred) => written_names(&starred.value, out),
+        // `f()[0] = 1` changes nothing this analysis names.
+        _ => {}
+    }
 }
 
 /// Adds any name this statement binds to a non-integer value.
@@ -293,7 +344,7 @@ fn collect_non_integer_bindings(
 ) {
     let mut condemn = |target: &Expr| {
         let mut names = Vec::new();
-        crate::syntax::target_names(target, &mut names);
+        written_names(target, &mut names);
         for name in names {
             if candidates.contains(&name) {
                 doomed.insert(name);
@@ -372,11 +423,36 @@ fn is_integer_expr(
                 literal_exponent(&binary.right).is_some()
                     && is_integer_expr(&binary.left, candidates, collections)
             }
+            // `//`, `%`, `<<` and `>>` over integers yield integers. This has
+            // to agree with `build_expression`, and it is the *same* predicate
+            // that decides both: proving `x = n // 2` binds an integer is what
+            // stops `x` being condemned, and a condemned `x` refuses at the
+            // binding, at every later read of it, and at the `for` line of any
+            // range it appears in. Teaching the translation alone would leave
+            // those three refusals standing. `LAN-91`.
+            ast::Operator::FloorDiv
+            | ast::Operator::Mod
+            | ast::Operator::LShift
+            | ast::Operator::RShift => approximation_of(binary, candidates, collections).is_some(),
             _ => false,
         },
         Expr::UnaryOp(unary) => {
             matches!(unary.op, ast::UnaryOp::USub | ast::UnaryOp::UAdd)
                 && is_integer_expr(&unary.operand, candidates, collections)
+        }
+        // `a if c else b` is an integer when both arms are, whichever way the
+        // test goes. Without this arm `x = a if c else b` never proves `x` an
+        // integer, so the binding refuses as `non-integer-value` **on top of**
+        // the conditional-expression refusal, and so does every later read of
+        // `x` and every `range` mentioning it. Teaching the translation without
+        // teaching this leaves two of the three refusals standing. `LAN-91`.
+        //
+        // It does not make the ternary's *value* available: nothing here claims
+        // to know which arm ran, and `Translator::bind_expression` binds the
+        // name inside a branch rather than to an expression.
+        Expr::IfExp(ternary) => {
+            is_integer_expr(&ternary.body, candidates, collections)
+                && is_integer_expr(&ternary.orelse, candidates, collections)
         }
         _ => false,
     }
@@ -403,6 +479,53 @@ fn length_of_collection(call: &ast::ExprCall, collections: &BTreeSet<String>) ->
     collections
         .contains(argument.id.as_str())
         .then(|| argument.id.to_string())
+}
+
+/// How many values a display iterates, and whether that count is exact.
+///
+/// # Only a display, and only some of them
+///
+/// | form | length | why |
+/// |---|---|---|
+/// | `[a, b, c]`, `(a, b, c)`, `'abc'`, `b'abc'` | exactly 3 | positional, nothing collapses |
+/// | `{a, b, c}`, `{a: 1, b: 2}` | **at most** 3 | equal elements and equal keys collapse |
+/// | `[*rest, 1]` | not known | `rest` contributes `len(rest)`, and this cannot see it |
+/// | `[0] * n`, `a + b`, a comprehension | not known | not a display at all |
+///
+/// The set and dict rows are the reason this returns exactness rather than a
+/// number. `{1, 1, 2}` writes three elements and iterates two, so counting three
+/// is a sound upper bound and a **false** `Theta` - and `Theta` against `O` is a
+/// distinction this codebase reports to its users. `[*rest, 1]` is the sharper
+/// trap: it is an ordinary `Expr::List` with two elements, so "the trip count is
+/// `elts.len()`" answers 2 for a loop that runs `len(rest) + 1` times.
+///
+/// A `str` is measured in **characters**, because that is what Python iterates.
+fn walked_display(expr: &Expr) -> Option<(u64, bool)> {
+    let counted = |elements: &[Expr], exact: bool| -> Option<(u64, bool)> {
+        if elements.iter().any(|it| matches!(it, Expr::Starred(_))) {
+            return None;
+        }
+        Some((u64::try_from(elements.len()).ok()?, exact))
+    };
+    match expr {
+        Expr::List(list) => counted(&list.elts, true),
+        Expr::Tuple(tuple) => counted(&tuple.elts, true),
+        Expr::Set(set) => counted(&set.elts, false),
+        // A `None` key is `**mapping`, which spreads an unknown number of them.
+        Expr::Dict(dict) => {
+            if dict.keys.iter().any(Option::is_none) {
+                return None;
+            }
+            Some((u64::try_from(dict.keys.len()).ok()?, false))
+        }
+        Expr::Constant(constant) => match &constant.value {
+            Constant::Str(text) => Some((u64::try_from(text.chars().count()).ok()?, true)),
+            Constant::Bytes(bytes) => Some((u64::try_from(bytes.len()).ok()?, true)),
+            Constant::Tuple(elements) => Some((u64::try_from(elements.len()).ok()?, true)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The collection parameter this expression iterates, if it is a bare name for
@@ -456,6 +579,125 @@ const fn arith_of(op: &ast::Operator) -> Option<ArithOp> {
     }
 }
 
+/// How deeply nested a conditional expression may be before it is refused.
+///
+/// Splitting `a if c else b` into a branch is one recursive frame per level,
+/// and `a if c else b if d else e` chains to the right without a bracket - so
+/// the byte-level guard, which counts brackets and operator characters, does
+/// not bound this. Sixty-four is far past anything a human writes and far short
+/// of a stack that runs out; past it the ternary is refused, which is the same
+/// answer the frontend gave before this ticket and is sound for the same reason.
+const MAX_TERNARY_DEPTH: u32 = 64;
+
+/// The largest left-shift this frontend turns into a multiplication.
+///
+/// `a << k` is `a * 2^k` exactly, and the fragment's literals are `i64`, so the
+/// factor has to fit one: `2^62` does and `2^63` does not. Past it the operator
+/// is refused rather than saturated - a wrapped factor is a *smaller* number
+/// than the truth, which is the one direction a bound may never move.
+const MAX_SHIFT: u32 = 62;
+
+/// What can be said about an integer operator the polynomial fragment cannot
+/// express.
+///
+/// Only these two shapes, and the difference between them is the trap in this
+/// whole lane. `<<` is the only one of the seven whose result is **larger** than
+/// its operand, so handling `Construct::BitwiseOperator` uniformly - bounding
+/// `n << 1` by `n` because `n >> 1` is bounded by `n` - under-reports by a
+/// factor of two per shift.
+#[derive(Debug, Clone, Copy)]
+enum Approximated {
+    /// `a << k` is exactly `a * 2^k`; the factor is that power of two.
+    ///
+    /// Exact, so it stays a plain product and the loops counted by it stay
+    /// `Theta`.
+    Scaled(i64),
+    /// The value's magnitude is dominated by the **left** operand's.
+    ///
+    /// `|a // b| <= |a|`, `|a % b| <= |a|` and `|a >> k| <= |a|` whenever `a` is
+    /// non-negative, for every `b != 0` and every `k >= 0`; a divisor of zero or
+    /// a negative shift raises before the value is used, and a negative result
+    /// makes a `range` over it empty, so an upper bound over `a` holds in every
+    /// case.
+    ///
+    /// # The divisor may not appear
+    ///
+    /// Division is **anti-monotone** in its second operand while every
+    /// `landav_bound::Bound` is weakly monotone, so a bound mentioning the
+    /// divisor takes its smallest value exactly where the true quotient takes
+    /// its largest: `100 // 1 == 100`, and a bound of `m` reads `1` there. The
+    /// inequality above mentions `b` nowhere, which is precisely what makes it
+    /// safe to write down.
+    ByDividend,
+}
+
+/// How `binary` may be approximated, or `None` if it may not be.
+///
+/// # Both operands must be proven integers first
+///
+/// Not a formality. It is what lets the *right* operand be left untranslated:
+/// an expression this predicate accepts is built from literals, proven-integer
+/// names and `+ - * **`, so it contains no call, no attribute and no subscript,
+/// and therefore no cost and no effect that dropping it could hide. The left
+/// operand is a different matter - it is kept, referenced by the refusal node,
+/// and walked - so a region inside it is charged where it stands.
+fn approximation_of(
+    binary: &ast::ExprBinOp,
+    candidates: &BTreeSet<String>,
+    collections: &BTreeSet<String>,
+) -> Option<Approximated> {
+    if !is_integer_expr(&binary.left, candidates, collections)
+        || !is_integer_expr(&binary.right, candidates, collections)
+    {
+        return None;
+    }
+    match binary.op {
+        ast::Operator::FloorDiv | ast::Operator::Mod | ast::Operator::RShift => {
+            Some(Approximated::ByDividend)
+        }
+        ast::Operator::LShift => {
+            let shift = literal_shift(&binary.right)?;
+            // `1 << 62` is the largest power of two an `i64` holds.
+            (shift <= MAX_SHIFT).then(|| Approximated::Scaled(1_i64 << shift))
+        }
+        _ => None,
+    }
+}
+
+/// A non-negative literal shift amount.
+///
+/// A negative one raises `ValueError` in Python and would panic a shift here,
+/// so it is not a literal this recognises; a symbolic one makes the result
+/// `n * 2^m`, which is not a polynomial and has no `SourceExpr`.
+fn literal_shift(expr: &Expr) -> Option<u32> {
+    let Expr::Constant(constant) = expr else {
+        return None;
+    };
+    let Constant::Int(value) = &constant.value else {
+        return None;
+    };
+    u32::try_from(value.clone()).ok()
+}
+
+/// How the frontend spells an operator it approximates, for the report.
+const fn spelling_of(op: &ast::Operator) -> &'static str {
+    match op {
+        ast::Operator::FloorDiv => "//",
+        ast::Operator::Mod => "%",
+        ast::Operator::LShift => "<<",
+        ast::Operator::RShift => ">>",
+        ast::Operator::Div => "/",
+        ast::Operator::Pow => "**",
+        ast::Operator::BitAnd => "&",
+        ast::Operator::BitOr => "|",
+        ast::Operator::BitXor => "^",
+        ast::Operator::MatMult => "@",
+        ast::Operator::Add => "+",
+        ast::Operator::Sub => "-",
+        ast::Operator::Mult => "*",
+    }
+}
+
 /// Why a Python operator is not in the fragment.
 const fn refusal_for(op: &ast::Operator) -> Construct {
     match op {
@@ -491,11 +733,59 @@ struct Translator<'a> {
     /// How many collection walks have been lowered, to keep their synthetic
     /// counters apart.
     walks: u32,
+    /// Whether the expression being translated is evaluated for its **effect**
+    /// and its value thrown away.
+    ///
+    /// True exactly while [`Translator::hoisted`] is running, and `hoisted`
+    /// translates into a scratch builder that is discarded whole - only the
+    /// refusals it found survive, and they survive through
+    /// [`landav_its::SourceProgram::unsupported_nodes`], which *scans* the arena
+    /// rather than walking it. Two things follow, and the collection lane rests
+    /// on both:
+    ///
+    /// * a node built here never reaches the program, so a form whose value the
+    ///   fragment cannot hold may return any placeholder at all rather than a
+    ///   refusal - `x = [1, 2, 3]` refuses because `x` holds a list, not because
+    ///   building the list was unanalysable, and an expression costs no source
+    ///   step of its own;
+    /// * an orphan is harmless here, because the scan finds it - so the
+    ///   *elements* of such a form can be translated for their own refusals
+    ///   without the parent having to reference them.
+    ///
+    /// Neither holds in a value position, which is why this is a flag and not a
+    /// blanket change: `if [1, 2]:` is a truth test whose answer decides a
+    /// branch, and `landav_its::lower` builds a guard out of it.
+    discarding: bool,
+    /// Whether the expression's value is read by **nothing at all**.
+    ///
+    /// Strictly narrower than [`Translator::discarding`], and the two are not
+    /// the same question. `discarding` says the nodes go to a scratch builder,
+    /// which is true of the right-hand side of `x = a and b` as well - that
+    /// value is hoisted for its refusals only. But a binding *names* a value,
+    /// and the report has to say why that name became unknowable: `x = a and b`
+    /// yields `non-integer-value: x`, and without the `conditional-expression`
+    /// beside it the user is told that `x` is not an integer and never told
+    /// which construct made it one. So value position keeps its refusal, and
+    /// `boolean_and_comparison_values_stay_refused` pins that.
+    ///
+    /// This flag is for the positions where there is no name and no value slot
+    /// at all: a `return`, whose [`landav_its::SourceStmt::Return`] never
+    /// represents what is returned, and a bare expression statement. There the
+    /// only question a boolean, a comparison or a ternary raises is what it
+    /// **costs**, and the answer is its operands' regions and nothing else.
+    /// `return a and b` can no more publish a bound variable than `return [a]`
+    /// can, because there is nowhere for the value to go.
+    value_discarded: bool,
 }
 
 impl Translator<'_> {
     fn origin<T: Ranged>(&self, node: &T) -> Origin {
         origin_of(self.path, self.index, node)
+    }
+
+    /// The position just past a node. See [`origin_past`].
+    fn origin_after<T: Ranged>(&self, node: &T) -> Origin {
+        origin_past(self.path, self.index, node)
     }
 
     // -- statements ---------------------------------------------------------
@@ -544,7 +834,7 @@ impl Translator<'_> {
                 // which `landav_its::lower` still reported but which a consumer
                 // walking the control structure could not place.
                 let mut statements = match &ret.value {
-                    Some(value) => self.refusals_of(value),
+                    Some(value) => self.discarded_cost_of(value),
                     None => Vec::new(),
                 };
                 let origin = self.origin(ret);
@@ -556,15 +846,18 @@ impl Translator<'_> {
 
             Stmt::Break(node) => vec![self.refuse_stmt(Construct::LoopJump, node)],
             Stmt::Continue(node) => vec![self.refuse_stmt(Construct::LoopJump, node)],
-            Stmt::Raise(node) => {
-                vec![self.refuse_stmt(Construct::ExceptionalControlFlow, node)]
-            }
-            Stmt::Try(node) => vec![self.refuse_stmt(Construct::ExceptionalControlFlow, node)],
+            Stmt::Raise(node) => self.raise(node),
+            Stmt::Try(node) => self.try_statement(node),
+            // `except*` runs **several** handlers for one exception group, so
+            // the sum over its clauses is still the honest upper bound and the
+            // shape is the same. It stays refused all the same: it is rare
+            // enough that the corpus does not pay for it, and every construct
+            // accepted here is soundness surface.
             Stmt::TryStar(node) => {
                 vec![self.refuse_stmt(Construct::ExceptionalControlFlow, node)]
             }
             Stmt::Assert(node) => vec![self.refuse_stmt(Construct::ExceptionalControlFlow, node)],
-            Stmt::With(node) => vec![self.refuse_stmt(Construct::ExceptionalControlFlow, node)],
+            Stmt::With(node) => self.with_statement(node),
             Stmt::AsyncWith(node) => vec![self.refuse_stmt(Construct::Coroutine, node)],
             Stmt::AsyncFor(node) => vec![self.refuse_stmt(Construct::Coroutine, node)],
             Stmt::AsyncFunctionDef(node) => vec![self.refuse_stmt(Construct::Coroutine, node)],
@@ -580,6 +873,176 @@ impl Translator<'_> {
         }
     }
 
+    /// `raise`, and the expression beside it.
+    ///
+    /// # One charged step, and an edge out of the region it stands in
+    ///
+    /// A `raise` used to be one whole-statement refusal, which was sound - the
+    /// hole denotes `omega` - and cost the code around it everything: a region
+    /// forgets every value the analysis knew, so a `raise` at the end of a
+    /// `try` body erased the trip count of a loop in the handler beside it.
+    ///
+    /// It assigns to nothing and costs one step, so it is now spelled as
+    /// [`landav_its::SourceStmt::Raise`]. **The step alone would be unsound**:
+    /// `for i in range(n): raise ValueError` executes two steps for every `n`,
+    /// and an engine charging the step without also learning that the loop can
+    /// be left early reports `Theta(2n)` - complete, exact, no holes. The edge
+    /// is the other half of this change and lives in `landav-engine`'s
+    /// `exits_within`.
+    ///
+    /// # The expression is still translated
+    ///
+    /// `raise ValueError(compute(n))` runs a call, and a call has an unknown
+    /// cost. Accepting the statement without translating what is inside it
+    /// would leave that call in no arena at all - invisible to the refusal scan
+    /// as well as to the walk - and the function would publish a bound that
+    /// omits it. A bare class name is the exception: a global lookup runs no
+    /// user code and binds nothing, so there is nothing to charge and nothing
+    /// to refuse.
+    fn raise(&mut self, node: &ast::StmtRaise) -> Vec<StmtId> {
+        let mut statements = Vec::new();
+        for expression in [node.exc.as_deref(), node.cause.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if !is_name_lookup(expression) {
+                statements.extend(self.refusals_of(expression));
+            }
+        }
+        let origin = self.origin(node);
+        statements.push(self.builder.raise_stmt(origin));
+        statements
+    }
+
+    /// `try` / `except` / `else` / `finally`.
+    ///
+    /// Becomes one [`landav_its::SourceStmt::Protected`], whose cost rule -
+    /// `body + handler + cleanup`, never exact - is stated there. What is
+    /// decided *here* is which Python clause goes into which slot:
+    ///
+    /// * the `else` clause joins the **body**. It runs after the body exactly
+    ///   when the body completed, so it is on the body's path and on no other;
+    /// * every `except` clause joins the **handler**, concatenated. Exactly one
+    ///   of them runs, so their sum dominates whichever it is;
+    /// * `finally` is the **cleanup**, and the whole point of the slot is that
+    ///   it sits outside the choice: charging it to the exceptional path only
+    ///   understates every normal run by the entire `finally` body.
+    ///
+    /// # `except E as e` is a rebinding, and it is checked
+    ///
+    /// The engine forgets every readable name on the way *out* of a
+    /// `Protected`, which covers a later trip count. It cannot cover one inside
+    /// the handler itself: `except ValueError as n:` followed by
+    /// `for i in range(n):` would read `n` as the caller's integer when it now
+    /// holds an exception object. There is no expression for what it holds, so
+    /// the clause opens with a refusal that forgets it - and only when the name
+    /// is one this pass tracks, so the overwhelmingly common
+    /// `except ValueError as e:` costs nothing.
+    ///
+    /// A collection parameter counts as tracked for the same reason: the bound
+    /// its length contributes is a fact about the object that name denotes, and
+    /// rebinding the name is not a change the length variable survives.
+    fn try_statement(&mut self, node: &ast::StmtTry) -> Vec<StmtId> {
+        let mut body = self.block(&node.body);
+        body.extend(self.block(&node.orelse));
+
+        let mut handler = Vec::new();
+        for clause in &node.handlers {
+            let ast::ExceptHandler::ExceptHandler(clause) = clause;
+            // `except E:` evaluates `E` to decide whether the clause matches,
+            // and `except self.errors:` runs a `property` getter to do it.
+            if let Some(kind) = &clause.type_
+                && !is_name_lookup(kind)
+            {
+                handler.extend(self.refusals_of(kind));
+            }
+            if let Some(name) = &clause.name
+                && (self.integers.contains(name.as_str())
+                    || self.collections.contains(name.as_str()))
+            {
+                let origin = self.origin(clause);
+                handler.push(self.builder.unsupported_stmt_detailed(
+                    Construct::BindingForm,
+                    name.as_str(),
+                    origin,
+                ));
+            }
+            handler.extend(self.block(&clause.body));
+        }
+
+        let cleanup = self.block(&node.finalbody);
+        let origin = self.origin(node);
+        vec![self.builder.protected(body, handler, cleanup, origin)]
+    }
+
+    /// `with`, which is a body between two calls the source text does not show.
+    ///
+    /// # No new theory, and two calls the frontend could not previously see
+    ///
+    /// `with lock:` evaluates `lock`, calls `lock.__enter__()`, runs the body,
+    /// and calls `lock.__exit__(...)` - on the normal path *and* on the
+    /// exceptional one, which is the entire reason the statement exists. Both
+    /// are calls to arbitrary user code, and this frontend already refuses
+    /// every call it can see as [`Construct::Call`]. These two are no different
+    /// for being implicit, and naming them anything else tells a user their
+    /// exception handling was refused when what they need to know is that a
+    /// context manager's `__exit__` has no bound.
+    ///
+    /// `__exit__` goes in the cleanup slot for the same reason `finally` does.
+    ///
+    /// # What the `__enter__` hole costs the body, and why that is right
+    ///
+    /// A call is a region, and a region forgets every readable name, so a
+    /// counted loop *inside* a `with` loses the endpoint it is counted by. That
+    /// is a real loss and it is not one to reach around: the value bound by
+    /// `with ... as name` comes from `__enter__`, so a `with cm as n:` over an
+    /// integer parameter `n` is exactly the case where reading it afterwards
+    /// would be wrong. Every `__enter__` precedes the body, so this is enforced
+    /// without a special case for the target.
+    ///
+    /// The gain is the body being *translated at all*. It used to be one opaque
+    /// statement refusal that swallowed everything inside it; now a call in a
+    /// `with` body is a named hole at its own position, charged once per
+    /// iteration of the loop that runs it.
+    fn with_statement(&mut self, node: &ast::StmtWith) -> Vec<StmtId> {
+        let origin = self.origin(node);
+        // `__exit__` runs after the last statement of the block, and reporting
+        // it there is also what keeps it distinguishable from `__enter__`: a
+        // consumer joining a hole to the refusal carrying its specifics has only
+        // position and construct to join on.
+        let closing = self.origin_after(node);
+        let mut body = Vec::new();
+        let mut cleanup = Vec::new();
+        for (position, item) in node.items.iter().enumerate() {
+            if !is_name_lookup(&item.context_expr) {
+                body.extend(self.refusals_of(&item.context_expr));
+            }
+            // The `with` line executes, so exactly one node has to carry its
+            // step - a statement executes once however many context managers it
+            // opens, and `refusals_of` above emits only fragments. The first
+            // `__enter__` is that node.
+            let extent = if position == 0 {
+                Extent::Statement
+            } else {
+                Extent::Fragment
+            };
+            body.push(self.builder.unsupported_stmt_with(
+                Construct::Call,
+                Some(Symbol::from("__enter__")),
+                extent,
+                origin.clone(),
+            ));
+            cleanup.push(self.builder.unsupported_stmt_with(
+                Construct::Call,
+                Some(Symbol::from("__exit__")),
+                Extent::Fragment,
+                closing.clone(),
+            ));
+        }
+        body.extend(self.block(&node.body));
+        vec![self.builder.protected(body, Vec::new(), cleanup, origin)]
+    }
+
     fn assign(&mut self, assign: &ast::StmtAssign) -> Vec<StmtId> {
         let [target] = assign.targets.as_slice() else {
             // `a = b = 0` binds two names; the fragment's assignment binds one.
@@ -592,11 +1055,64 @@ impl Translator<'_> {
             statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
             return statements;
         };
-        if !self.integers.contains(name.id.as_str()) {
-            return self.refuse_binding(name.id.as_str(), target, &assign.value);
+        self.bind_expression(name.id.as_str(), target, &assign.value, assign, 0)
+    }
+
+    /// Emits `name = value`, splitting a conditional expression into a branch.
+    ///
+    /// # Why a ternary is a statement here and not an expression
+    ///
+    /// `x = a if c else b` and the four-line `if` that spells it out are the
+    /// same program, and the engine has derived the second since it existed.
+    /// What separated them was the shape of this frontend: an expression
+    /// translation that could only return an `ExprId` had nowhere to put a
+    /// branch, so the ternary became one opaque region - the sole blocker for
+    /// 118 stdlib functions across 369 sites.
+    ///
+    /// Rewriting it into [`landav_its::SourceStmt::If`] reaches the arithmetic
+    /// that already exists: the test is charged once whichever way it goes, and
+    /// the arms are combined by **maximum** by `TripCount::branching`, because
+    /// exactly one of them runs.
+    ///
+    /// # Why not hoist the arms' refusals instead
+    ///
+    /// That is the cheaper change and it is permanently loose.
+    /// [`Translator::refusals_of`] turns the refusals inside an expression into
+    /// a *list* of statements, and the engine **sums** a statement list - right
+    /// for `x = f(n) + g(n)`, where both calls happen, and wrong here, where one
+    /// does. Arms costing 10 and 3 would be reported at 13 where the truth is
+    /// 10: sound, and wrong on every one of those 369 sites for ever.
+    ///
+    /// # What this does not buy
+    ///
+    /// The ternary's *value*. `x` afterwards holds one of two numbers and the
+    /// fragment has no expression for that - there is no maximum in
+    /// [`landav_its::SourceExpr`] and deliberately never will be, since every
+    /// variant of it must denote a polynomial. The name is bound inside each
+    /// arm, so a later trip count over `x` reads it as a value no arm can vouch
+    /// for and holes, which is the honest answer.
+    fn bind_expression<T: Ranged>(
+        &mut self,
+        name: &str,
+        target: &Expr,
+        value: &Expr,
+        node: &T,
+        depth: u32,
+    ) -> Vec<StmtId> {
+        if let Expr::IfExp(ternary) = value
+            && depth < MAX_TERNARY_DEPTH
+        {
+            let cond = self.condition(&ternary.test);
+            let then_body = self.bind_expression(name, target, &ternary.body, node, depth + 1);
+            let else_body = self.bind_expression(name, target, &ternary.orelse, node, depth + 1);
+            let origin = self.origin(ternary);
+            return vec![self.builder.if_else(cond, then_body, else_body, origin)];
         }
-        let value = self.expression(&assign.value);
-        self.bind(name.id.as_str(), value, assign)
+        if !self.integers.contains(name) {
+            return self.refuse_binding(name, target, value);
+        }
+        let translated = self.expression(value);
+        self.bind(name, translated, node)
     }
 
     fn aug_assign(&mut self, assign: &ast::StmtAugAssign) -> Vec<StmtId> {
@@ -609,15 +1125,17 @@ impl Translator<'_> {
             return vec![self.refuse_stmt(refusal_for(&assign.op), assign)];
         };
         if !self.integers.contains(name.id.as_str()) {
-            // `x += e` reads `x` as well as writing it, so the read is a
-            // refusal of its own and is hoisted alongside the value's.
-            let target = assign.target.as_ref();
-            let mut statements = self.hoisted(Extent::Fragment, |this| {
-                let _ = this.read(name.id.as_str(), target);
-                let _ = this.expression(&assign.value);
-            });
-            statements.extend(self.refuse_binding(name.id.as_str(), target, &assign.value));
-            return statements;
+            // `x += e` reads `x` as well as writing it, and both are refusals
+            // about the same name at the same position - the read cannot be
+            // turned into a value, and neither can what the statement leaves
+            // behind. They were charged separately, and the value was
+            // translated twice on top of that: `m += obj.k` produced
+            // `attribute` twice at one column and `non-integer-value` twice at
+            // another, five regions for a two-line function. One construct at
+            // one position is one region: the report names one fix once, the
+            // per-construct ledger counts one occurrence once, and filling the
+            // hole adds the read's cost once.
+            return self.refuse_binding(name.id.as_str(), assign.target.as_ref(), &assign.value);
         }
         // `x += e` is `x = x + e`. The expansion is a Python fact, and it
         // stays on this side of the boundary.
@@ -647,11 +1165,7 @@ impl Translator<'_> {
             ));
             return statements;
         }
-        if !self.integers.contains(name.id.as_str()) {
-            return self.refuse_binding(name.id.as_str(), assign.target.as_ref(), value);
-        }
-        let translated = self.expression(value);
-        self.bind(name.id.as_str(), translated, assign)
+        self.bind_expression(name.id.as_str(), assign.target.as_ref(), value, assign, 0)
     }
 
     /// Emits `name = value`.
@@ -714,6 +1228,60 @@ impl Translator<'_> {
         ]
     }
 
+    /// `for x in [a, b, c]:` - a display, whose length is in the source.
+    ///
+    /// The counter is synthetic for the same reason as in
+    /// [`Translator::walk_collection`]: the target binds an **element**, and
+    /// `for x in [1, 'a']` is legal Python, so a target promoted on the strength
+    /// of the elements it happened to have would need element type inference to
+    /// stay sound.
+    ///
+    /// The display's own elements are translated first, as statements in front
+    /// of the loop. That is where they belong - the display is built once,
+    /// before the first iteration - and it is not optional: `for x in [g(n), 2]`
+    /// runs `g` exactly once, and a loop that counted the elements while never
+    /// translating them would publish a complete bound for a function that
+    /// calls something.
+    ///
+    /// `exact` comes from [`walked_display`]. Where it is false the endpoint is
+    /// a refusal *bounded by* the written element count, which the engine reads
+    /// as an upper bound and reports as `O` rather than `Theta`.
+    fn walk_display(&mut self, loop_stmt: &ast::StmtFor, length: u64, exact: bool) -> Vec<StmtId> {
+        let mut statements = self.refusals_of(&loop_stmt.iter);
+        let origin = self.origin(loop_stmt);
+        let Ok(length) = i64::try_from(length) else {
+            statements.push(self.refuse_stmt(Construct::UnboundedIteration, loop_stmt));
+            return statements;
+        };
+
+        let start = self.builder.int(0, origin.clone());
+        let written = self.builder.int(length, origin.clone());
+        let stop = if exact {
+            written
+        } else {
+            self.builder.unsupported_expr_bounded(
+                Construct::Collection,
+                "set or dict display, whose equal elements collapse",
+                written,
+                origin.clone(),
+            )
+        };
+        let counter = VarName::new(format!("#walk{}", self.walks));
+        self.walks += 1;
+
+        let body = self.block(&loop_stmt.body);
+        let Some(stride) = core::num::NonZeroI64::new(1) else {
+            unreachable!("1 is non-zero")
+        };
+        statements.push(self.builder.for_range(
+            counter,
+            RangeSpec::new(start, stop, stride),
+            body,
+            origin,
+        ));
+        statements
+    }
+
     fn for_loop(&mut self, loop_stmt: &ast::StmtFor) -> Vec<StmtId> {
         if !loop_stmt.orelse.is_empty() {
             return vec![self.refuse_stmt_detailed(
@@ -731,17 +1299,37 @@ impl Translator<'_> {
             if let Some(collection) = walked_collection(&loop_stmt.iter, &self.collections) {
                 return self.walk_collection(loop_stmt, &collection);
             }
+            // Walking a **display** is counted by how many values it holds,
+            // which is written in the source. `LAN-91`.
+            if let Some((length, exact)) = walked_display(&loop_stmt.iter) {
+                return self.walk_display(loop_stmt, length, exact);
+            }
             // Iteration over any other container, a generator, `enumerate`,
             // `zip`: all need a size model this fragment does not have.
             return vec![self.refuse_stmt(Construct::UnboundedIteration, loop_stmt)];
         };
-        if !self.integers.contains(target.id.as_str()) {
-            return vec![self.refuse_stmt_detailed(
-                Construct::NonIntegerValue,
-                target.id.as_str(),
-                loop_stmt,
-            )];
-        }
+        // A counter this pass could not prove integral does **not** refuse the
+        // loop. Refusing it here reported `non-integer-value` on the `for` line,
+        // naming a variable the user did not write while never naming the
+        // `attribute` or `subscript` in the endpoint that actually caused it -
+        // so the construct was invisible to the per-construct ledger. Worse, it
+        // returned before the body was lowered, so the body and any counted loop
+        // inside it left the program altogether.
+        //
+        // The loop is built instead, with a synthetic counter, exactly as
+        // [`Translator::walk_collection`] does and for the same reason: the trip
+        // count is a property of the range and not of the target, so it is still
+        // arithmetic, while a name the fragment cannot vouch for must not become
+        // a `landav_its::VarName` the engine may read. Whatever refused in the
+        // endpoint is translated below and charged where it stands, and a read
+        // of the target inside the body keeps refusing as it always did.
+        let counter = if self.integers.contains(target.id.as_str()) {
+            VarName::new(target.id.as_str())
+        } else {
+            let synthetic = VarName::new(format!("#walk{}", self.walks));
+            self.walks += 1;
+            synthetic
+        };
 
         let origin = self.origin(loop_stmt);
         let (start, stop, step) = match arguments {
@@ -774,12 +1362,10 @@ impl Translator<'_> {
         };
 
         let body = self.block(&loop_stmt.body);
-        vec![self.builder.for_range(
-            VarName::new(target.id.as_str()),
-            RangeSpec::new(start, stop, stride),
-            body,
-            origin,
-        )]
+        vec![
+            self.builder
+                .for_range(counter, RangeSpec::new(start, stop, stride), body, origin),
+        ]
     }
 
     /// A statement that is just an expression.
@@ -803,8 +1389,27 @@ impl Translator<'_> {
         // no other node in the arena to charge the step that executing this line
         // costs. Any further refusals are fragments of the same statement, which
         // executes once however many of them it contains.
-        self.hoisted(Extent::Statement, |this| {
-            let _ = this.expression(&bare.value);
+        self.evaluate(bare.value.as_ref(), 0)
+    }
+
+    /// Translates an expression evaluated for its effect, splitting a
+    /// conditional expression into a branch.
+    ///
+    /// The statement counterpart of [`Translator::bind_expression`], and it
+    /// exists for the same reason: `f() if c else g()` runs one of two calls,
+    /// and a refusal list would charge both. See that method for the argument.
+    fn evaluate(&mut self, value: &Expr, depth: u32) -> Vec<StmtId> {
+        if let Expr::IfExp(ternary) = value
+            && depth < MAX_TERNARY_DEPTH
+        {
+            let cond = self.condition(&ternary.test);
+            let then_body = self.evaluate(&ternary.body, depth + 1);
+            let else_body = self.evaluate(&ternary.orelse, depth + 1);
+            let origin = self.origin(ternary);
+            return vec![self.builder.if_else(cond, then_body, else_body, origin)];
+        }
+        self.hoisted(Extent::Statement, true, |this| {
+            let _ = this.expression(value);
         })
     }
 
@@ -828,7 +1433,22 @@ impl Translator<'_> {
     /// refusal ledger [`landav_its::lower`] produces is unchanged; what changes
     /// is that the node is now somewhere a walk can find it.
     fn refusals_of(&mut self, value: &Expr) -> Vec<StmtId> {
-        self.hoisted(Extent::Fragment, |this| {
+        self.hoisted(Extent::Fragment, false, |this| {
+            let _ = this.expression(value);
+        })
+    }
+
+    /// The statements that record what `value` **costs**, for a position that
+    /// reads none of it.
+    ///
+    /// [`Translator::refusals_of`] with the value question dropped as well as
+    /// the nodes. The difference is one construct family - a boolean, a
+    /// comparison or a ternary, which have no value the fragment can hold but
+    /// whose *cost* is entirely their operands' - and the positions that
+    /// qualify are the ones with no value slot to fill: `return a and b` and a
+    /// bare `a and b` line. See [`Translator::value_discarded`].
+    fn discarded_cost_of(&mut self, value: &Expr) -> Vec<StmtId> {
+        self.hoisted(Extent::Fragment, true, |this| {
             let _ = this.expression(value);
         })
     }
@@ -844,13 +1464,26 @@ impl Translator<'_> {
     /// nothing else stands for that line. Whichever it is, only the first can be
     /// it - a statement executes once no matter how many unanalysable parts it
     /// has - so the rest are fragments.
-    fn hoisted(&mut self, first: Extent, translate: impl FnOnce(&mut Self)) -> Vec<StmtId> {
+    ///
+    /// `value_discarded` says whether anything at all reads the expression's
+    /// value; see [`Translator::value_discarded`] for why that is a separate
+    /// question from translating into a scratch builder.
+    fn hoisted(
+        &mut self,
+        first: Extent,
+        value_discarded: bool,
+        translate: impl FnOnce(&mut Self),
+    ) -> Vec<StmtId> {
         // Every node `translate` builds carries its own position, so this
         // fallback origin is never the one reported.
         let scratch =
             SourceProgramBuilder::new("<discarded>", Origin::new("<discarded>"), Vec::new());
         let kept = std::mem::replace(&mut self.builder, scratch);
+        let outer = core::mem::replace(&mut self.discarding, true);
+        let outer_value = core::mem::replace(&mut self.value_discarded, value_discarded);
         translate(self);
+        self.discarding = outer;
+        self.value_discarded = outer_value;
         let scratch = std::mem::replace(&mut self.builder, kept);
         let discarded = scratch.build(Vec::new());
 
@@ -1036,7 +1669,17 @@ impl Translator<'_> {
 
     /// Translates an expression, worklist-driven.
     fn expression(&mut self, root: &Expr) -> ExprId {
-        let ordered = postorder(root, expression_children);
+        let discarding = self.discarding;
+        let value_discarded = self.value_discarded;
+        let ordered = postorder(root, |expr| {
+            expression_children(
+                expr,
+                &self.integers,
+                &self.collections,
+                discarding,
+                value_discarded,
+            )
+        });
         let mut built: HashMap<usize, ExprId> = HashMap::new();
 
         for node in ordered {
@@ -1070,7 +1713,14 @@ impl Translator<'_> {
                 },
                 // `True` is `1` and `False` is `0`, exactly, in Python.
                 Constant::Bool(flag) => self.builder.int(i64::from(*flag), origin),
+                // A string, a bytes or a tuple constant. Evaluated for its
+                // effect it has none - nothing is written and no name changes
+                // meaning - so in a discarded position it is not a refusal at
+                // all. See [`Translator::discarding`].
                 Constant::Str(_) | Constant::Bytes(_) | Constant::Tuple(_) => {
+                    if self.discarding {
+                        return self.builder.int(0, origin);
+                    }
                     self.builder.unsupported_expr(Construct::Collection, origin)
                 }
                 _ => self
@@ -1092,6 +1742,29 @@ impl Translator<'_> {
                             None => self
                                 .builder
                                 .unsupported_expr(Construct::NonPolynomialPower, origin),
+                        };
+                    }
+                    // `//`, `%`, `>>` and `<<` are not polynomials, but three
+                    // of them are dominated by their left operand and the
+                    // fourth is a multiplication. See [`Approximated`].
+                    if let Some(approximation) =
+                        approximation_of(binary, &self.integers, &self.collections)
+                        && let Some(left) = recall(&binary.left)
+                    {
+                        return match approximation {
+                            Approximated::Scaled(factor) => {
+                                let scale = self.builder.int(factor, origin.clone());
+                                self.builder.arith(ArithOp::Mul, left, scale, origin)
+                            }
+                            // The refusal keeps pointing at the dividend, so
+                            // the engine may read its magnitude and the ITS
+                            // still refuses to build a system it cannot model.
+                            Approximated::ByDividend => self.builder.unsupported_expr_bounded(
+                                refusal_for(&binary.op),
+                                spelling_of(&binary.op),
+                                left,
+                                origin,
+                            ),
                         };
                     }
                     return self
@@ -1148,12 +1821,20 @@ impl Translator<'_> {
             Expr::Subscript(_) | Expr::Slice(_) | Expr::Starred(_) => {
                 self.builder.unsupported_expr(Construct::Subscript, origin)
             }
+            // A display, and the f-string that shares its shape. Building one
+            // costs no source step, so in a discarded position it is free - and
+            // its elements have been translated already (see
+            // `expression_children`), so a call hidden inside one is named and
+            // placed where it stands rather than vanishing with the container.
             Expr::List(_)
             | Expr::Tuple(_)
             | Expr::Set(_)
             | Expr::Dict(_)
             | Expr::JoinedStr(_)
             | Expr::FormattedValue(_) => {
+                if self.discarding {
+                    return self.builder.int(0, origin);
+                }
                 self.builder.unsupported_expr(Construct::Collection, origin)
             }
             Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::GeneratorExp(_) => {
@@ -1169,9 +1850,50 @@ impl Translator<'_> {
             Expr::NamedExpr(_) => self
                 .builder
                 .unsupported_expr(Construct::BindingForm, origin),
-            Expr::IfExp(_) | Expr::BoolOp(_) | Expr::Compare(_) => self
-                .builder
-                .unsupported_expr(Construct::ConditionalExpression, origin),
+            // A ternary and an `and`/`or` chain, in a position that reads no
+            // value from them. Neither costs a source step of its own and
+            // neither can bind anything, so what is left is their operands -
+            // already translated by `expression_children`, so a call inside one
+            // is named where it stands instead of vanishing with the container.
+            //
+            // Charging **every** operand is an upper bound rather than the
+            // truth, because `and` may skip its right-hand side and a ternary
+            // runs one arm of two. Everything the operands contribute here is a
+            // refusal, so the over-charge can only ever be a hole that denotes
+            // `omega` too many - never a false `Theta`, since a function with a
+            // hole is `Partial` and `exact_elsewhere` speaks only for the
+            // arithmetic outside the holes, which is untouched.
+            //
+            // In value position all three stay refused; see
+            // [`Translator::value_discarded`].
+            Expr::IfExp(_) | Expr::BoolOp(_) => {
+                if self.value_discarded {
+                    return self.builder.int(0, origin);
+                }
+                self.builder
+                    .unsupported_expr(Construct::ConditionalExpression, origin)
+            }
+            // A comparison, with the same argument and one exception. `in`,
+            // `not in`, `is` and `is not` are refused whatever position they
+            // stand in: `x in items` runs `__contains__`, which is arbitrary
+            // user code with an arbitrary cost, exactly as `x.y` runs a
+            // `property`. `comparison` already refuses them under these names
+            // in condition position, and one operator answers to one construct
+            // wherever it is written.
+            Expr::Compare(comparison) => {
+                if self.value_discarded {
+                    let Some(refused) = membership_or_identity(comparison) else {
+                        return self.builder.int(0, origin);
+                    };
+                    return self.builder.unsupported_expr_detailed(
+                        refused,
+                        "membership or identity comparison",
+                        origin,
+                    );
+                }
+                self.builder
+                    .unsupported_expr(Construct::ConditionalExpression, origin)
+            }
         }
     }
 
@@ -1183,6 +1905,32 @@ impl Translator<'_> {
         }
         self.builder
             .unsupported_expr_detailed(Construct::NonIntegerValue, name, origin)
+    }
+}
+
+/// Whether evaluating `expr` is a bare name lookup, or a tuple of them.
+///
+/// # Why these are the expressions worth *not* translating
+///
+/// `except ValueError:`, `except (ValueError, TypeError):` and
+/// `raise StopIteration` name a class and nothing more. The lookup runs no user
+/// code, costs no source step, and its value is never bound to anything this
+/// analysis reads - so there is nothing to charge and nothing to refuse.
+///
+/// [`Translator::read`] would refuse each name as `non-integer-value` all the
+/// same, because it answers the *value* question and the value is what is not
+/// wanted here. That refusal is a named hole in the report, so translating
+/// these would put a spurious hole on nearly every `try` in the corpus and tell
+/// the user to go and look at the word `ValueError`.
+///
+/// Anything else is translated as usual. `except self.errors:` runs a
+/// `property`; `raise ValueError(explain(n))` runs a call. Both have unknown
+/// costs and both must be named where they stand.
+fn is_name_lookup(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(_) => true,
+        Expr::Tuple(tuple) => tuple.elts.iter().all(is_name_lookup),
+        _ => false,
     }
 }
 
@@ -1213,13 +1961,101 @@ const fn compare_of(op: &ast::CmpOp) -> Option<CompareOp> {
     }
 }
 
+/// The construct a comparison refuses under, if any of its operators is
+/// membership or identity.
+///
+/// `None` means every operator is one the fragment understands. Deliberately a
+/// free function rather than a method on `Translator::comparison`, which makes
+/// the same decision for a **condition**: the two positions build different
+/// kinds of node, and the one thing they must agree on is which operators are
+/// refused and under what name.
+fn membership_or_identity(comparison: &ast::ExprCompare) -> Option<Construct> {
+    comparison
+        .ops
+        .iter()
+        .find(|candidate| compare_of(candidate).is_none())
+        .map(|refused| match refused {
+            ast::CmpOp::In | ast::CmpOp::NotIn => Construct::Collection,
+            _ => Construct::NonIntegerValue,
+        })
+}
+
 /// The children of an expression that the fragment translates.
 ///
 /// Only the forms that survive into the fragment have children here. A refused
 /// form has none, because it becomes one `Unsupported` node and its interior is
 /// never inspected -- which is also what keeps a refused comprehension from
 /// producing a refusal per node inside it.
-fn expression_children(expr: &Expr) -> Vec<&Expr> {
+fn expression_children<'e>(
+    expr: &'e Expr,
+    candidates: &BTreeSet<String>,
+    collections: &BTreeSet<String>,
+    discarding: bool,
+    value_discarded: bool,
+) -> Vec<&'e Expr> {
+    // The operands of a boolean, a comparison or a ternary, where the value of
+    // the whole is read by nothing and `build_expression` therefore accepts it.
+    // This arm is not optional precision: accepting a container while leaving
+    // its interior untranslated is how a call disappears from a program with no
+    // hole anywhere, and `Walk::reconciled` cannot catch it because a node that
+    // was never built is not in the arena to reconcile. `return f(n) or g(n)`
+    // must produce two `call` regions, and it is this that produces them.
+    //
+    // A comparison that `membership_or_identity` refuses gets none, in step
+    // with every other refused form: its `Unsupported` node references nothing,
+    // so a refusal among its operands would be an orphan (`LAN-90`).
+    if value_discarded {
+        let operands: Option<Vec<&'e Expr>> = match expr {
+            Expr::BoolOp(boolean) => Some(boolean.values.iter().collect()),
+            Expr::IfExp(ternary) => Some(vec![
+                ternary.test.as_ref(),
+                ternary.body.as_ref(),
+                ternary.orelse.as_ref(),
+            ]),
+            Expr::Compare(comparison) if membership_or_identity(comparison).is_none() => Some(
+                core::iter::once(comparison.left.as_ref())
+                    .chain(comparison.comparators.iter())
+                    .collect(),
+            ),
+            _ => None,
+        };
+        if let Some(operands) = operands {
+            return operands;
+        }
+    }
+    // A display's elements, and only where the display itself is not going to
+    // become a refusal. In a **value** position the container refuses and
+    // references nothing, so translating its elements would leave every refusal
+    // among them pointing at nothing - the orphan shape `LAN-90` fixed. In a
+    // **discarded** position the container is free, so the elements are the only
+    // thing left that can refuse, and not translating them would publish a
+    // complete bound for a function that calls something. Of the 23 stdlib
+    // functions blocked solely by `collection`, 22 hide a call, an attribute or
+    // a subscript inside the display.
+    if discarding {
+        let elements: Option<Vec<&'e Expr>> = match expr {
+            Expr::List(list) => Some(list.elts.iter().collect()),
+            Expr::Tuple(tuple) => Some(tuple.elts.iter().collect()),
+            Expr::Set(set) => Some(set.elts.iter().collect()),
+            Expr::Dict(dict) => Some(
+                dict.keys
+                    .iter()
+                    .flatten()
+                    .chain(dict.values.iter())
+                    .collect(),
+            ),
+            Expr::JoinedStr(joined) => Some(joined.values.iter().collect()),
+            Expr::FormattedValue(formatted) => Some(
+                core::iter::once(formatted.value.as_ref())
+                    .chain(formatted.format_spec.as_deref())
+                    .collect(),
+            ),
+            _ => None,
+        };
+        if let Some(elements) = elements {
+            return elements;
+        }
+    }
     match expr {
         Expr::BinOp(binary) => match binary.op {
             ast::Operator::Add | ast::Operator::Sub | ast::Operator::Mult => {
@@ -1227,6 +2063,25 @@ fn expression_children(expr: &Expr) -> Vec<&Expr> {
             }
             // Only the base: the exponent must be a literal, read directly.
             ast::Operator::Pow => vec![&binary.left],
+            // An approximated operator keeps its **left** operand: the node
+            // built for it references that operand, so it must exist. The right
+            // one is deliberately absent - `approximation_of` has already proved
+            // it a plain integer expression, so nothing that could cost or
+            // assign anything is being dropped. Adding an arm here whenever
+            // `build_expression` gains one is not optional: a form with no
+            // children has its interior left untranslated, and a container that
+            // is *accepted* while its interior vanishes publishes a complete
+            // bound that omits whatever was inside.
+            ast::Operator::FloorDiv
+            | ast::Operator::Mod
+            | ast::Operator::LShift
+            | ast::Operator::RShift => {
+                if approximation_of(binary, candidates, collections).is_some() {
+                    vec![&binary.left]
+                } else {
+                    Vec::new()
+                }
+            }
             _ => Vec::new(),
         },
         Expr::UnaryOp(unary) => match unary.op {
@@ -1252,7 +2107,7 @@ fn condition_children(expr: &Expr) -> Vec<&Expr> {
 /// `MAX_EXPRESSION_DEPTH`, which is ten thousand operators -- deep enough that
 /// a recursive translation of a generated file risks the stack, and a stack
 /// overflow is an abort that no lint can see.
-fn postorder<'e>(root: &'e Expr, children: fn(&'e Expr) -> Vec<&'e Expr>) -> Vec<&'e Expr> {
+fn postorder<'e>(root: &'e Expr, children: impl Fn(&'e Expr) -> Vec<&'e Expr>) -> Vec<&'e Expr> {
     let mut ordered = Vec::new();
     let mut work = vec![root];
     while let Some(node) = work.pop() {
@@ -1274,5 +2129,17 @@ fn position<T: Ranged>(path: &Path, index: &LineIndex, node: &T) -> Location {
 /// The position of a node, as an opaque [`Origin`] for Core.
 fn origin_of<T: Ranged>(path: &Path, index: &LineIndex, node: &T) -> Origin {
     let (line, column) = index.position(node.start().to_usize());
+    Origin::new(format!("{}:{line}:{column}", path.display()))
+}
+
+/// The position **just past** a node.
+///
+/// One caller: the implicit `__exit__` of a `with`, which runs after the last
+/// statement of the block rather than at the `with` line. Two holes at one
+/// position would also be indistinguishable to a consumer joining a hole to the
+/// refusal that carries its specifics - that join is on position and construct -
+/// so `__exit__` would be reported as `__enter__`.
+fn origin_past<T: Ranged>(path: &Path, index: &LineIndex, node: &T) -> Origin {
+    let (line, column) = index.position(node.end().to_usize());
     Origin::new(format!("{}:{line}:{column}", path.display()))
 }

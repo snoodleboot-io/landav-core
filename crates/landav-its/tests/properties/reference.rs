@@ -42,6 +42,14 @@ pub type State = BTreeMap<String, i128>;
 pub enum Ending {
     /// Ran to completion, by falling off the end or by returning.
     Terminated,
+    /// Ended by raising, with nothing left to catch it.
+    ///
+    /// A completed run like [`Self::Terminated`] - the cost is known and a
+    /// bound must dominate it - and distinguished from it because the two say
+    /// different things about *exactness*. A run that left early performed
+    /// fewer steps than the whole body contains, so a bound covering the body
+    /// is not attained by it.
+    Raised,
     /// Hit the step budget. The program may or may not terminate; the
     /// reference declines to say.
     Exhausted,
@@ -98,6 +106,9 @@ struct Tally {
 enum Flow {
     Normal,
     Returned,
+    /// An exception is propagating: the rest of the enclosing block does not
+    /// run, and neither do the remaining iterations of an enclosing loop.
+    Raised,
     Exhausted,
     Undefined,
 }
@@ -128,6 +139,7 @@ pub fn interpret(program: &SourceProgram, initial: &State, budget: u64) -> Run {
         charged: tally.charged,
         ending: match flow {
             Flow::Normal | Flow::Returned => Ending::Terminated,
+            Flow::Raised => Ending::Raised,
             Flow::Exhausted => Ending::Exhausted,
             Flow::Undefined => Ending::Undefined,
         },
@@ -257,6 +269,47 @@ fn run_stmt(
         SourceStmt::Return => {
             tally.charged += 1;
             Flow::Returned
+        }
+
+        // One source step, then the run is abandoned. Written from
+        // `SourceStmt::Raise`: it costs a step and assigns to nothing, and it
+        // is an edge out of every region it stands in.
+        SourceStmt::Raise => {
+            tally.charged += 1;
+            Flow::Raised
+        }
+
+        // Written from `SourceStmt::Protected`. The statement itself costs
+        // nothing in the engine's unit - it is a grouping, not a step - so the
+        // whole of the charge comes from the three blocks.
+        //
+        // The body runs until it is abandoned. A handler runs only when it was,
+        // and only if there is one: an empty handler does not catch, so the
+        // exception keeps propagating. The cleanup runs on **every** path out of
+        // the body, which is the fact the engine's arithmetic puts outside the
+        // choice.
+        SourceStmt::Protected {
+            body,
+            handler,
+            cleanup,
+        } => {
+            let attempted = run_block(program, body, state, tally, budget);
+            let after = match attempted {
+                Flow::Exhausted | Flow::Undefined => return attempted,
+                Flow::Raised if !handler.is_empty() => {
+                    run_block(program, handler, state, tally, budget)
+                }
+                other => other,
+            };
+            match after {
+                Flow::Exhausted | Flow::Undefined => after,
+                _ => match run_block(program, cleanup, state, tally, budget) {
+                    // The cleanup completing leaves the body's own outcome in
+                    // force; the cleanup raising or returning replaces it.
+                    Flow::Normal => after,
+                    interrupted => interrupted,
+                },
+            }
         }
 
         // A refused construct has no source semantics: the reference declines

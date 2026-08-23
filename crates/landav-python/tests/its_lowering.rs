@@ -323,7 +323,19 @@ def c(n: int) -> int:
 #[test]
 fn python_constructs_outside_the_fragment_refuse_by_name() {
     let cases: &[(&str, Construct, &str)] = &[
-        ("items = [1, 2, 3]", Construct::Collection, "a list literal"),
+        // `LAN-91` moved which refusal is credited here, deliberately. A display
+        // is an *expression*, and in the engine's unit an expression costs no
+        // source step of its own - so in a discarded position it is no longer a
+        // region. What still refuses, and what refused all along underneath the
+        // `Collection` credit, is the **binding**: a name holding a list is not
+        // an integer, and no read of it may become a bound variable. That is the
+        // truer refusal of the two, and it is the one that keeps the function
+        // out of the transition system.
+        (
+            "items = [1, 2, 3]",
+            Construct::NonIntegerValue,
+            "a list literal bound to a name",
+        ),
         ("x = n[0]", Construct::Subscript, "an index"),
         ("x = n.bit_length", Construct::Attribute, "an attribute"),
         ("x = len(n)", Construct::Call, "a call"),
@@ -335,27 +347,47 @@ fn python_constructs_outside_the_fragment_refuse_by_name() {
         ("x = n / 2", Construct::IntegerDivision, "true division"),
         ("x = n // 2", Construct::IntegerDivision, "floor division"),
         ("x = n % 2", Construct::IntegerDivision, "modulo"),
-        ("x = n << 1", Construct::BitwiseOperator, "a shift"),
+        // `x = n << 1` is deliberately absent: `LAN-91` accepts a left shift by
+        // a small literal as `n * 2^k`, which the bound algebra represents
+        // exactly, so it is inside the fragment now and lowers. See
+        // `a_left_shift_by_a_literal_is_inside_the_fragment` below.
+        //
+        // `&`, `|` and `^` stay out, and for a reason worth keeping: sound
+        // monotone over-approximations of them do exist, but the useful one
+        // (`a & b <= min(a, b)`) needs a `Min` constructor the algebra does not
+        // have, and every other one requires both operands non-negative - a
+        // precondition an `int` annotation does not establish and this frontend
+        // cannot check.
         ("x = n & 1", Construct::BitwiseOperator, "a bitwise and"),
         (
             "x = n ** n",
             Construct::NonPolynomialPower,
             "a symbolic exponent",
         ),
-        (
-            "x = 1 if n else 2",
-            Construct::ConditionalExpression,
-            "a conditional expression",
-        ),
+        // `x = 1 if n else 2` is deliberately absent: `LAN-91` splits a ternary
+        // whose arms are both integral into a real branch statement, so it is
+        // inside the fragment and lowers. See
+        // `a_ternary_over_integral_arms_is_inside_the_fragment` below.
+        //
+        // A ternary in *value* position whose arms are not integral still
+        // refuses, and so does a boolean or comparison used as a value - see the
+        // `n in [1]` row further down.
         (
             "x = (n > 1)",
             Construct::ConditionalExpression,
             "a comparison as a value",
         ),
+        // `for q in [1, 2]` is deliberately absent: a list display has a
+        // statically known length, so `LAN-91` counts the walk exactly and the
+        // loop lowers. See `a_walk_over_a_display_is_inside_the_fragment` below.
+        //
+        // Iterating something whose length is *not* statically known still
+        // refuses as `UnboundedIteration` - a generator, `enumerate`, `zip`, a
+        // starred element, or a repeated display like `[0] * n`.
         (
-            "for q in [1, 2]:\n        pass",
+            "for q in [0] * n:\n        pass",
             Construct::UnboundedIteration,
-            "iterating a list",
+            "iterating a repeated display, whose length is not static",
         ),
         (
             "for q in range(0, n, n):\n        pass",
@@ -399,7 +431,13 @@ fn python_constructs_outside_the_fragment_refuse_by_name() {
             "tuple unpacking",
         ),
         ("x = yield n", Construct::Coroutine, "yield"),
-        ("x = 'text'", Construct::Collection, "a string"),
+        // Same move as the list literal above, for the same reason: the string
+        // is an expression that costs nothing, and the binding is what refuses.
+        (
+            "x = 'text'",
+            Construct::NonIntegerValue,
+            "a string bound to a name",
+        ),
         // Position matters, and both positions must refuse. In a *value*
         // position the comparison itself is out of the fragment, so it refuses
         // as a comparison-as-value before `in` is ever reached; in a condition
@@ -429,6 +467,99 @@ fn python_constructs_outside_the_fragment_refuse_by_name() {
             "{description} should refuse as {expected}, but named {named:?}\n{source}"
         );
     }
+}
+
+/// **A left shift by a small literal is inside the fragment.**
+///
+/// The one row `LAN-91` removed from the table above rather than re-credited.
+/// `n << k` for a literal `0 <= k <= 62` is `n * 2^k`, which the bound algebra
+/// represents exactly - so it is not an approximation that has to be labelled
+/// `O`, and not a refusal. It lowers.
+///
+/// Kept as its own test rather than deleted from the table, because the useful
+/// assertion changed direction: the table says "this refuses, by this name", and
+/// what matters here is that it does **not**.
+///
+/// It is also the only one of the seven integer operators whose result *exceeds*
+/// its operand, which is why it could not be handled with the rest of the
+/// `BitwiseOperator` bucket: bounding `n << 1` by `n` would report half the
+/// steps the loop actually runs.
+/// **A walk over a literal display is inside the fragment.**
+///
+/// A `list` or `tuple` display with no starred element has a length known at
+/// translation time, so `for q in [1, 2]` is a counted loop with a literal trip
+/// count and lowers.
+///
+/// A `set` or `dict` display does **not** get an equality: equal elements
+/// collapse, so `{1, 1, 2}` writes three and iterates two. That is counted as an
+/// upper bound and the engine reports `O`, never `Theta` - which is why this
+/// test names a list rather than a set.
+#[test]
+fn a_walk_over_a_display_is_inside_the_fragment() {
+    let functions = lower_module(
+        Path::new("walk.py"),
+        "\
+def counts(n: int) -> int:
+    total = 0
+    for q in [1, 2]:
+        total = total + 1
+    return total
+",
+    )
+    .expect("parses");
+    assert!(
+        lower(functions[0].program()).is_ok(),
+        "a display of two elements is a loop that runs twice, which the fragment \
+         can represent"
+    );
+}
+
+/// **A ternary over integral arms is inside the fragment.**
+///
+/// The other row `LAN-91` removed rather than re-credited. `x = a if c else b`
+/// where both arms are proven integers becomes a real branch statement, so the
+/// test is charged once, the arms are combined by maximum, and the whole thing
+/// lowers.
+///
+/// A ternary whose arms are *not* integral still refuses, and a boolean or a
+/// comparison used as a **value** still refuses - only the discarded positions
+/// (`return`, a bare expression statement) accept those, where there is no value
+/// slot for the result to flow into.
+#[test]
+fn a_ternary_over_integral_arms_is_inside_the_fragment() {
+    let functions = lower_module(
+        Path::new("ternary.py"),
+        "\
+def picks(n: int) -> int:
+    x = 1 if n else 2
+    return x
+",
+    )
+    .expect("parses");
+    assert!(
+        lower(functions[0].program()).is_ok(),
+        "both arms are integers and the test is a condition the fragment reads, \
+         so this is a branch, not a refusal"
+    );
+}
+
+#[test]
+fn a_left_shift_by_a_literal_is_inside_the_fragment() {
+    let functions = lower_module(
+        Path::new("shift.py"),
+        "\
+def shifts(n: int) -> int:
+    x = n << 1
+    return x
+",
+    )
+    .expect("parses");
+    let program = functions[0].program();
+    assert!(
+        lower(program).is_ok(),
+        "`n << 1` is `n * 2`, which the fragment represents exactly, so the \
+         function belongs in the transition system"
+    );
 }
 
 /// A parameter without an `int` annotation poisons every read of it.

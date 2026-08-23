@@ -115,6 +115,25 @@ pub enum StmtSpec {
     },
     /// Return from the function.
     Return,
+    /// Abandon the run: `raise`.
+    ///
+    /// Never drawn by [`arb_body`]. `landav_its::lower` refuses it, so a
+    /// program containing one has no transition system and every property
+    /// comparing one against the reference would have nothing to compare. The
+    /// cost engine is total over [`SourceProgram`] and does have something to
+    /// say about it, which is what [`arb_raising_body`] is for.
+    Raise,
+    /// `try: body / except: handler / finally: cleanup`.
+    ///
+    /// Never drawn by [`arb_body`], for the same reason as [`Self::Raise`].
+    Try {
+        /// The statements that may be abandoned partway through.
+        body: Vec<StmtSpec>,
+        /// The statements that run when they are; empty means nothing catches.
+        handler: Vec<StmtSpec>,
+        /// The statements that run on every path out of the body.
+        cleanup: Vec<StmtSpec>,
+    },
 }
 
 /// Turns a generated body into a [`SourceProgram`].
@@ -285,6 +304,23 @@ impl Materialiser {
                 let origin = self.origin();
                 vec![self.builder.return_stmt(origin)]
             }
+
+            StmtSpec::Raise => {
+                let origin = self.origin();
+                vec![self.builder.raise_stmt(origin)]
+            }
+
+            StmtSpec::Try {
+                body,
+                handler,
+                cleanup,
+            } => {
+                let body = self.block(body);
+                let handler = self.block(handler);
+                let cleanup = self.block(cleanup);
+                let origin = self.origin();
+                vec![self.builder.protected(body, handler, cleanup, origin)]
+            }
         }
     }
 }
@@ -341,7 +377,16 @@ fn contains_loop(body: &[StmtSpec], depth: usize) -> bool {
             else_body,
             ..
         } => contains_loop(then_body, depth) || contains_loop(else_body, depth),
-        StmtSpec::Assign { .. } | StmtSpec::Return => false,
+        StmtSpec::Try {
+            body,
+            handler,
+            cleanup,
+        } => {
+            contains_loop(body, depth)
+                || contains_loop(handler, depth)
+                || contains_loop(cleanup, depth)
+        }
+        StmtSpec::Assign { .. } | StmtSpec::Return | StmtSpec::Raise => false,
     })
 }
 
@@ -349,7 +394,68 @@ fn contains_conditional(body: &[StmtSpec]) -> bool {
     body.iter().any(|spec| match spec {
         StmtSpec::If { .. } => true,
         StmtSpec::While { body, .. } | StmtSpec::For { body, .. } => contains_conditional(body),
+        StmtSpec::Try {
+            body,
+            handler,
+            cleanup,
+        } => {
+            contains_conditional(body)
+                || contains_conditional(handler)
+                || contains_conditional(cleanup)
+        }
+        StmtSpec::Assign { .. } | StmtSpec::Return | StmtSpec::Raise => false,
+    })
+}
+
+/// Whether `body` contains a `raise` anywhere.
+#[must_use]
+pub fn contains_raise(body: &[StmtSpec]) -> bool {
+    body.iter().any(|spec| match spec {
+        StmtSpec::Raise => true,
+        StmtSpec::While { body, .. } | StmtSpec::For { body, .. } => contains_raise(body),
+        StmtSpec::If {
+            then_body,
+            else_body,
+            ..
+        } => contains_raise(then_body) || contains_raise(else_body),
+        StmtSpec::Try {
+            body,
+            handler,
+            cleanup,
+        } => contains_raise(body) || contains_raise(handler) || contains_raise(cleanup),
         StmtSpec::Assign { .. } | StmtSpec::Return => false,
+    })
+}
+
+/// Whether a loop body can reach a `raise`.
+///
+/// The shape the whole lane exists for. A counted loop's trip count is
+/// arithmetic *because* nothing can leave the iteration space early; an
+/// exceptional exit can, so the count still dominates the iterations performed
+/// but is no longer attained by them. Reporting such a loop as an equality is
+/// the `LAN-88` failure class reached by a different route, and it is what
+/// `a_raise_a_loop_can_reach_is_never_an_equality` forbids.
+#[must_use]
+pub fn raises_inside_a_loop(body: &[StmtSpec]) -> bool {
+    body.iter().any(|spec| match spec {
+        StmtSpec::While { body, .. } | StmtSpec::For { body, .. } => {
+            contains_raise(body) || raises_inside_a_loop(body)
+        }
+        StmtSpec::If {
+            then_body,
+            else_body,
+            ..
+        } => raises_inside_a_loop(then_body) || raises_inside_a_loop(else_body),
+        StmtSpec::Try {
+            body,
+            handler,
+            cleanup,
+        } => {
+            raises_inside_a_loop(body)
+                || raises_inside_a_loop(handler)
+                || raises_inside_a_loop(cleanup)
+        }
+        StmtSpec::Assign { .. } | StmtSpec::Return | StmtSpec::Raise => false,
     })
 }
 
@@ -451,6 +557,59 @@ pub fn arb_body() -> impl Strategy<Value = Vec<StmtSpec>> {
                 )
                 .prop_map(|(target, start, stop, step, body)| StmtSpec::For {
                     target, start, stop, step, body
+                }),
+        ]
+    });
+
+    prop::collection::vec(statement, 1..4)
+}
+
+/// A statement body that can raise, and can catch.
+///
+/// Deliberately **not** part of [`arb_body`]. `landav_its::lower` refuses both
+/// `raise` and `try`, so a program containing one has no transition system, and
+/// every property that compares the emitted system against the reference would
+/// have nothing to compare and would skip the case. The cost engine is total
+/// over [`SourceProgram`] and does have an answer, so the raising corpus lives
+/// here and is drawn only by the properties in `engine_cost`.
+///
+/// Weights favour putting a `raise` where it does damage: inside a loop, which
+/// is the one place an early exit turns a correct number into a false
+/// equality.
+pub fn arb_raising_body() -> impl Strategy<Value = Vec<StmtSpec>> {
+    let leaf = prop_oneof![
+        6 => (0_usize..MUTABLE.len(), arb_expr())
+            .prop_map(|(target, value)| StmtSpec::Assign { target, value }),
+        1 => Just(StmtSpec::Return),
+        3 => Just(StmtSpec::Raise),
+    ];
+
+    let statement = leaf.prop_recursive(3, 24, 3, |inner| {
+        prop_oneof![
+            3 => (arb_cond(), prop::collection::vec(inner.clone(), 0..3),
+                  prop::collection::vec(inner.clone(), 0..3))
+                .prop_map(|(cond, then_body, else_body)| StmtSpec::If {
+                    cond, then_body, else_body
+                }),
+            2 => (0_i64..4, prop::collection::vec(inner.clone(), 0..3))
+                .prop_map(|(trips, body)| StmtSpec::While { trips, body }),
+            5 => (
+                    0_usize..MUTABLE.len(),
+                    arb_endpoint(),
+                    arb_endpoint(),
+                    prop_oneof![Just(1_i64), Just(2), Just(-1), Just(-2)],
+                    prop::collection::vec(inner.clone(), 0..3),
+                )
+                .prop_map(|(target, start, stop, step, body)| StmtSpec::For {
+                    target, start, stop, step, body
+                }),
+            4 => (
+                    prop::collection::vec(inner.clone(), 0..3),
+                    prop::collection::vec(inner.clone(), 0..2),
+                    prop::collection::vec(inner, 0..2),
+                )
+                .prop_map(|(body, handler, cleanup)| StmtSpec::Try {
+                    body, handler, cleanup
                 }),
         ]
     });

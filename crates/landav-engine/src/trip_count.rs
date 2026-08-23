@@ -16,9 +16,12 @@ use crate::hole::Hole;
 ///
 /// A counted loop's iteration space is fixed before the loop begins - see
 /// `RangeSpec`, whose `start` and `stop` are evaluated exactly once - and the
-/// fragment refuses `break`, `continue` and exceptions, so nothing can leave
-/// early. Those two facts together mean the trip count is not something to be
-/// inferred; it is arithmetic on values the program already computed.
+/// fragment refuses `break` and `continue`, so nothing can leave early *except*
+/// by ending the run: a `return`, a `raise`, or a `try` an exception can
+/// propagate out of. Those two facts together mean the trip count is not
+/// something to be inferred; it is arithmetic on values the program already
+/// computed - and the exits are answered by relaxing the claim rather than by
+/// abandoning the number. See `analyse::exits_within`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TripCount {
     /// The loop runs exactly this many times.

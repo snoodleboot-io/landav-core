@@ -24,6 +24,7 @@
 //! transcript is read by a human, and a name survives that reading where a
 //! code does not.
 
+use landav_bound::ResourceKind;
 use serde::Serialize;
 
 /// The version of this schema.
@@ -44,6 +45,16 @@ pub struct Run {
     /// code without parsing anything at all, and an agent reading the JSON
     /// should not have to know the code table.
     pub outcome: &'static str,
+    /// The resource this run was asked about, or absent when none was named.
+    ///
+    /// Carries whether this build derives a number for **that** resource and,
+    /// when it does not, what *it* is waiting on. One sentence per resource,
+    /// never one for the registry: `ops` is waiting on a measurement and
+    /// `peak-mem` on an analysis nobody has started, and a consumer told only
+    /// that both are unavailable cannot tell which will arrive first. See
+    /// [`crate::resource`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<Resource>,
     /// What was analysed and what came of it.
     pub summary: Summary,
     /// One entry per function the run met, in the order it met them.
@@ -92,6 +103,54 @@ pub struct Summary {
     pub stale_waivers: usize,
 }
 
+/// The resource a run was asked about, and its status in this build.
+#[derive(Debug, Serialize)]
+pub struct Resource {
+    /// The `--resource` value, so a run can be filed against the invocation
+    /// that produced it. Never the semiring alone: three registered resources
+    /// share `additive`, so the algebra does not say what was counted.
+    pub id: &'static str,
+    /// The unit the reported number is in.
+    pub unit: &'static str,
+    /// The algebra the resource instantiates.
+    pub semiring: &'static str,
+    /// Whether this build produces a number for this resource.
+    ///
+    /// A boolean rather than an inference from a missing field: a consumer
+    /// cannot otherwise tell "no number was derived" from "the number is zero",
+    /// and those call for opposite reactions.
+    pub derived: bool,
+    /// What *this* resource is waiting on, and `null` exactly when `derived`.
+    ///
+    /// The two are the same fact in two shapes and are generated from one
+    /// function, so a resource can never report both a number and something it
+    /// is still waiting for.
+    pub awaiting: Option<String>,
+}
+
+/// What was derived for the selected resource, for one function.
+#[derive(Debug, Serialize)]
+pub struct FunctionResource {
+    /// The count, rendered as an expression, because it may be symbolic: a
+    /// call inside `for i in range(n)` issues `n` queries.
+    pub bound: Option<String>,
+    /// `"exact"`, `"upper"`, `"partial"`, or `null`.
+    ///
+    /// `"partial"` means the count mentions a region that was not derived, and
+    /// is therefore not comparable against a budget. It is what a `while` gets,
+    /// and it is reported instead of `0` because the run has no evidence that
+    /// the unread region issues nothing.
+    pub bound_kind: Option<&'static str>,
+    /// The same quantity as a number when it is a closed constant, so a gate
+    /// can threshold without parsing algebra.
+    ///
+    /// `null` is not zero. It means the count is symbolic, or mentions an
+    /// unanalysed region, and a gate that reads it as zero has inverted the
+    /// tool - which is the same rule `bound` already carries, and it bites
+    /// harder here because a resource count is exactly what gets thresholded.
+    pub value: Option<u64>,
+}
+
 /// One function, and everything concluded about it.
 #[derive(Debug, Serialize)]
 pub struct Function {
@@ -128,14 +187,39 @@ pub struct Function {
     pub holes: Vec<Hole>,
     /// Constructs that stopped this function lowering.
     pub refused: Vec<Refusal>,
+    /// What was derived for the selected resource, when one was selected and
+    /// this build derives it. Absent otherwise, and absence is not zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<FunctionResource>,
 }
 
 /// A region whose cost is unknown, standing in the bound as a variable.
+///
+/// Carries both halves of `CONTRIBUTING.md`'s third non-negotiable: the
+/// unaccounted **term** (`variable`, `construct`, `origin`) and the
+/// **assumption** that could not be discharged. LAN-14 is the second half; it
+/// was built as [`landav_bound::Assumption`] and left unwired, so a report
+/// named the `while` and never said that what was missing was a termination
+/// argument rather than a cost rule.
 #[derive(Debug, Serialize)]
 pub struct Hole {
     /// The variable it appears as in `bound`, so the two can be connected.
     pub variable: String,
     pub construct: String,
+    /// The obligation this region left undischarged, as a stable name:
+    /// `termination-not-proved`, `callee-cost-unknown`, `recursion-not-ranked`,
+    /// `resource-not-modelled`.
+    ///
+    /// Named, never coded, for the reason this module's documentation gives.
+    /// Distinct from `construct` on purpose: `construct` says what the region
+    /// *is*, and this says what could not be *established* about it. Two `while`
+    /// loops and a call all read as "we could not derive it" without this field,
+    /// and they need different responses - a ranking function, a cost contract.
+    pub assumption: String,
+    /// What the assumption is about: the callee whose cost is unknown, the
+    /// variable with no size bound, the construct with no rule. `null` where the
+    /// obligation has no subject beyond the region itself.
+    pub assumption_subject: Option<String>,
     pub origin: String,
 }
 
@@ -174,12 +258,25 @@ pub struct Problem {
 /// come to different conclusions about what was found.
 #[derive(Debug, Default)]
 pub struct Collector {
+    /// The resource this run was asked about, if any. Held so that the
+    /// per-function block and the run-level block are decided from one value
+    /// and cannot disagree about which question was asked.
+    resource: Option<ResourceKind>,
     functions: Vec<Function>,
     findings: Vec<Finding>,
     problems: Vec<Problem>,
 }
 
 impl Collector {
+    /// A collector for a run that named `resource`.
+    #[must_use]
+    pub fn for_resource(resource: Option<ResourceKind>) -> Self {
+        Self {
+            resource,
+            ..Self::default()
+        }
+    }
+
     /// Record every finding in a module.
     pub fn absorb_findings(&mut self, module: &landav_python::ModuleAnalysis) {
         for finding in module.findings() {
@@ -201,20 +298,22 @@ impl Collector {
         lowered: Result<(), &landav_its::LoweringError>,
     ) {
         let at = function.location();
-        let refused = lowered.err().map_or_else(Vec::new, |error| {
-            error.refusals().map_or_else(Vec::new, |refusals| {
-                refusals
-                    .as_slice()
-                    .iter()
-                    .map(|unsupported| Refusal {
-                        construct: unsupported.construct().tag().to_owned(),
-                        describes: unsupported.construct().describe().to_owned(),
-                        origin: unsupported.origin().as_str().to_owned(),
-                        detail: unsupported.detail().map(ToString::to_string),
-                    })
-                    .collect()
+        // Kept as the frontend's own records for as long as possible: the hole
+        // ledger is joined against these to find the specifics a hole does not
+        // carry, and re-deriving them from the rendered strings would be
+        // parsing English back into a value.
+        let records = lowered.err().and_then(landav_its::LoweringError::refusals);
+        let records: &[landav_its::Unsupported] =
+            records.map_or(&[], landav_its::Refusals::as_slice);
+        let refused = records
+            .iter()
+            .map(|unsupported| Refusal {
+                construct: unsupported.construct().tag().to_owned(),
+                describes: unsupported.construct().describe().to_owned(),
+                origin: unsupported.origin().as_str().to_owned(),
+                detail: unsupported.detail().map(ToString::to_string),
             })
-        });
+            .collect();
 
         // The engine is consulted for **every** function, including the ones
         // that did not lower: a call is the sole construct blocking most of the
@@ -222,7 +321,7 @@ impl Collector {
         // thing a user of that corpus can act on. What a run is entitled to say
         // about a function the toolchain refused is decided once, in
         // `crate::derived`, so the text and this cannot drift apart.
-        let derived = crate::derived::cost_of(function, lowered.is_ok());
+        let derived = crate::derived::cost_of(function, lowered.is_ok(), records);
         let (bound, kind, exact_outside, holes) = derived.as_ref().map_or_else(
             || (None, None, false, Vec::new()),
             |cost| {
@@ -235,10 +334,21 @@ impl Collector {
                 let holes = cost
                     .holes()
                     .iter()
-                    .map(|hole| Hole {
-                        variable: hole.var().symbol().to_string(),
-                        construct: hole.construct().to_owned(),
-                        origin: hole.origin().as_str().to_owned(),
+                    .map(|hole| {
+                        // Both halves of the blame, decided in one place:
+                        // `crate::assumption` keys on the hole rather than on a
+                        // refusal record, because the most common hole on the
+                        // corpus - a `while` - lowers and so has no refusal
+                        // record to key on.
+                        let assumption =
+                            crate::assumption::undischarged(hole, records, function.name());
+                        Hole {
+                            variable: hole.var().symbol().to_string(),
+                            construct: hole.construct().to_owned(),
+                            assumption: crate::assumption::name(&assumption).to_owned(),
+                            assumption_subject: crate::assumption::subject(&assumption),
+                            origin: hole.origin().as_str().to_owned(),
+                        }
                     })
                     .collect();
                 (
@@ -249,6 +359,26 @@ impl Collector {
                 )
             },
         );
+
+        // The selected resource, projected out of the same derived cost the
+        // bound above was rendered from - never a second walk, so the two
+        // numbers printed beside each other cannot use different control-flow
+        // rules. Absent when no resource was named, and when the named one
+        // derives nothing in this build: a per-function number beside
+        // `derived: false` would be the fabrication the exit contract exists to
+        // prevent, and it would look entirely plausible.
+        let resource = self
+            .resource
+            .filter(|kind| crate::resource::derives(*kind))
+            .and(derived.as_ref())
+            .map(|cost| {
+                let projected = crate::resource_bound::ResourceBound::queries_of(cost);
+                FunctionResource {
+                    bound: projected.bound,
+                    bound_kind: projected.kind,
+                    value: projected.value,
+                }
+            });
 
         self.functions.push(Function {
             name: function.name().to_owned(),
@@ -261,6 +391,7 @@ impl Collector {
             exact_outside_holes: exact_outside,
             holes,
             refused,
+            resource,
         });
     }
 
@@ -286,6 +417,19 @@ impl Collector {
         Run {
             schema_version: SCHEMA_VERSION,
             outcome: outcome.tag(),
+            resource: self.resource.map(|kind| {
+                let descriptor = kind.descriptor();
+                Resource {
+                    id: descriptor.id().as_str(),
+                    unit: descriptor.unit(),
+                    semiring: descriptor.semiring().as_str(),
+                    derived: crate::resource::derives(kind),
+                    // `null` exactly when derived: the two are generated from
+                    // one function, so a resource cannot report both a number
+                    // and something it is still waiting for.
+                    awaiting: crate::resource::awaiting(kind),
+                }
+            }),
             summary,
             functions: self.functions,
             findings: self.findings,
