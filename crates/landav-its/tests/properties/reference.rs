@@ -57,8 +57,40 @@ pub struct Run {
     pub state: State,
     /// How many statements were executed.
     pub steps: u64,
+    /// The same run, scored in `landav-engine`'s unit.
+    ///
+    /// # Why a second number and not a factor of the first
+    ///
+    /// [`Self::steps`] counts what this interpreter does: one per statement,
+    /// including the loop statement itself, and one per loop test including the
+    /// final failing one. `landav-engine` counts something deliberately
+    /// different - its own documentation defines it as "one per statement
+    /// executed, plus one per loop iteration for the loop's own test and
+    /// increment" - so a loop costs `count * (1 + body)` there and
+    /// `2 + count * (1 + body)` here.
+    ///
+    /// The gap is not a constant: it compounds with nesting, so no factor
+    /// relates the two. Scoring the same run twice is the only way to compare
+    /// the engine against a semantics it did not write.
+    ///
+    /// Written from the engine's doc comment, not from its code. Nothing in
+    /// this module calls `landav_engine::cost`, for the same reason nothing in
+    /// it calls `lower`.
+    pub charged: u64,
     /// How the run ended.
     pub ending: Ending,
+}
+
+/// The two counters one run accumulates.
+///
+/// Threaded together so that a statement cannot be counted in one unit and
+/// forgotten in the other.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tally {
+    /// Statements executed, plus one per loop test.
+    steps: u64,
+    /// The same run in `landav-engine`'s unit. See [`Run::charged`].
+    charged: u64,
 }
 
 /// Control flow inside the interpreter.
@@ -88,11 +120,12 @@ enum Flow {
 #[must_use]
 pub fn interpret(program: &SourceProgram, initial: &State, budget: u64) -> Run {
     let mut state = initial.clone();
-    let mut steps = 0_u64;
-    let flow = run_block(program, program.body(), &mut state, &mut steps, budget);
+    let mut tally = Tally::default();
+    let flow = run_block(program, program.body(), &mut state, &mut tally, budget);
     Run {
         state,
-        steps,
+        steps: tally.steps,
+        charged: tally.charged,
         ending: match flow {
             Flow::Normal | Flow::Returned => Ending::Terminated,
             Flow::Exhausted => Ending::Exhausted,
@@ -105,11 +138,11 @@ fn run_block(
     program: &SourceProgram,
     body: &[StmtId],
     state: &mut State,
-    steps: &mut u64,
+    tally: &mut Tally,
     budget: u64,
 ) -> Flow {
     for id in body {
-        let flow = run_stmt(program, *id, state, steps, budget);
+        let flow = run_stmt(program, *id, state, tally, budget);
         if flow != Flow::Normal {
             return flow;
         }
@@ -121,48 +154,60 @@ fn run_stmt(
     program: &SourceProgram,
     id: StmtId,
     state: &mut State,
-    steps: &mut u64,
+    tally: &mut Tally,
     budget: u64,
 ) -> Flow {
-    if *steps >= budget {
+    if tally.steps >= budget {
         return Flow::Exhausted;
     }
-    *steps += 1;
+    tally.steps += 1;
 
     let Some(stmt) = program.stmt(id) else {
         return Flow::Undefined;
     };
 
     match stmt {
-        SourceStmt::Assign { target, value } => match eval(program, *value, state) {
-            Some(computed) => {
-                state.insert(target.as_str().to_owned(), computed);
-                Flow::Normal
+        SourceStmt::Assign { target, value } => {
+            // One source step, in both units.
+            tally.charged += 1;
+            match eval(program, *value, state) {
+                Some(computed) => {
+                    state.insert(target.as_str().to_owned(), computed);
+                    Flow::Normal
+                }
+                None => Flow::Undefined,
             }
-            None => Flow::Undefined,
-        },
+        }
 
         SourceStmt::If {
             cond,
             then_body,
             else_body,
-        } => match decide(program, *cond, state) {
-            Some(true) => run_block(program, then_body, state, steps, budget),
-            Some(false) => run_block(program, else_body, state, steps, budget),
-            None => Flow::Undefined,
-        },
+        } => {
+            // The test itself, charged once whichever arm is taken.
+            tally.charged += 1;
+            match decide(program, *cond, state) {
+                Some(true) => run_block(program, then_body, state, tally, budget),
+                Some(false) => run_block(program, else_body, state, tally, budget),
+                None => Flow::Undefined,
+            }
+        }
 
         SourceStmt::While { cond, body } => loop {
-            if *steps >= budget {
+            if tally.steps >= budget {
                 return Flow::Exhausted;
             }
-            *steps += 1;
+            tally.steps += 1;
             match decide(program, *cond, state) {
                 Some(false) => return Flow::Normal,
                 None => return Flow::Undefined,
                 Some(true) => {}
             }
-            let flow = run_block(program, body, state, steps, budget);
+            // One step of loop overhead per *executed* iteration. The final
+            // failing test is not an iteration and costs nothing in the
+            // engine's unit; the loop statement itself costs nothing either.
+            tally.charged += 1;
+            let flow = run_block(program, body, state, tally, budget);
             if flow != Flow::Normal {
                 return flow;
             }
@@ -182,10 +227,10 @@ fn run_stmt(
             };
             let step = i128::from(range.step.get());
             loop {
-                if *steps >= budget {
+                if tally.steps >= budget {
                     return Flow::Exhausted;
                 }
-                *steps += 1;
+                tally.steps += 1;
                 let more = if step > 0 {
                     counter < limit
                 } else {
@@ -194,8 +239,11 @@ fn run_stmt(
                 if !more {
                     return Flow::Normal;
                 }
+                // See the `while` arm: one per iteration, none for the loop
+                // statement and none for the test that ends it.
+                tally.charged += 1;
                 state.insert(target.as_str().to_owned(), counter);
-                let flow = run_block(program, body, state, steps, budget);
+                let flow = run_block(program, body, state, tally, budget);
                 if flow != Flow::Normal {
                     return flow;
                 }
@@ -206,7 +254,10 @@ fn run_stmt(
             }
         }
 
-        SourceStmt::Return => Flow::Returned,
+        SourceStmt::Return => {
+            tally.charged += 1;
+            Flow::Returned
+        }
 
         // A refused construct has no source semantics: the reference declines
         // rather than inventing one. Programs containing these are never fed

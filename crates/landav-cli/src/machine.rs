@@ -66,7 +66,20 @@ pub struct Summary {
     /// Functions met, whether or not they lowered.
     pub functions: usize,
     /// Functions that became an integer transition system.
+    ///
+    /// The headline number, and the one `coverage_percent` is over. It means
+    /// "the whole toolchain can handle this function" and must not be confused
+    /// with `analysed`.
     pub lowered: usize,
+    /// Functions the native engine derived a bound for, complete or partial.
+    ///
+    /// Always at least `lowered`, and usually larger: a function whose only
+    /// obstacle is a call does not lower, and is still analysed apart from that
+    /// call. Reported separately rather than folded into `lowered` because a
+    /// partial bound carries an unfilled hole, an unfilled hole denotes `omega`,
+    /// and counting those as covered would claim an improvement the run did not
+    /// make.
+    pub analysed: usize,
     /// `lowered / functions`, as a percentage, or `null` when there were no
     /// functions - which is not the same as zero percent and must not be
     /// reported as it.
@@ -86,8 +99,14 @@ pub struct Function {
     pub file: String,
     pub line: u32,
     pub column: u32,
-    /// Whether it became an integer transition system. A function that did not
-    /// lower has no bound, and the reasons are in `refused`.
+    /// Whether it became an integer transition system.
+    ///
+    /// **Not** whether anything was derived for it: the native engine reads the
+    /// structured source directly and reports a `"partial"` bound for a function
+    /// the lowering refused, naming each region it could not derive. The two are
+    /// different numbers and `summary` reports both. A function with
+    /// `lowered: false` never carries an `"exact"` or `"upper"` bound; the
+    /// reasons it did not lower are in `refused`.
     pub lowered: bool,
     /// The derived cost, or `null`.
     ///
@@ -197,12 +216,13 @@ impl Collector {
             })
         });
 
-        // A function that did not lower never reached the engine, so it has no
-        // bound - and reporting one would be inventing a conclusion the run did
-        // not reach.
-        let derived = lowered
-            .is_ok()
-            .then(|| landav_engine::cost(function.program()));
+        // The engine is consulted for **every** function, including the ones
+        // that did not lower: a call is the sole construct blocking most of the
+        // corpus, and cost derived apart from a named call site is the first
+        // thing a user of that corpus can act on. What a run is entitled to say
+        // about a function the toolchain refused is decided once, in
+        // `crate::derived`, so the text and this cannot drift apart.
+        let derived = crate::derived::cost_of(function, lowered.is_ok());
         let (bound, kind, exact_outside, holes) = derived.as_ref().map_or_else(
             || (None, None, false, Vec::new()),
             |cost| {

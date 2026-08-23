@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cc48dfbe427f0c1f7e8edc87b7e8356e76ed2ccb58ab7e782a97d983d6c0a06c # shrinks to nest = [For { target: 0, start: Int(4), stop: Int(0), step: -3, body: [For { target: 1, start: Int(0), stop: Var(0), step: 1, body: [Assign { target: 1, value: Int(0) }] }] }], initial = {"n": 0}

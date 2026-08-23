@@ -13,6 +13,14 @@ landav-bound = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# A dev-dependency cycle, and a deliberate one: `landav-engine` depends on this
+# crate, and this crate's property suite is the only place that owns an
+# independently-written reference semantics for `SourceProgram`. Checking the
+# engine against the *lowering's* reference rather than against a second
+# reference of its own is what makes the comparison worth running. Cargo builds
+# dev-dependencies separately from the library, so the cycle is not a build
+# cycle.
+landav-engine = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

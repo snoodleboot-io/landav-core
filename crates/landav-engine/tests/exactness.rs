@@ -327,6 +327,75 @@ fn an_unsupported_statement_becomes_a_hole_naming_the_construct() {
     assert!(result.bound().is_some());
 }
 
+/// A `return` in the middle of a block is not an equality.
+///
+/// Found by `landav-its`' `engine_cost` property, which scores a generated
+/// program against the reference interpreter and compares. The sum charges
+/// every statement in the block; a `return` before the end means the ones after
+/// it are charged and never run. The number still dominates - it is an
+/// over-approximation, which is the safe direction - but `Exact` claims it is
+/// *attained*, and it is not.
+///
+/// `def f(n): return; x = 0; y = 0` costs one step and was reported as
+/// `Exact(3)`.
+#[test]
+fn a_return_before_the_end_of_a_block_is_not_exact() {
+    let mut build = SourceProgramBuilder::new("early", here(), vec![VarName::new("n")]);
+    let leave = build.return_stmt(here());
+    let first = build.int(0, here());
+    let unreachable_one = build.assign(VarName::new("x"), first, here());
+    let second = build.int(0, here());
+    let unreachable_two = build.assign(VarName::new("y"), second, here());
+    let program = build.build(vec![leave, unreachable_one, unreachable_two]);
+
+    let result = cost(&program);
+    assert!(
+        matches!(result, TripCount::AtMost(_)),
+        "the statements after the `return` are charged and never executed, so          the total is an upper bound and not an equality, got {result:?}"
+    );
+
+    // A `return` as the *last* statement changes nothing, and almost every real
+    // function has that shape. Losing it would trade one wrong label for a
+    // whole class of them.
+    let mut build = SourceProgramBuilder::new("trailing", here(), vec![VarName::new("n")]);
+    let value = build.int(0, here());
+    let assign = build.assign(VarName::new("x"), value, here());
+    let leave = build.return_stmt(here());
+    let program = build.build(vec![assign, leave]);
+    assert!(
+        cost(&program).is_exact(),
+        "a trailing `return` executes, so the sum is still attained"
+    );
+}
+
+/// A `return` inside a loop falsifies the trip count the same way a `break`
+/// would.
+///
+/// `TripCount`'s own argument for exactness is that "the fragment refuses
+/// `break`, `continue` and exceptions, so nothing can leave early". A `return`
+/// is the one thing it accepts that can, so a loop containing one runs *at
+/// most* its trip count.
+#[test]
+fn a_return_inside_a_loop_is_not_exact() {
+    let mut build = SourceProgramBuilder::new("leaves", here(), vec![VarName::new("n")]);
+    let start = build.int(0, here());
+    let stop = build.var(VarName::new("n"), here());
+    let leave = build.return_stmt(here());
+    let loop_stmt = build.for_range(
+        VarName::new("i"),
+        RangeSpec::new(start, stop, NonZeroI64::new(1).expect("1 is non-zero")),
+        vec![leave],
+        here(),
+    );
+    let program = build.build(vec![loop_stmt]);
+
+    let result = cost(&program);
+    assert!(
+        matches!(result, TripCount::AtMost(_)),
+        "the loop leaves on its first iteration, so `n * 2` is an upper bound          and not the cost, got {result:?}"
+    );
+}
+
 /// `for i in range(n): for j in range(i): x = 0`
 fn triangular() -> SourceProgram {
     let mut build = SourceProgramBuilder::new("tri", here(), vec![VarName::new("n")]);
@@ -423,6 +492,19 @@ fn the_triangular_bound_equals_the_truth() {
 /// one but a different *sequence* of counter values, and Faulhaber's formulae
 /// are over `0, 1, 2, ...`. Summing one as if it were the other would be
 /// silently wrong, so those fall back to the approximation.
+///
+/// # The half this test used to leave out
+///
+/// It asserted only that the result was `AtMost`, which the approximation
+/// satisfied while *under*-approximating: the fallback substituted the loop's
+/// **trip count** for its **counter**, and those are the same number only for
+/// `range(0, e)` in unit steps. This loop runs ten times and its counter reaches
+/// 27, so the engine reported 210 against a true cost of 280 - a complete bound,
+/// printed as `O(210) - an upper bound; the true cost may be lower`, that the
+/// program exceeds. The shape was pinned here and green.
+///
+/// So the number is checked as well as the variant. `AtMost` is a claim about a
+/// value, and a test that reads the tag without the value certifies the tag.
 #[test]
 fn a_strided_loop_body_that_reads_its_counter_is_not_summed() {
     let mut build = SourceProgramBuilder::new("strided", here(), vec![VarName::new("n")]);
@@ -456,6 +538,22 @@ fn a_strided_loop_body_that_reads_its_counter_is_not_summed() {
     assert!(
         matches!(result, TripCount::AtMost(_)),
         "a strided counter must not be summed as if it stepped by one, got {result:?}"
+    );
+
+    // One step per iteration of each loop, plus one per assignment: the outer
+    // counter takes the values 0, 3, ... 27, and the inner loop runs that many
+    // times.
+    let truth: u64 = (0..10_u64).map(|k| 1 + 2 * (3 * k)).sum();
+    assert_eq!(truth, 280, "the arithmetic in this test is wrong");
+    let bound = result.bound().expect("an `AtMost` carries a bound");
+    let reported = at(bound, "n", 0);
+    assert!(
+        reported.magnitude_cmp(landav_bound::Nat::Fin(truth)) != core::cmp::Ordering::Less,
+        "the engine reported {reported:?} for a loop nest that costs {truth} \
+         steps. An `AtMost` is offered for comparison against a budget, so \
+         under-approximating it is worse than reporting nothing: the counter of \
+         a loop is dominated by the endpoint it moves away from, not by its trip \
+         count."
     );
 }
 
@@ -607,4 +705,79 @@ fn two_regions_get_two_holes() {
         result.holes()[1].var(),
         "two regions must not share a variable"
     );
+}
+
+/// A `while` inside a counted loop whose body's cost mentions the counter.
+///
+/// `close_over_counter` must substitute for the counter, and it used to do that
+/// by pulling the bound out of the body's result and rebuilding a
+/// `TripCount::AtMost` around it. The hole *variables* stayed in the bound; the
+/// ledger that named them did not. So the engine returned a **complete** upper
+/// bound with `#hole0` in it - `O(2 + n * (1 + #hole0 + 2n))`, `holes: []`,
+/// `lowered: true` - which the CLI printed as "an upper bound; the true cost may
+/// be lower" without naming the `while` anywhere in the run, and which any
+/// consumer supplying only the parameters evaluates with the omega term at zero.
+///
+/// An unfilled hole denotes omega. Offering one inside a finite-looking claim a
+/// budget gate may act on is the single failure this crate's design exists to
+/// prevent, so the substitution goes through `TripCount::substituting`, which
+/// carries the ledger.
+#[test]
+fn a_substituted_bound_keeps_the_holes_its_body_carried() {
+    let mut build = SourceProgramBuilder::new("nested", here(), vec![VarName::new("n")]);
+    let one = NonZeroI64::new(1).expect("1 is non-zero");
+
+    // `for j in range(i): x = 0` - a cost that mentions the outer counter, which
+    // is what forces the substitution.
+    let inner_start = build.int(0, here());
+    let inner_stop = build.var(VarName::new("i"), here());
+    let zero = build.int(0, here());
+    let assign = build.assign(VarName::new("x"), zero, here());
+    let inner = build.for_range(
+        VarName::new("j"),
+        RangeSpec::new(inner_start, inner_stop, one),
+        vec![assign],
+        here(),
+    );
+
+    // `while n > 0: pass` - the region whose hole must survive the substitution.
+    let read = build.var(VarName::new("n"), here());
+    let bound_zero = build.int(0, here());
+    let cond = build.compare(landav_its::CompareOp::Gt, read, bound_zero, here());
+    let loop_forever = build.while_loop(cond, vec![], here());
+
+    let outer_start = build.int(0, here());
+    let outer_stop = build.var(VarName::new("n"), here());
+    let outer = build.for_range(
+        VarName::new("i"),
+        RangeSpec::new(outer_start, outer_stop, one),
+        vec![inner, loop_forever],
+        here(),
+    );
+    let program = build.build(vec![outer]);
+
+    let result = cost(&program);
+
+    assert!(
+        !result.is_complete(),
+        "a bound containing a hole variable is not a complete answer, whatever \
+         variant carries it: {result:?}"
+    );
+    assert!(
+        result
+            .holes()
+            .iter()
+            .any(|hole| hole.construct() == "while"),
+        "the `while` must still be named after the counter was substituted \
+         away: {result:?}"
+    );
+    let bound = result.bound().expect("a partial result carries a bound");
+    for var in bound.vars() {
+        assert!(
+            var.symbol().as_str() == "n" || landav_engine::Hole::is_hole(&var),
+            "the bound mentions `{}`, which is neither a parameter nor a hole: \
+             {bound}",
+            var.symbol()
+        );
+    }
 }

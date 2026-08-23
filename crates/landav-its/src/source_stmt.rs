@@ -3,8 +3,8 @@
 use landav_bound::Symbol;
 
 use crate::{
-    cond_id::CondId, construct::Construct, expr_id::ExprId, range_spec::RangeSpec, stmt_id::StmtId,
-    var_name::VarName,
+    cond_id::CondId, construct::Construct, expr_id::ExprId, extent::Extent, range_spec::RangeSpec,
+    stmt_id::StmtId, var_name::VarName,
 };
 
 /// A statement, as one arena node.
@@ -75,11 +75,14 @@ pub enum SourceStmt {
     /// A statement the frontend could not translate.
     ///
     /// See [`crate::SourceExpr::Unsupported`] for why this is a node rather
-    /// than an omission.
+    /// than an omission, and [`Extent`] for why a frontend has to say how much
+    /// of a source statement this node stands for.
     Unsupported {
         /// What was refused.
         construct: Construct,
         /// Frontend-supplied specifics, if any.
         detail: Option<Symbol>,
+        /// Whether this is a whole statement or a fragment of the one beside it.
+        extent: Extent,
     },
 }

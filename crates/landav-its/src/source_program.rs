@@ -6,8 +6,9 @@ use std::collections::BTreeSet;
 use landav_bound::{Origin, Symbol};
 
 use crate::{
-    cond_id::CondId, expr_id::ExprId, source_cond::SourceCond, source_expr::SourceExpr,
-    source_stmt::SourceStmt, stmt_id::StmtId, var_name::VarName,
+    cond_id::CondId, expr_id::ExprId, node_id::NodeId, source_cond::SourceCond,
+    source_expr::SourceExpr, source_stmt::SourceStmt, stmt_id::StmtId,
+    unsupported_node::UnsupportedNode, var_name::VarName,
 };
 
 /// One function's body, expressed in the numeric fragment.
@@ -124,6 +125,69 @@ impl SourceProgram {
         self.overflowed
     }
 
+    /// Every `Unsupported` node in the program, in canonical arena order,
+    /// **whether or not anything points at it**.
+    ///
+    /// # Why a scan and not a traversal, and why it is published
+    ///
+    /// A traversal reaches only the nodes the control flow can reach *and* that
+    /// something points at. Neither is guaranteed. A frontend translating
+    /// `return f()` has an expression it must not lose - the call has an unknown
+    /// cost - but this fragment's `return` carries no value, so the node it
+    /// built may have no parent. Relying on a traversal silently drops it, and a
+    /// silently dropped refusal is the truncation `LAN-67` criterion 4 forbids.
+    ///
+    /// [`crate::lower`] is built on exactly this scan, which is why it can
+    /// promise that building an `Unsupported` node anywhere refuses the program.
+    /// It is published because a *second* consumer now derives costs from the
+    /// structured source directly, and that consumer's obligation is the same
+    /// one: it must be able to check that everything it charged is everything
+    /// the program contains. Sharing one implementation is what stops the two
+    /// answers drifting apart.
+    ///
+    /// Note the deliberate absence of deduplication - see [`UnsupportedNode`].
+    /// Every node is yielded separately, because two identical refusals are two
+    /// costs.
+    pub fn unsupported_nodes(&self) -> impl Iterator<Item = UnsupportedNode> + '_ {
+        let exprs = self.exprs.iter().enumerate().filter_map(|(index, node)| {
+            let SourceExpr::Unsupported { construct, detail } = node else {
+                return None;
+            };
+            Some(UnsupportedNode::new(
+                NodeId::Expr(ExprId(narrow(index))),
+                *construct,
+                origin_at(&self.expr_origins, index, &self.origin),
+                detail.clone(),
+            ))
+        });
+        let conds = self.conds.iter().enumerate().filter_map(|(index, node)| {
+            let SourceCond::Unsupported { construct, detail } = node else {
+                return None;
+            };
+            Some(UnsupportedNode::new(
+                NodeId::Cond(CondId(narrow(index))),
+                *construct,
+                origin_at(&self.cond_origins, index, &self.origin),
+                detail.clone(),
+            ))
+        });
+        let stmts = self.stmts.iter().enumerate().filter_map(|(index, node)| {
+            let SourceStmt::Unsupported {
+                construct, detail, ..
+            } = node
+            else {
+                return None;
+            };
+            Some(UnsupportedNode::new(
+                NodeId::Stmt(StmtId(narrow(index))),
+                *construct,
+                origin_at(&self.stmt_origins, index, &self.origin),
+                detail.clone(),
+            ))
+        });
+        exprs.chain(conds).chain(stmts)
+    }
+
     /// Every variable name the program mentions, read or written, in canonical
     /// order.
     ///
@@ -156,6 +220,26 @@ impl SourceProgram {
         }
         names
     }
+}
+
+/// The origin recorded for the node at `index`, or the program's own.
+///
+/// The two vectors are pushed in lock-step by
+/// [`crate::SourceProgramBuilder`], so a missing entry is not reachable; the
+/// fallback keeps this total rather than fallible, because a node with no
+/// position is still worth reporting at the function's position.
+fn origin_at(origins: &[Origin], index: usize, fallback: &Origin) -> Origin {
+    origins.get(index).unwrap_or(fallback).clone()
+}
+
+/// A `usize` arena index back as the `u32` the handle carries.
+///
+/// The builder refuses past [`crate::MAX_ARENA_NODES`], which is far below
+/// `u32::MAX`, so an index that does not fit cannot have been recorded. The
+/// workspace denies truncating casts, and saturating produces a handle every
+/// accessor already reports as `None`.
+fn narrow(index: usize) -> u32 {
+    u32::try_from(index).unwrap_or(u32::MAX)
 }
 
 /// A `u32` arena index as a `usize`, without an `as` cast.

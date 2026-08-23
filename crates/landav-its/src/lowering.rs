@@ -200,25 +200,19 @@ impl<'a> Lowering<'a> {
     /// off something, which is the easiest mistake in the whole translation to
     /// make and the hardest to notice.
     fn refuse_every_unsupported_node(&mut self) {
-        let program = self.program;
-
-        for (index, node) in program.exprs.iter().enumerate() {
-            if let SourceExpr::Unsupported { construct, detail } = node {
-                let origin = origin_at(&program.expr_origins, index, program.origin());
-                self.refuse(*construct, origin, detail.clone());
-            }
-        }
-        for (index, node) in program.conds.iter().enumerate() {
-            if let SourceCond::Unsupported { construct, detail } = node {
-                let origin = origin_at(&program.cond_origins, index, program.origin());
-                self.refuse(*construct, origin, detail.clone());
-            }
-        }
-        for (index, node) in program.stmts.iter().enumerate() {
-            if let SourceStmt::Unsupported { construct, detail } = node {
-                let origin = origin_at(&program.stmt_origins, index, program.origin());
-                self.refuse(*construct, origin, detail.clone());
-            }
+        // One implementation, shared with every other consumer that has to
+        // account for these nodes. `landav-engine` charges each one as a hole
+        // and then reconciles what it charged against this same scan; two
+        // separate walks would let the two answers drift apart, and the drift
+        // would show up as a bound that omits a construct rather than as a
+        // test failure.
+        let found: Vec<_> = self.program.unsupported_nodes().collect();
+        for node in found {
+            self.refuse(
+                node.construct(),
+                node.origin().clone(),
+                node.detail().cloned(),
+            );
         }
     }
 
@@ -980,12 +974,6 @@ impl<'a> Lowering<'a> {
             }
         }
     }
-}
-
-/// The origin recorded for arena entry `index`, falling back to the
-/// program's own position.
-fn origin_at(origins: &[Origin], index: usize, fallback: &Origin) -> Origin {
-    origins.get(index).unwrap_or(fallback).clone()
 }
 
 /// The normal form that admits everything.

@@ -293,8 +293,8 @@ impl Coverage {
             );
         } else {
             text.push_str(&format!(
-                "  {} of {} function(s) produced no transition system at all, so nothing \
-                 is derived from them and no bound reported for this program covers them\n",
+                "  {} of {} function(s) produced no transition system at all, so no \
+                 solver was asked about them and no complete bound covers them\n",
                 self.units() - self.lowered,
                 self.units()
             ));

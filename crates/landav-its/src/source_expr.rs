@@ -96,6 +96,26 @@ pub enum SourceExpr {
     /// *no* transition either - the whole lowering fails, because a partial
     /// integer transition system admits fewer executions than the program has
     /// and a bound derived from it can be exceeded.
+    ///
+    /// # A refusal is not the end of what can be said
+    ///
+    /// That is the *lowering's* answer, and it is the only sound one on that
+    /// path. A consumer reading this program directly rather than through a
+    /// transition system has a second option: charge the node as a named region
+    /// of unknown cost and derive everything around it. `landav-engine` does
+    /// exactly that, which is why [`crate::SourceProgram::unsupported_nodes`]
+    /// is published - such a consumer has to be able to check that it accounted
+    /// for every one of these, and a second walk of its own would be a second
+    /// thing to keep correct.
+    ///
+    /// # Position matters to that consumer and not to this one
+    ///
+    /// The lowering scans, so where a node hangs is irrelevant to it. A cost is
+    /// charged where the node *is*: a region inside a loop body is paid once per
+    /// iteration, and the same region attached to nothing at all cannot be
+    /// placed and cannot be charged soundly. A frontend that translates an
+    /// expression it will not keep should therefore surface the refusal at a
+    /// position in the statement tree rather than leaving the node orphaned.
     Unsupported {
         /// What was refused.
         construct: Construct,

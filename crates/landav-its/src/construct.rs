@@ -1,5 +1,7 @@
 //! [`Construct`] - the named vocabulary of things this lowering will not do.
 
+use crate::cost_effect::CostEffect;
+
 /// What a refusal is *about*.
 ///
 /// # This enum is the diagnostic vocabulary
@@ -147,6 +149,43 @@ impl Construct {
             Self::ArithmeticOverflow => "arithmetic-overflow",
             Self::PolynomialDegree => "polynomial-degree",
             Self::PolynomialSize => "polynomial-size",
+        }
+    }
+
+    /// What holing this construct costs the code around it.
+    ///
+    /// See [`CostEffect`]. Matched exhaustively and deliberately: this enum is
+    /// `#[non_exhaustive]`, so a classifier written outside this crate would
+    /// need a wildcard arm and a construct added tomorrow would inherit
+    /// whatever that arm said.
+    #[must_use]
+    pub const fn cost_effect(self) -> CostEffect {
+        match self {
+            // An edge *out of* the region being counted. A loop containing one
+            // may stop before its counter is exhausted.
+            Self::LoopJump | Self::ExceptionalControlFlow => CostEffect::ControlFlow,
+
+            // Everything else costs an unknown amount where it stands and
+            // leaves the surrounding control flow alone.
+            Self::NonIntegerValue
+            | Self::Call
+            | Self::Attribute
+            | Self::Subscript
+            | Self::Collection
+            | Self::Comprehension
+            | Self::UnboundedIteration
+            | Self::IntegerDivision
+            | Self::NonPolynomialPower
+            | Self::BitwiseOperator
+            | Self::Declaration
+            | Self::BindingForm
+            | Self::ComplexAssignmentTarget
+            | Self::Coroutine
+            | Self::PatternMatch
+            | Self::ConditionalExpression
+            | Self::ArithmeticOverflow
+            | Self::PolynomialDegree
+            | Self::PolynomialSize => CostEffect::Region,
         }
     }
 

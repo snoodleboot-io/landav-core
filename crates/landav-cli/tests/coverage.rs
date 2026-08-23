@@ -231,8 +231,20 @@ fn the_report_says_what_where_and_what_it_means() -> io::Result<()> {
         "the report does not say where the refused construct is.\n{}",
         run.describe()
     );
+    // "no transition system" is pinned verbatim: it is exactly right for a
+    // refused function and it is what tells a reader what the coverage
+    // percentage is a percentage *of*.
+    //
+    // "no bound" is deliberately **not** pinned any more. `LAN-87` made the
+    // native engine total over the structured source, so a function whose only
+    // obstacle is a call is analysed apart from that call and does have a bound
+    // - a partial one, carrying an unfilled hole. Asserting the old sentence
+    // would be asserting that the ticket did not happen. What must stay true is
+    // that no *complete* bound is claimed for it, which
+    // `provenance.rs` asserts at the process boundary over every function in a
+    // run.
     assert!(
-        run.mentions("no transition system") && run.mentions("no bound"),
+        run.mentions("no transition system") && run.mentions("no complete bound"),
         "the report does not say what a refusal means for the result.\n{}",
         run.describe()
     );
