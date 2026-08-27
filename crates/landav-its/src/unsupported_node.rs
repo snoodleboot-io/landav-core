@@ -3,7 +3,10 @@
 
 use landav_bound::{Origin, Symbol};
 
-use crate::{construct::Construct, node_id::NodeId, unsupported::Unsupported};
+use crate::{
+    construct::Construct, declared_effect::DeclaredEffect, node_id::NodeId,
+    unsupported::Unsupported,
+};
 
 /// An `Unsupported` node in a [`crate::SourceProgram`]: what it refuses, where
 /// it is, and **which node it is**.
@@ -24,6 +27,7 @@ pub struct UnsupportedNode {
     construct: Construct,
     origin: Origin,
     detail: Option<Symbol>,
+    declared: Option<DeclaredEffect>,
 }
 
 impl UnsupportedNode {
@@ -40,7 +44,27 @@ impl UnsupportedNode {
             construct,
             origin,
             detail,
+            declared: None,
         }
+    }
+
+    /// The same record, carrying what the frontend declared about the node.
+    ///
+    /// A node with a declaration is **not** a refusal - see [`DeclaredEffect`].
+    /// It is yielded by the scan all the same, because a consumer that charges
+    /// every node it finds must still find this one: dropping it here would let
+    /// a declared node go uncharged and unreconciled, which is the same silent
+    /// omission the scan exists to make impossible.
+    #[must_use]
+    pub fn declaring(mut self, declared: Option<DeclaredEffect>) -> Self {
+        self.declared = declared;
+        self
+    }
+
+    /// What the frontend declared about this node, if anything.
+    #[must_use]
+    pub const fn declared(&self) -> Option<DeclaredEffect> {
+        self.declared
     }
 
     /// Which node this is.

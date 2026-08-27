@@ -6,9 +6,9 @@ use landav_bound::{Origin, Symbol};
 
 use crate::{
     MAX_ARENA_NODES, arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId,
-    construct::Construct, expr_id::ExprId, extent::Extent, range_spec::RangeSpec,
-    source_cond::SourceCond, source_expr::SourceExpr, source_program::SourceProgram,
-    source_stmt::SourceStmt, stmt_id::StmtId, var_name::VarName,
+    construct::Construct, declared_effect::DeclaredEffect, expr_id::ExprId, extent::Extent,
+    range_spec::RangeSpec, source_cond::SourceCond, source_expr::SourceExpr,
+    source_program::SourceProgram, source_stmt::SourceStmt, stmt_id::StmtId, var_name::VarName,
 };
 
 /// Builds a [`SourceProgram`] node by node.
@@ -106,6 +106,8 @@ impl SourceProgramBuilder {
                 construct,
                 detail: None,
                 bounded_by: None,
+                evaluates: Vec::new(),
+                declared: None,
             },
             origin,
         )
@@ -123,6 +125,8 @@ impl SourceProgramBuilder {
                 construct,
                 detail: Some(detail.into()),
                 bounded_by: None,
+                evaluates: Vec::new(),
+                declared: None,
             },
             origin,
         )
@@ -146,6 +150,68 @@ impl SourceProgramBuilder {
                 construct,
                 detail: Some(detail.into()),
                 bounded_by: Some(bounded_by),
+                evaluates: Vec::new(),
+                declared: None,
+            },
+            origin,
+        )
+    }
+
+    /// An expression the frontend could not translate, which evaluated
+    /// `evaluates` on the way in.
+    ///
+    /// See [`SourceExpr::Unsupported`]: the listed expressions stay part of the
+    /// program, so a walk reaches them and charges every region inside them
+    /// **at its own position**. This node keeps its own region and its own
+    /// hole; nothing here bounds its value.
+    pub fn unsupported_expr_evaluating(
+        &mut self,
+        construct: Construct,
+        detail: impl Into<Symbol>,
+        evaluates: Vec<ExprId>,
+        origin: Origin,
+    ) -> ExprId {
+        self.push_expr(
+            SourceExpr::Unsupported {
+                construct,
+                detail: Some(detail.into()),
+                bounded_by: None,
+                evaluates,
+                declared: None,
+            },
+            origin,
+        )
+    }
+
+    /// An expression the frontend did not translate but **can account for**.
+    ///
+    /// The node is still an [`SourceExpr::Unsupported`] - it has no value this
+    /// fragment can write down - but it is no longer a refusal: it costs what
+    /// `declared` says and forgets only what `declared` says it may change. See
+    /// [`DeclaredEffect`] for what may be declared, and
+    /// [`SourceExpr::Unsupported`] for the rule that one of these may only be
+    /// built where nothing reads the value.
+    ///
+    /// `evaluates` carries the same meaning it does on an ordinary refusal, and
+    /// carries more weight here: a declared node no longer denotes `omega`, so
+    /// it no longer covers for a call written inside it. Whatever the node
+    /// evaluated on the way in has to be listed, or it disappears from the
+    /// program with nothing standing in for it.
+    pub fn declared_expr(
+        &mut self,
+        construct: Construct,
+        detail: impl Into<Symbol>,
+        evaluates: Vec<ExprId>,
+        declared: DeclaredEffect,
+        origin: Origin,
+    ) -> ExprId {
+        self.push_expr(
+            SourceExpr::Unsupported {
+                construct,
+                detail: Some(detail.into()),
+                bounded_by: None,
+                evaluates,
+                declared: Some(declared),
             },
             origin,
         )
@@ -185,6 +251,30 @@ impl SourceProgramBuilder {
             SourceCond::Unsupported {
                 construct,
                 detail: None,
+                declared: None,
+            },
+            origin,
+        )
+    }
+
+    /// A condition the frontend did not translate but **can account for**.
+    ///
+    /// The condition counterpart of [`SourceProgramBuilder::declared_expr`].
+    /// Unlike the expression form there is nothing to say about a value here -
+    /// a condition has none - so what stays unknown is only which branch runs,
+    /// and [`crate::lower`] already answers that with "either".
+    pub fn declared_cond(
+        &mut self,
+        construct: Construct,
+        detail: impl Into<Symbol>,
+        declared: DeclaredEffect,
+        origin: Origin,
+    ) -> CondId {
+        self.push_cond(
+            SourceCond::Unsupported {
+                construct,
+                detail: Some(detail.into()),
+                declared: Some(declared),
             },
             origin,
         )
@@ -201,6 +291,7 @@ impl SourceProgramBuilder {
             SourceCond::Unsupported {
                 construct,
                 detail: Some(detail.into()),
+                declared: None,
             },
             origin,
         )
@@ -328,6 +419,33 @@ impl SourceProgramBuilder {
                 construct,
                 detail,
                 extent,
+                declared: None,
+            },
+            origin,
+        )
+    }
+
+    /// A statement the frontend did not translate but **can account for**.
+    ///
+    /// The statement counterpart of [`SourceProgramBuilder::declared_expr`], and
+    /// the shape a frontend that hoists a discarded expression's refusals into
+    /// statements ends up with. `extent` decides whether the source step is
+    /// charged here or by the statement beside it, exactly as it does for a
+    /// refusal; `declared` decides everything else.
+    pub fn declared_stmt(
+        &mut self,
+        construct: Construct,
+        detail: Option<Symbol>,
+        extent: Extent,
+        declared: DeclaredEffect,
+        origin: Origin,
+    ) -> StmtId {
+        self.push_stmt(
+            SourceStmt::Unsupported {
+                construct,
+                detail,
+                extent,
+                declared: Some(declared),
             },
             origin,
         )

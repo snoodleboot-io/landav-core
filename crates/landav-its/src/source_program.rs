@@ -172,45 +172,77 @@ impl SourceProgram {
     /// Note the deliberate absence of deduplication - see [`UnsupportedNode`].
     /// Every node is yielded separately, because two identical refusals are two
     /// costs.
+    ///
+    /// # Declared nodes are yielded too, and they are not refusals
+    ///
+    /// A node carrying a [`crate::DeclaredEffect`] appears here like any other,
+    /// with its declaration attached ([`UnsupportedNode::declared`]). That is
+    /// deliberate and it is the whole reason the declaration rides on the record
+    /// rather than the record being filtered: a consumer that charges every node
+    /// this yields must still charge *this* one, at its declared cost, or it
+    /// goes uncharged and unreconciled - the same silent omission the scan
+    /// exists to make impossible. A consumer collecting **refusals**
+    /// ([`crate::lower`]) skips it; a consumer collecting **costs**
+    /// (`landav-engine`) does not.
     pub fn unsupported_nodes(&self) -> impl Iterator<Item = UnsupportedNode> + '_ {
         let exprs = self.exprs.iter().enumerate().filter_map(|(index, node)| {
             let SourceExpr::Unsupported {
-                construct, detail, ..
+                construct,
+                detail,
+                declared,
+                ..
             } = node
             else {
                 return None;
             };
-            Some(UnsupportedNode::new(
-                NodeId::Expr(ExprId(narrow(index))),
-                *construct,
-                origin_at(&self.expr_origins, index, &self.origin),
-                detail.clone(),
-            ))
+            Some(
+                UnsupportedNode::new(
+                    NodeId::Expr(ExprId(narrow(index))),
+                    *construct,
+                    origin_at(&self.expr_origins, index, &self.origin),
+                    detail.clone(),
+                )
+                .declaring(*declared),
+            )
         });
         let conds = self.conds.iter().enumerate().filter_map(|(index, node)| {
-            let SourceCond::Unsupported { construct, detail } = node else {
+            let SourceCond::Unsupported {
+                construct,
+                detail,
+                declared,
+            } = node
+            else {
                 return None;
             };
-            Some(UnsupportedNode::new(
-                NodeId::Cond(CondId(narrow(index))),
-                *construct,
-                origin_at(&self.cond_origins, index, &self.origin),
-                detail.clone(),
-            ))
+            Some(
+                UnsupportedNode::new(
+                    NodeId::Cond(CondId(narrow(index))),
+                    *construct,
+                    origin_at(&self.cond_origins, index, &self.origin),
+                    detail.clone(),
+                )
+                .declaring(*declared),
+            )
         });
         let stmts = self.stmts.iter().enumerate().filter_map(|(index, node)| {
             let SourceStmt::Unsupported {
-                construct, detail, ..
+                construct,
+                detail,
+                declared,
+                ..
             } = node
             else {
                 return None;
             };
-            Some(UnsupportedNode::new(
-                NodeId::Stmt(StmtId(narrow(index))),
-                *construct,
-                origin_at(&self.stmt_origins, index, &self.origin),
-                detail.clone(),
-            ))
+            Some(
+                UnsupportedNode::new(
+                    NodeId::Stmt(StmtId(narrow(index))),
+                    *construct,
+                    origin_at(&self.stmt_origins, index, &self.origin),
+                    detail.clone(),
+                )
+                .declaring(*declared),
+            )
         });
         exprs.chain(conds).chain(stmts)
     }

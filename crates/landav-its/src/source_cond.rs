@@ -2,7 +2,10 @@
 
 use landav_bound::Symbol;
 
-use crate::{compare_op::CompareOp, cond_id::CondId, construct::Construct, expr_id::ExprId};
+use crate::{
+    compare_op::CompareOp, cond_id::CondId, construct::Construct, declared_effect::DeclaredEffect,
+    expr_id::ExprId,
+};
 
 /// A truth-valued condition, as one arena node.
 ///
@@ -61,10 +64,21 @@ pub enum SourceCond {
     /// a condition the frontend could not translate may also have an effect on
     /// the integer state - a call, an assignment expression - and there is no
     /// sound over-approximation of an unknown effect.
+    ///
+    /// A node carrying a [`DeclaredEffect`] is the exception, and the exception
+    /// is narrow: the frontend has said what the condition's *evaluation* costs
+    /// and that it rebinds nothing, so the "unknown effect" half of the argument
+    /// above no longer applies and only the unknown truth value is left. That
+    /// half really is sound to approximate - both branches may be taken - and
+    /// [`crate::lower`] already lowers this variant to exactly that. See
+    /// [`crate::SourceExpr::Unsupported`].
     Unsupported {
         /// What was refused.
         construct: Construct,
         /// Frontend-supplied specifics, if any.
         detail: Option<Symbol>,
+        /// What the frontend can nevertheless say about this node's cost and
+        /// effect, if anything.
+        declared: Option<DeclaredEffect>,
     },
 }

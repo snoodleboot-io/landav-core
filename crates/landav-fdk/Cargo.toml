@@ -13,5 +13,11 @@ landav-bound = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 
+# Signature packs are TOML: diffable in review, and it takes comments, which is
+# what makes the required `why` field readable as prose rather than as a string
+# literal. Not a new dependency in the tree - `landav-cli` already reads
+# `pyproject.toml` with the same crate at the same version.
+toml = "0.9"
+
 [lints]
 workspace = true

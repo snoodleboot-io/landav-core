@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 use landav_bound::{Bound, Origin, VarId};
 use landav_its::{
-    CondId, Construct, CostEffect, ExprId, Extent, NodeId, RangeSpec, SourceCond, SourceExpr,
-    SourceProgram, SourceStmt, StmtId, VarName,
+    CondId, Construct, CostEffect, DeclaredEffect, ExprId, Extent, NodeId, RangeSpec, SourceCond,
+    SourceExpr, SourceProgram, SourceStmt, StmtId, VarName,
 };
 
 use crate::{expr_bound, hole::Hole, summation, trip_count::TripCount};
@@ -267,13 +267,16 @@ impl<'a> Walk<'a> {
             // step, and charging it twice would report `2 + call` for one line.
             // See `landav_its::Extent`.
             SourceStmt::Unsupported {
-                construct, extent, ..
+                construct,
+                extent,
+                declared,
+                ..
             } => {
-                let extent = *extent;
+                let (extent, declared) = (*extent, *declared);
                 self.charged.insert(NodeId::Stmt(id));
                 // `Walk::region` is what forgets every readable value here; see
                 // the invariant recorded there.
-                let region = self.region(*construct, self.stmt_origin(id));
+                let region = self.region(*construct, declared, self.stmt_origin(id));
                 match extent {
                     Extent::Statement => region.then(TripCount::Exact(Bound::one())),
                     Extent::Fragment => region,
@@ -603,10 +606,41 @@ impl<'a> Walk<'a> {
     /// `for_range_cost` reads its endpoints *before* the body walk for the
     /// converse reason: a `RangeSpec` really is evaluated before the first
     /// iteration, so a region inside the loop does not change the trip count.
-    fn region(&mut self, construct: Construct, origin: Origin) -> TripCount {
-        if construct.may_rebind_locals() {
+    ///
+    /// # A node that declared its own answer
+    ///
+    /// `declared` is the per-**node** answer to the two questions
+    /// `Construct::may_rebind_locals` and `cost_effect` answer per *kind*. A
+    /// call is holed and forgets everything because `Construct::Call` has to
+    /// speak for every callee at once; a node the frontend could name a bounded
+    /// cost for is charged that cost and forgets only what it says it may
+    /// change. See [`landav_its::DeclaredEffect`].
+    ///
+    /// Nothing here knows why the frontend was able to say that, and nothing
+    /// here should: a table of callee names in this crate would be a Python
+    /// fact in a language-agnostic layer. What this crate owns is the rule that
+    /// an *undeclared* node is unchanged - still a named hole, still forgetting
+    /// every readable value - which is what keeps the pack an allowlist rather
+    /// than a relaxation.
+    fn region(
+        &mut self,
+        construct: Construct,
+        declared: Option<DeclaredEffect>,
+        origin: Origin,
+    ) -> TripCount {
+        let rebinds = declared.map_or_else(
+            || construct.may_rebind_locals(),
+            DeclaredEffect::rebinds_locals,
+        );
+        // A declaration that *also* claims not to mutate an argument keeps
+        // everything, volatile names included. Nothing admitted so far claims
+        // that - an `__instancecheck__` is user code and may call
+        // `items.append(...)` - and the field exists so that a signature which
+        // can claim it has somewhere to say so.
+        let mutates = declared.is_none_or(DeclaredEffect::mutates_arguments);
+        if rebinds {
             self.readable.clear();
-        } else {
+        } else if mutates {
             // A read runs foreign code, and foreign code cannot rebind a name in
             // *this* frame - see `Construct::may_rebind_locals`, where that
             // argument lives. What it can do is mutate an object, so anything
@@ -616,6 +650,15 @@ impl<'a> Walk<'a> {
             // is the frontend's to say, and it says so in the program.
             let program = self.program;
             self.readable.retain(|name| !program.is_volatile(name));
+        }
+        if let Some(effect) = declared {
+            // Not a hole: the cost is known, so there is nothing to name and
+            // nothing for `Bound::subst` to fill later. `cost_effect` is not
+            // consulted either - a declared node is bounded work in the middle
+            // of a region, never an edge out of one, and a frontend wanting to
+            // declare an early exit would be declaring something this type
+            // cannot express.
+            return TripCount::Exact(Bound::constant(u64::from(effect.steps())));
         }
         let hole = self.holes.next(construct.tag(), origin);
         let charged = TripCount::opaque(hole);
@@ -640,6 +683,7 @@ impl<'a> Walk<'a> {
             let Some(SourceExpr::Unsupported {
                 construct,
                 bounded_by,
+                declared,
                 ..
             }) = self.program.expr(id)
             else {
@@ -657,9 +701,9 @@ impl<'a> Walk<'a> {
                 self.charged.insert(NodeId::Expr(id));
                 continue;
             }
-            let (construct, origin) = (*construct, self.expr_origin(id));
+            let (construct, declared, origin) = (*construct, *declared, self.expr_origin(id));
             self.charged.insert(NodeId::Expr(id));
-            let region = self.region(construct, origin);
+            let region = self.region(construct, declared, origin);
             total = total.then(region);
         }
         total
@@ -670,10 +714,15 @@ impl<'a> Walk<'a> {
         let mut total = TripCount::Exact(Bound::zero());
         for id in cond_nodes(self.program, root) {
             match self.program.cond(id) {
-                Some(SourceCond::Unsupported { construct, .. }) => {
-                    let (construct, origin) = (*construct, self.cond_origin(id));
+                Some(SourceCond::Unsupported {
+                    construct,
+                    declared,
+                    ..
+                }) => {
+                    let (construct, declared, origin) =
+                        (*construct, *declared, self.cond_origin(id));
                     self.charged.insert(NodeId::Cond(id));
-                    let region = self.region(construct, origin);
+                    let region = self.region(construct, declared, origin);
                     total = total.then(region);
                 }
                 Some(SourceCond::Compare { left, right, .. }) => {
@@ -873,19 +922,20 @@ fn expr_nodes(program: &SourceProgram, root: ExprId) -> Vec<ExprId> {
             SourceExpr::Arith { left, right, .. } => work.extend([*right, *left]),
             SourceExpr::Neg { operand } => work.push(*operand),
             SourceExpr::Pow { base, .. } => work.push(*base),
-            // A refusal that names an expression bounding its magnitude keeps
-            // that expression in the program, so the walk must reach it: the
-            // regions inside `g(n) // 2` are charged because the walk descends
+            // A refusal that names an expression bounding its magnitude, or one
+            // it evaluated on the way in, keeps that expression in the program,
+            // so the walk must reach it: the regions inside `g(n) // 2` and the
+            // inner call of `fetch(g(n))` are charged because the walk descends
             // here. See [`SourceExpr::Unsupported`].
             SourceExpr::Unsupported {
-                bounded_by: Some(operand),
+                bounded_by,
+                evaluates,
                 ..
-            } => work.push(*operand),
-            SourceExpr::Int { .. }
-            | SourceExpr::Var { .. }
-            | SourceExpr::Unsupported {
-                bounded_by: None, ..
-            } => {}
+            } => {
+                work.extend(evaluates.iter().rev().copied());
+                work.extend(*bounded_by);
+            }
+            SourceExpr::Int { .. } | SourceExpr::Var { .. } => {}
         }
     }
     ordered
@@ -987,7 +1037,16 @@ fn writes_of(program: &SourceProgram, body: &[StmtId]) -> Option<BTreeSet<VarNam
                 names.insert(target.clone());
                 work.extend(body.iter().copied());
             }
-            SourceStmt::Unsupported { .. } => return None,
+            // A declared statement writes nothing: the frontend said it cannot
+            // rebind a local of this frame, and that is exactly the question
+            // this walk asks. Answering `None` here would clear `readable`
+            // before a loop body containing one is walked, which costs the loop
+            // its own endpoint - the failure this declaration exists to remove,
+            // one nesting level down.
+            SourceStmt::Unsupported { declared, .. } => match declared {
+                Some(effect) if !effect.rebinds_locals() => {}
+                _ => return None,
+            },
         }
     }
     Some(names)
@@ -1056,6 +1115,7 @@ fn expr_has_region(program: &SourceProgram, root: ExprId) -> bool {
             program.expr(id),
             Some(SourceExpr::Unsupported {
                 bounded_by: None,
+                declared: None,
                 ..
             })
         )
@@ -1066,7 +1126,11 @@ fn expr_has_region(program: &SourceProgram, root: ExprId) -> bool {
 fn cond_has_region(program: &SourceProgram, root: CondId) -> bool {
     cond_nodes(program, root).into_iter().any(|id| {
         match program.cond(id) {
-            Some(SourceCond::Unsupported { .. }) => true,
+            // A declared node is not a region for the same reason a `bounded_by`
+            // refusal is not: its *effect* is known. It costs a constant and
+            // assigns to nothing, so a name read across it still holds the value
+            // the caller supplied - which is the entire point of declaring it.
+            Some(SourceCond::Unsupported { declared, .. }) => declared.is_none(),
             Some(SourceCond::Compare { left, right, .. }) => {
                 expr_has_region(program, *left) || expr_has_region(program, *right)
             }

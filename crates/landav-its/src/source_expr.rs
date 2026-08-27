@@ -2,7 +2,10 @@
 
 use landav_bound::Symbol;
 
-use crate::{arith_op::ArithOp, construct::Construct, expr_id::ExprId, var_name::VarName};
+use crate::{
+    arith_op::ArithOp, construct::Construct, declared_effect::DeclaredEffect, expr_id::ExprId,
+    var_name::VarName,
+};
 
 /// An integer-valued expression, as one arena node.
 ///
@@ -145,6 +148,51 @@ pub enum SourceExpr {
     /// point at that operand here rather than translating and discarding it -
     /// an `Unsupported` node nothing points at is the orphan
     /// `SourceProgram::unsupported_nodes` exists to catch.
+    ///
+    /// # A refusal that still knows what it evaluated on the way in
+    ///
+    /// `evaluates` is the second thing a refusal may carry, and it answers a
+    /// different question from `bounded_by`. `bounded_by` is about this node's
+    /// **value**; `evaluates` is about the **work done before** it: the
+    /// arguments of `fetch(g(n))` are evaluated whether or not `fetch` can be
+    /// translated, and `g(n)` among them is a call the program issues.
+    ///
+    /// The two are independent and are read differently. A `bounded_by`
+    /// operand makes this node *not* a region, because `n // 2` is arithmetic
+    /// with no representation here rather than code with an unknown effect. An
+    /// `evaluates` operand does nothing of the kind: this node stays a region
+    /// with a hole of its own, and each listed expression is walked and charged
+    /// **where it stands**, so a nested region inside a loop is paid once per
+    /// iteration. Nothing in the listed expressions bounds this node's value -
+    /// `fetch(g(n))` may return anything at all - so a consumer deriving a
+    /// magnitude must ignore them entirely.
+    ///
+    /// The reason it exists is that a refused container is otherwise a place
+    /// where a whole subtree can disappear. A frontend that translates a
+    /// refused form's interior without pointing at it here leaves orphans; one
+    /// that does not translate it at all leaves the program with no record that
+    /// the interior was ever evaluated, and a consumer counting *regions of a
+    /// particular kind* - rather than summing costs - then reads a number below
+    /// the truth. Empty for every refusal whose interior the frontend did not
+    /// translate, which is most of them.
+    ///
+    /// # A refusal that is not, in the end, a refusal
+    ///
+    /// `declared` is the third and last thing one of these may carry, and it is
+    /// the only one that changes what the node *is*. A node carrying a
+    /// [`DeclaredEffect`] costs what it declares rather than an unknown amount,
+    /// so [`crate::lower`] emits a transition for it instead of refusing the
+    /// program and `landav-engine` charges a constant instead of a hole. See
+    /// [`DeclaredEffect`] for what may be declared and what it licenses.
+    ///
+    /// The node stays an `Unsupported` node all the same, and that is
+    /// deliberate: it has no **value** this fragment can write down. A frontend
+    /// must therefore build one only where nothing reads the value - a bare
+    /// statement, a truth test, an argument evaluated for effect. `expr_poly`
+    /// refuses a declared node it meets, which is the enforcement of that rule
+    /// rather than a restatement of it.
+    ///
+    /// It is `None` for every ordinary refusal, which is almost all of them.
     Unsupported {
         /// What was refused.
         construct: Construct,
@@ -153,5 +201,11 @@ pub enum SourceExpr {
         /// An expression whose magnitude dominates this one's, if the frontend
         /// knows one.
         bounded_by: Option<ExprId>,
+        /// Expressions evaluated as part of reaching this node, kept in the
+        /// program so that a walk charges the regions inside them.
+        evaluates: Vec<ExprId>,
+        /// What the frontend can nevertheless say about this node's cost and
+        /// effect, if anything.
+        declared: Option<DeclaredEffect>,
     },
 }

@@ -41,6 +41,14 @@
 //! compiled in. That decision is what keeps the OSS/EE split reversible — see
 //! the flag on [`F-032`], which may yet move from EE to a baseline-in-OSS split.
 //!
+//! [`SignaturePack`] is the first of the two to exist. Its format is TOML, its
+//! reader is [`SignaturePack::parse`], and the OSS builtin pack is a `.toml`
+//! file in this crate rather than a `match` anywhere: there is no Rust arm per
+//! callee in this workspace, and adding one is editing a table. The builtin
+//! file is embedded so that the *default* does not depend on an install path -
+//! see [`SignaturePack`] for that argument, and for the shadowing caveat that
+//! name-keyed matching carries.
+//!
 //! [`F-043`]: https://linear.app/snoodleboot/issue/LAN-25
 //! [`F-044`]: https://linear.app/snoodleboot/issue/LAN-29
 //! [`F-032`]: https://linear.app/snoodleboot/issue/LAN-36
@@ -60,6 +68,16 @@
 // The traits below are scheduled for R3, but the *shape* is fixed now because
 // R0-R2 code will be written against it and retrofitting is what this whole
 // feature exists to avoid.
+
+pub mod cost_class;
+pub mod pack_error;
+pub mod signature;
+pub mod signature_pack;
+
+pub use crate::{
+    cost_class::CostClass, pack_error::PackError, signature::Signature,
+    signature_pack::SignaturePack,
+};
 
 /// Placeholder so the workspace builds before `LAN-25` lands.
 ///

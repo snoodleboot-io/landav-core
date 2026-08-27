@@ -3,8 +3,8 @@
 use landav_bound::Symbol;
 
 use crate::{
-    cond_id::CondId, construct::Construct, expr_id::ExprId, extent::Extent, range_spec::RangeSpec,
-    stmt_id::StmtId, var_name::VarName,
+    cond_id::CondId, construct::Construct, declared_effect::DeclaredEffect, expr_id::ExprId,
+    extent::Extent, range_spec::RangeSpec, stmt_id::StmtId, var_name::VarName,
 };
 
 /// A statement, as one arena node.
@@ -167,5 +167,13 @@ pub enum SourceStmt {
         detail: Option<Symbol>,
         /// Whether this is a whole statement or a fragment of the one beside it.
         extent: Extent,
+        /// What the frontend can nevertheless say about this node's cost and
+        /// effect, if anything.
+        ///
+        /// A declared node is a real statement: [`crate::lower`] emits a
+        /// transition for it rather than refusing the program. `extent` still
+        /// decides whether the source step is charged here or by the statement
+        /// beside it. See [`DeclaredEffect`].
+        declared: Option<DeclaredEffect>,
     },
 }

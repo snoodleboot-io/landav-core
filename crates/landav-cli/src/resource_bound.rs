@@ -48,22 +48,34 @@
 //! result is reported as `partial`, and no number is offered. A zero is the most
 //! dangerous answer available here, because every gate passes it.
 //!
-//! # The under-count this module cannot close, stated rather than hidden
+//! # What this number still does not see, stated rather than hidden
 //!
-//! `landav_python`'s `expression_children` does not descend into a refused
-//! form, so `fetch(g(n))` builds **one** `Unsupported` node - the outer call -
-//! and the inner call is never translated at all. The cost bound is sound
-//! (`#hole0` denotes the cost of the whole region, nested call included), but
-//! the *query* count reads `1` where two call expressions are evaluated.
+//! A call written inside another call's **arguments** used to vanish:
+//! `expression_children` gave a refused form no children, so `fetch(g(n))`
+//! built one `Unsupported` node and reported `1`. `LAN-96` closed that - the
+//! frontend now translates a refused call's arguments and the refusal points at
+//! them - and the count for that shape is right.
 //!
-//! This is the cross-cutting hazard already on the record for the construct
-//! lanes, and it is a frontend fact: there is no node in the arena for this
-//! module to count, and no signal in the hole or the refusal that distinguishes
-//! `fetch(n)` from `fetch(g(n))`. Closing it means translating a refused form's
-//! children, in `landav-python`, so that a nested call gets its own hole.
-//! **Until that lands, `queries` must not be used as a hard budget gate on code
-//! that nests calls inside call arguments.** It is recorded here, next to the
-//! number, rather than in a ticket nobody reading the number will open.
+//! Three neighbouring containers are not closed, and each is a *different*
+//! widening with its own measurement rather than a residue of the same one:
+//!
+//! * a call in the **callee**: `(a() / b()).read_bytes()` counts the
+//!   `read_bytes` and not the two calls that produced the object it is read
+//!   from;
+//! * a call among the operands of a refused **binary operator**:
+//!   `_create("%s.%s" % (host(), pid()))` counts the outer call alone;
+//! * a call inside a **subscript index** or an **attribute chain**, which is
+//!   the one place this is not a low number: those regions survive into the
+//!   query bound unfilled, so the run reports `partial` and offers no number at
+//!   all.
+//!
+//! Measured over `/usr/lib/python3.12` and the typed corpus, deduplicated by
+//! real path, the confident numbers that are below a `ast`-derived truth went
+//! from 229/570 (40.2%) to 174/570 (30.5%) and from 412/1795 (23.0%) to
+//! 200/1779 (11.2%). What remains is the list above, not the nested-call gap.
+//! **`queries` is still not a hard budget gate on code that hides a call in a
+//! callee, an operand or an index**; it is recorded here, next to the number,
+//! rather than in a ticket nobody reading the number will open.
 
 use std::collections::BTreeSet;
 

@@ -185,6 +185,14 @@
 //! published so that a second consumer with the same obligation can be built on
 //! the same implementation rather than on a second walk that drifts.
 //!
+//! One node kind is scanned and not refused: one carrying a [`DeclaredEffect`],
+//! which is a frontend saying it can *account for* what it did not translate —
+//! this costs a constant, and it rebinds no local of the frame it stands in.
+//! [`lower`] emits an ordinary step for it. Nothing here checks the claim and
+//! nothing here could; what this crate guarantees is that a node with nothing
+//! declared refuses exactly as it always has, so the mechanism is an opt-in per
+//! node and never a relaxation of the default.
+//!
 //! ## All-or-nothing is a property of *this path*, not of the toolchain
 //!
 //! It is worth being exact about the scope, because it narrowed. All-or-nothing
@@ -259,6 +267,7 @@ pub mod construct;
 pub mod cost;
 pub mod cost_effect;
 pub mod coverage;
+pub mod declared_effect;
 pub mod expr_id;
 pub mod extent;
 pub mod guard;
@@ -289,14 +298,15 @@ pub mod var_name;
 
 pub use crate::{
     arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId, constraint::Constraint,
-    construct::Construct, cost::Cost, cost_effect::CostEffect, coverage::Coverage, expr_id::ExprId,
-    extent::Extent, guard::Guard, its::Its, its_var::ItsVar, location::Location,
-    location_id::LocationId, lowering::lower, lowering_error::LoweringError, monomial::Monomial,
-    node_id::NodeId, polynomial::Polynomial, range_spec::RangeSpec, refusals::Refusals,
-    relation::Relation, source_cond::SourceCond, source_expr::SourceExpr,
-    source_program::SourceProgram, source_program_builder::SourceProgramBuilder,
-    source_stmt::SourceStmt, stmt_id::StmtId, transition::Transition, unsupported::Unsupported,
-    unsupported_node::UnsupportedNode, update::Update, var_name::VarName,
+    construct::Construct, cost::Cost, cost_effect::CostEffect, coverage::Coverage,
+    declared_effect::DeclaredEffect, expr_id::ExprId, extent::Extent, guard::Guard, its::Its,
+    its_var::ItsVar, location::Location, location_id::LocationId, lowering::lower,
+    lowering_error::LoweringError, monomial::Monomial, node_id::NodeId, polynomial::Polynomial,
+    range_spec::RangeSpec, refusals::Refusals, relation::Relation, source_cond::SourceCond,
+    source_expr::SourceExpr, source_program::SourceProgram,
+    source_program_builder::SourceProgramBuilder, source_stmt::SourceStmt, stmt_id::StmtId,
+    transition::Transition, unsupported::Unsupported, unsupported_node::UnsupportedNode,
+    update::Update, var_name::VarName,
 };
 
 /// The highest total degree a [`Polynomial`] may reach.
