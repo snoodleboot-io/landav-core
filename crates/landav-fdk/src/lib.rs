@@ -71,12 +71,13 @@
 
 pub mod cost_class;
 pub mod pack_error;
+pub mod result_length;
 pub mod signature;
 pub mod signature_pack;
 
 pub use crate::{
-    cost_class::CostClass, pack_error::PackError, signature::Signature,
-    signature_pack::SignaturePack,
+    cost_class::CostClass, pack_error::PackError, result_length::ResultLength,
+    signature::Signature, signature_pack::SignaturePack,
 };
 
 /// Placeholder so the workspace builds before `LAN-25` lands.

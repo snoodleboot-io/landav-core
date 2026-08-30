@@ -20,6 +20,18 @@
 #                      `true` for everything here — an `__instancecheck__` is
 #                      user code and may call `items.append(...)` — which keeps
 #                      LAN-89's collection-length variables volatile.
+#   result_length      OPTIONAL. How many values the result holds, in terms of
+#                      argument 0 (the RECEIVER for a method row):
+#                      exactly-argument0 | at-most-argument0. Omitted means
+#                      "unknown", which confers nothing.
+#                      This is NOT a cost. `sorted` is length-preserving AND
+#                      n log n: the length of the result and the cost of the
+#                      call are two separate claims, read through two separate
+#                      accessors with two separate admissibility gates. A row
+#                      may declare the first while its cost stays unresolvable,
+#                      and the call site STILL carries its cost hole. Conflating
+#                      them makes a sort inside a loop report a bound the
+#                      program exceeds.
 #   why                required, on refusing rows as much as admitting ones.
 #
 # ---------------------------------------------------------------------------
@@ -266,9 +278,19 @@ callee = "sorted"
 cost = "loglinear"
 rebinds_locals = false
 mutates_arguments = true
+result_length = "exactly-argument0"
 why = """
 n log n in its argument's length, plus a comparison per step which may itself be
-user code. Two unbounded things at once.
+user code. Two unbounded things at once — so the cost stays unresolvable and the
+call site stays a hole.
+
+The LENGTH is a different claim and it is known exactly: sorted() copies its
+argument into a list and then permutes it, so the result holds exactly as many
+values as the argument did at the moment of the call. A comparison that mutates
+the argument cannot change that — the list is already built — which is why the
+trip count of `for r in sorted(records)` is a reading of the state BEFORE this
+call, and why the frontend charges this hole after the loop rather than in front
+of it. LAN-99.
 """
 
 [[signature]]
@@ -276,8 +298,11 @@ callee = "list"
 cost = "linear-in-argument"
 rebinds_locals = false
 mutates_arguments = true
+result_length = "exactly-argument0"
 why = """
-Copies its argument. 14 stdlib sole-blocked sites and every one of them is linear
+Copies its argument, one element per element, so the copy holds exactly as many
+values as the original — a length relation, declared beside a cost that stays
+unresolvable. 14 stdlib sole-blocked sites and every one of them is linear
 in something. `list()` with no argument is constant, but a row keyed by name
 cannot tell the two apart and the frontend does not look at arity for a refused
 row.
@@ -337,4 +362,153 @@ why = """
 The other half of the same statement, with the same 96 sites and the same
 argument. A `__exit__` that suppresses an exception also changes the control
 flow, which is a second reason beyond the cost.
+"""
+
+# ---------------------------------------------------------------------------
+# length relations — LAN-99
+# ---------------------------------------------------------------------------
+#
+# Every row below declares `result_length`. Read the header note first: that
+# column is a claim about how many values come BACK, and it is independent of
+# the `cost` column beside it. `sorted` above carries a relation and stays a
+# hole; `enumerate` below carries a relation and is discharged. The two columns
+# were separated so those two rows could both be written honestly.
+#
+# The relation is conditional on the ARGUMENT, never a property of the name. A
+# frontend may only use it where argument 0 is something whose length the caller
+# supplies — for landav-python, a parameter annotated with a sized builtin, or
+# another length relation bottoming out in one. `enumerate(stream())` and
+# `enumerate(r for r in xs if p(r))` confer nothing, and neither does `d.items()`
+# where `d` came from a call.
+#
+# What is NOT here, and why:
+#
+#   splitlines  len(s.splitlines()) is the number of NEWLINES in s, not len(s).
+#               It appears in the length-preserving corpus tally by shape and is
+#               not length-preserving at all.
+#   dict        dict(pairs) collapses equal keys, so it would be at-most — but
+#               dict(**kwargs) and dict(mapping) are three different callees
+#               wearing one name and the arity check would have to grow first.
+#   zip         min() of its arguments' lengths, which is neither an equality
+#               with argument 0 nor an upper bound BY argument 0 in the sense
+#               this column means — min is <= argument 0, so at-most-argument0
+#               would be sound, but zip's whole point is several arguments and a
+#               column that names one of them describes it badly. LAN-11.
+#   filter      yields FEWER values than it reads, decided by user code it also
+#               runs once per element. Two reasons, either sufficient.
+#   map         yields exactly as many, and runs arbitrary user code on every
+#               one of them. The length claim would be true and would arrive
+#               attached to a call whose cost is whatever `fn` costs; admitting
+#               it would mean a complete-looking bound for a program that calls
+#               something len(records) times. When the cost half can be stated,
+#               this row can be written.
+
+[[signature]]
+callee = "enumerate"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+result_length = "exactly-argument0"
+why = """
+Wraps its argument and returns; the pairs are produced one at a time by the loop
+that consumes it, so constructing one is O(1) and it yields exactly as many
+values as the argument holds. 44 stdlib loops, the second-largest
+length-preserving shape in the corpus. The loose end is `iter()` on a user
+object, which runs `__iter__` — the same loose end `bool`'s row already accepts
+for `__len__`, and the length relation is in any case gated on the argument
+being a sized builtin the caller supplied.
+"""
+
+[[signature]]
+callee = "reversed"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+result_length = "exactly-argument0"
+why = """
+Returns a reverse iterator over the same elements: no copy, no comparison, the
+same count. Constant for the same reason as `enumerate` and with the same loose
+end, `__reversed__` on a user object, gated the same way.
+"""
+
+[[signature]]
+callee = "tuple"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = true
+result_length = "exactly-argument0"
+why = """
+The immutable sibling of `list`: copies its argument element for element, so the
+cost is linear in a size this analysis cannot see and the result holds exactly as
+many values as the original.
+"""
+
+[[signature]]
+callee = "set"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = true
+result_length = "at-most-argument0"
+why = """
+AT MOST, and the distinction is the point: `set([1, 1, 2])` reads three values and
+holds two, so a loop over it runs at most len(argument) times and possibly fewer.
+An equality here would be a false Theta, which is the same error LAN-91 refused
+for the `{1, 1, 2}` display, and Theta against O is a difference this tool prints
+for its users. Hashing every element is linear at best and runs `__hash__` and
+`__eq__`, which are user code, so the cost stays unresolvable.
+"""
+
+[[signature]]
+callee = "frozenset"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = true
+result_length = "at-most-argument0"
+why = """
+The same collapse with the same argument as `set`. Admitting one and not the
+other would leave a user rewriting a frozenset as a set to get a bound.
+"""
+
+[[signature]]
+callee = "items"
+cost = "unbounded"
+rebinds_locals = false
+mutates_arguments = true
+result_length = "exactly-argument0"
+why = """
+The largest length-preserving shape in the corpus — 57 stdlib loops, 58 on the
+typed one — and the first row whose relation has to bite on a bare ATTRIBUTE
+rather than a bare name. Argument 0 of a method row is its RECEIVER, so
+`len(d.items()) == len(d)` needs no new vocabulary.
+
+The cost is a separate matter and stays refused. `dict.items()` really is O(1),
+but a row keyed by name matches ANY object's `.items()`, and a frontend resolving
+the cost of an arbitrary receiver's method would be declaring a bound for code
+the pack has never seen — the caveat every method row in this file already
+carries. The LENGTH claim is safe where the cost claim is not, because the
+frontend may only use it when the receiver is a collection the caller supplied,
+which is a far stronger gate than the name.
+"""
+
+[[signature]]
+callee = "keys"
+cost = "unbounded"
+rebinds_locals = false
+mutates_arguments = true
+result_length = "exactly-argument0"
+why = """
+A dict has exactly as many keys as it has entries. Same receiver-as-argument-0
+reading, same gate, and the same refusal on the cost side as `items`.
+"""
+
+[[signature]]
+callee = "values"
+cost = "unbounded"
+rebinds_locals = false
+mutates_arguments = true
+result_length = "exactly-argument0"
+why = """
+And exactly as many values, one per entry, duplicates included — `values()` does
+NOT collapse equal values the way `set` does, so this is an equality and not an
+upper bound. Same gate and same cost refusal as `items`.
 """
