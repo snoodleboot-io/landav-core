@@ -5,7 +5,7 @@ use landav_bound::{Origin, Symbol};
 
 use crate::{
     construct::Construct, declared_effect::DeclaredEffect, node_id::NodeId,
-    unsupported::Unsupported,
+    unsupported::Unsupported, writes::Writes,
 };
 
 /// An `Unsupported` node in a [`crate::SourceProgram`]: what it refuses, where
@@ -28,6 +28,7 @@ pub struct UnsupportedNode {
     origin: Origin,
     detail: Option<Symbol>,
     declared: Option<DeclaredEffect>,
+    writes: Writes,
 }
 
 impl UnsupportedNode {
@@ -45,6 +46,7 @@ impl UnsupportedNode {
             origin,
             detail,
             declared: None,
+            writes: Writes::unstated(),
         }
     }
 
@@ -65,6 +67,24 @@ impl UnsupportedNode {
     #[must_use]
     pub const fn declared(&self) -> Option<DeclaredEffect> {
         self.declared
+    }
+
+    /// The same record, carrying which locals the node may rebind.
+    ///
+    /// Carried for the same reason the declaration is: a frontend that
+    /// translates into a scratch program and hoists the refusals across has to
+    /// be able to hoist this too, or every refused binding would arrive at the
+    /// engine having forgotten that it binds one name.
+    #[must_use]
+    pub fn writing(mut self, writes: Writes) -> Self {
+        self.writes = writes;
+        self
+    }
+
+    /// Which locals of its frame this node may rebind. See [`Writes`].
+    #[must_use]
+    pub const fn writes(&self) -> &Writes {
+        &self.writes
     }
 
     /// Which node this is.

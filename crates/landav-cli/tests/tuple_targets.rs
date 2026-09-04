@@ -566,28 +566,21 @@ def g() -> int:
 /// counting assertion and fail these, which is the whole reason they are stated
 /// together.
 ///
-/// **Deferred, and the evidence says it is not a tuple-target property.** The
-/// refusal half already holds today; what fails is the counting half, for a
-/// reason this file does not own. The body is `total = total + a`, which
-/// condemns `total`, which makes the *preceding* `total = 0` a
-/// `non-integer-value` refusal - and `Construct::NonIntegerValue`
-/// `::may_rebind_locals()` is `true`, so that statement is a frame-wide region
-/// that clears `len(pairs)` before the loop is ever reached.
+/// **Ignored under `LAN-99`, and un-ignored by `LAN-100`.** The refusal half
+/// held from the start; the counting half did not, for a reason this file does
+/// not own. The body is `total = total + a`, which condemns `total`, which
+/// makes the *preceding* `total = 0` a `non-integer-value` refusal - and a
+/// refusal used to forget the whole frame, so that one statement cleared
+/// `len(pairs)` before the loop was ever reached. The identical function with
+/// a single-name target reported the same holes, which is what made it not a
+/// tuple-target property.
 ///
-/// Measured, and this is what makes it not ours: the identical function with a
-/// *single-name* target reports exactly the same holes, and did so before tuple
-/// targets existed. Replace the body with one that does not accumulate and the
-/// tuple loop counts correctly at `2 + len(pairs) * (3 + ...)`.
-///
-/// The fix is to teach a refusal to forget the one local it can actually change
-/// rather than the whole frame, which is new `landav-its` and `landav-engine`
-/// surface with corpus-wide effect - and is the same bottleneck that leaves 75
-/// of 91 reachable loops without an endpoint. Doing it inside `LAN-99` would
-/// have moved a great many numbers under cover of this ticket.
+/// `LAN-100` teaches a refused binding to forget the one local it binds.
+/// `total = 0` now carries `Writes::only(total)`, the length survives it, and
+/// the loop below is counted - at full strength, exactly as this test was
+/// written, rather than rewritten to pass. See `refusal_granularity.rs` for
+/// the rest of that ticket's claims.
 #[test]
-#[ignore = "blocked by region granularity, not by tuple targets: a refusal \
-            forgets the whole frame, so an earlier `non-integer-value` clears \
-            the length. A single-name target behaves identically."]
 fn neither_name_of_a_tuple_target_is_readable_as_an_integer() {
     for element in ["a", "b"] {
         let source = format!(

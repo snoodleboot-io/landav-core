@@ -53,8 +53,8 @@ use std::{
 use landav_bound::{Origin, Symbol};
 use landav_fdk::{Signature, SignaturePack};
 use landav_its::{
-    ArithOp, CompareOp, CondId, Construct, DeclaredEffect, ExprId, Extent, RangeSpec,
-    SourceProgramBuilder, StmtId, VarName,
+    ArithOp, CompareOp, CondId, Construct, DeclaredEffect, ExprId, Extent, Locals, RangeSpec,
+    SourceProgramBuilder, StmtId, VarName, Writes,
 };
 use rustpython_parser::ast::{self, Constant, Expr, Ranged, Stmt, text_size::TextRange};
 
@@ -1317,11 +1317,10 @@ impl Translator<'_> {
                 && (self.integers.contains(name.as_str())
                     || self.collections.contains(name.as_str()))
             {
-                let origin = self.origin(clause);
-                handler.push(self.builder.unsupported_stmt_detailed(
+                handler.push(self.refuse_named_binding(
                     Construct::BindingForm,
                     name.as_str(),
-                    origin,
+                    clause,
                 ));
             }
             handler.extend(self.block(&clause.body));
@@ -1404,12 +1403,12 @@ impl Translator<'_> {
         let [target] = assign.targets.as_slice() else {
             // `a = b = 0` binds two names; the fragment's assignment binds one.
             let mut statements = self.refusals_of(&assign.value);
-            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            statements.push(self.refuse_targets(assign, assign.targets.iter()));
             return statements;
         };
         let Expr::Name(name) = target else {
             let mut statements = self.refusals_of(&assign.value);
-            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            statements.push(self.refuse_targets(assign, [target]));
             return statements;
         };
         self.bind_expression(name.id.as_str(), target, &assign.value, assign, 0)
@@ -1475,11 +1474,27 @@ impl Translator<'_> {
     fn aug_assign(&mut self, assign: &ast::StmtAugAssign) -> Vec<StmtId> {
         let Expr::Name(name) = assign.target.as_ref() else {
             let mut statements = self.refusals_of(&assign.value);
-            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            statements.push(self.refuse_targets(assign, [assign.target.as_ref()]));
             return statements;
         };
         let Some(op) = arith_of(&assign.op) else {
-            return vec![self.refuse_stmt(refusal_for(&assign.op), assign)];
+            // `x //= e` rebinds `x`, and the operator may run user code on
+            // whatever `x` holds. The value is not translated here, so its
+            // interior speaks for the statement.
+            let mut writes = self.target_writes([assign.target.as_ref()]);
+            if rebinds_the_frame([assign.value.as_ref()]) {
+                writes = Writes::frame();
+            } else if let Locals::AtMost(names) = writes.locals() {
+                writes = Writes::at_most(names.iter().cloned());
+            }
+            let origin = self.origin(assign);
+            return vec![self.builder.unsupported_stmt_writing(
+                refusal_for(&assign.op),
+                None,
+                Extent::Statement,
+                writes,
+                origin,
+            )];
         };
         if !self.integers.contains(name.id.as_str()) {
             // `x += e` reads `x` as well as writing it, and both are refusals
@@ -1510,12 +1525,12 @@ impl Translator<'_> {
         };
         let Expr::Name(name) = assign.target.as_ref() else {
             let mut statements = self.refusals_of(value);
-            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            statements.push(self.refuse_targets(assign, [assign.target.as_ref()]));
             return statements;
         };
         if !annotation_is_int(Some(&assign.annotation)) {
             let mut statements = self.refusals_of(value);
-            statements.push(self.refuse_stmt_detailed(
+            statements.push(self.refuse_named_binding(
                 Construct::NonIntegerValue,
                 name.id.as_str(),
                 assign,
@@ -1544,13 +1559,142 @@ impl Translator<'_> {
     /// [`Translator::refusals_of`].
     fn refuse_binding(&mut self, name: &str, target: &Expr, value: &Expr) -> Vec<StmtId> {
         let mut statements = self.refusals_of(value);
-        let origin = self.origin(target);
-        statements.push(self.builder.unsupported_stmt_detailed(
-            Construct::NonIntegerValue,
-            name,
-            origin,
-        ));
+        statements.push(self.refuse_named_binding(Construct::NonIntegerValue, name, target));
         statements
+    }
+
+    /// Refuses a statement that binds exactly `name`, saying so.
+    ///
+    /// `LAN-100`. The statement stays refused - its value is one this fragment
+    /// cannot hold - but what it *does* is known: it rebinds one local and
+    /// touches no object, so every other value the engine knew survives it. A
+    /// collection parameter's length is a name the source cannot spell, and it
+    /// is rebound with the parameter, so it is listed beside it.
+    fn refuse_named_binding<T: Ranged>(
+        &mut self,
+        construct: Construct,
+        name: &str,
+        node: &T,
+    ) -> StmtId {
+        let origin = self.origin(node);
+        self.builder.unsupported_stmt_writing(
+            construct,
+            Some(Symbol::from(name)),
+            Extent::Statement,
+            Writes::only(self.rebound_names(name)),
+            origin,
+        )
+    }
+
+    /// Refuses an assignment whose targets this fragment cannot bind, saying
+    /// which locals they reach.
+    ///
+    /// `LAN-100`. `a = b = 0` rebinds two known names and nothing else; `x.y =
+    /// v` rebinds no local and runs a setter; `a, b = pair` rebinds two names
+    /// and runs an `__iter__`. Each is narrower than "anything", which is what
+    /// the construct answers for all three, and each is what the engine needs
+    /// to keep a trip count read three lines earlier. The value's own refusals
+    /// are hoisted separately by the caller and carry their own answer.
+    fn refuse_targets<'e, T: Ranged>(
+        &mut self,
+        node: &T,
+        targets: impl IntoIterator<Item = &'e Expr>,
+    ) -> StmtId {
+        let writes = self.target_writes(targets);
+        let origin = self.origin(node);
+        self.builder.unsupported_stmt_writing(
+            Construct::ComplexAssignmentTarget,
+            None,
+            Extent::Statement,
+            writes,
+            origin,
+        )
+    }
+
+    /// The variables a binding of `name` rebinds: the name, and the length
+    /// variable standing beside it if `name` is a collection parameter.
+    fn rebound_names(&self, name: &str) -> Vec<VarName> {
+        let mut names = vec![VarName::new(name)];
+        if self.collections.contains(name) {
+            names.push(length_var(name));
+        }
+        names
+    }
+
+    /// What binding `targets` may change. See [`Translator::refuse_targets`].
+    fn target_writes<'e>(&self, targets: impl IntoIterator<Item = &'e Expr>) -> Writes {
+        let mut names: Vec<VarName> = Vec::new();
+        let mut mutates = false;
+        let mut work: Vec<&Expr> = targets.into_iter().collect();
+        while let Some(target) = work.pop() {
+            match target {
+                Expr::Name(name) => names.extend(self.rebound_names(name.id.as_str())),
+                // Unpacking runs an `__iter__` on the value, which is user code.
+                Expr::Tuple(tuple) => {
+                    mutates = true;
+                    work.extend(tuple.elts.iter());
+                }
+                Expr::List(list) => {
+                    mutates = true;
+                    work.extend(list.elts.iter());
+                }
+                Expr::Starred(starred) => {
+                    mutates = true;
+                    work.push(starred.value.as_ref());
+                }
+                // A setter and a `__setitem__` run in their own frame and
+                // rebind nothing here - unless the object or the index hides a
+                // walrus or a call, which the fragment did not translate.
+                Expr::Attribute(attribute) => {
+                    mutates = true;
+                    if rebinds_the_frame([attribute.value.as_ref()]) {
+                        return Writes::frame();
+                    }
+                }
+                Expr::Subscript(subscript) => {
+                    mutates = true;
+                    if rebinds_the_frame([subscript.value.as_ref(), subscript.slice.as_ref()]) {
+                        return Writes::frame();
+                    }
+                }
+                // Not a target Python accepts; refuse as widely as possible
+                // rather than guess.
+                _ => return Writes::frame(),
+            }
+        }
+        if mutates {
+            Writes::at_most(names)
+        } else {
+            Writes::only(names)
+        }
+    }
+
+    /// Refuses an expression, saying what its untranslated interior may
+    /// change. See [`effect_of_untranslated`].
+    fn refuse_expr(
+        &mut self,
+        construct: Construct,
+        detail: Option<&str>,
+        node: &Expr,
+        origin: Origin,
+    ) -> ExprId {
+        let writes = effect_of_untranslated([node]);
+        self.builder
+            .unsupported_expr_writing(construct, detail.map(Symbol::from), writes, origin)
+    }
+
+    /// The condition counterpart of [`Translator::refuse_expr`], over every
+    /// operand the refused condition would have evaluated.
+    fn refuse_cond<'e>(
+        &mut self,
+        construct: Construct,
+        detail: Option<&str>,
+        roots: impl IntoIterator<Item = &'e Expr>,
+        origin: Origin,
+    ) -> CondId {
+        let writes = effect_of_untranslated(roots);
+        self.builder
+            .unsupported_cond_writing(construct, detail.map(Symbol::from), writes, origin)
     }
 
     /// `for x in items:` where `items` is a collection parameter.
@@ -2130,10 +2274,14 @@ impl Translator<'_> {
                         effect,
                         node.origin().clone(),
                     ),
-                    None => self.builder.unsupported_stmt_with(
+                    // And so does what the node said it may change, for the
+                    // same reason: a refused binding that lost its write set
+                    // on the way across would forget the frame again.
+                    None => self.builder.unsupported_stmt_writing(
                         node.construct(),
                         node.detail().cloned(),
                         extent,
+                        node.writes().clone(),
                         node.origin().clone(),
                     ),
                 }
@@ -2268,8 +2416,7 @@ impl Translator<'_> {
             .copied()
             .unwrap_or_else(|| {
                 let origin = self.origin(root);
-                self.builder
-                    .unsupported_cond(Construct::ConditionalExpression, origin)
+                self.refuse_cond(Construct::ConditionalExpression, None, [root], origin)
             })
     }
 
@@ -2293,17 +2440,16 @@ impl Translator<'_> {
                     });
                 }
                 combined.unwrap_or_else(|| {
-                    self.builder
-                        .unsupported_cond(Construct::ConditionalExpression, origin)
+                    self.refuse_cond(Construct::ConditionalExpression, None, [node], origin)
                 })
             }
 
             Expr::UnaryOp(unary) if matches!(unary.op, ast::UnaryOp::Not) => {
                 match recall(&unary.operand) {
                     Some(operand) => self.builder.not(operand, origin),
-                    None => self
-                        .builder
-                        .unsupported_cond(Construct::ConditionalExpression, origin),
+                    None => {
+                        self.refuse_cond(Construct::ConditionalExpression, None, [node], origin)
+                    }
                 }
             }
 
@@ -2354,9 +2500,10 @@ impl Translator<'_> {
                 ast::CmpOp::In | ast::CmpOp::NotIn => Construct::Collection,
                 _ => Construct::NonIntegerValue,
             };
-            return self.builder.unsupported_cond_detailed(
+            return self.refuse_cond(
                 construct,
-                "membership or identity comparison",
+                Some("membership or identity comparison"),
+                compare_operands(comparison),
                 origin,
             );
         }
@@ -2374,9 +2521,10 @@ impl Translator<'_> {
                     ast::CmpOp::In | ast::CmpOp::NotIn => Construct::Collection,
                     _ => Construct::NonIntegerValue,
                 };
-                return self.builder.unsupported_cond_detailed(
+                return self.refuse_cond(
                     construct,
-                    "membership or identity comparison",
+                    Some("membership or identity comparison"),
+                    compare_operands(comparison),
                     origin,
                 );
             };
@@ -2391,8 +2539,12 @@ impl Translator<'_> {
         }
 
         combined.unwrap_or_else(|| {
-            self.builder
-                .unsupported_cond(Construct::ConditionalExpression, origin)
+            self.refuse_cond(
+                Construct::ConditionalExpression,
+                None,
+                compare_operands(comparison),
+                origin,
+            )
         })
     }
 
@@ -2423,8 +2575,7 @@ impl Translator<'_> {
             .copied()
             .unwrap_or_else(|| {
                 let origin = self.origin(root);
-                self.builder
-                    .unsupported_expr(Construct::NonIntegerValue, origin)
+                self.refuse_expr(Construct::NonIntegerValue, None, root, origin)
             })
     }
 
@@ -2438,9 +2589,7 @@ impl Translator<'_> {
                     Ok(literal) => self.builder.int(literal, origin),
                     // Python integers are unbounded; the fragment's are not.
                     // Truncating would change the program, so it refuses.
-                    Err(_) => self
-                        .builder
-                        .unsupported_expr(Construct::ArithmeticOverflow, origin),
+                    Err(_) => self.refuse_expr(Construct::ArithmeticOverflow, None, node, origin),
                 },
                 // `True` is `1` and `False` is `0`, exactly, in Python.
                 Constant::Bool(flag) => self.builder.int(i64::from(*flag), origin),
@@ -2452,11 +2601,9 @@ impl Translator<'_> {
                     if self.discarding {
                         return self.builder.int(0, origin);
                     }
-                    self.builder.unsupported_expr(Construct::Collection, origin)
+                    self.refuse_expr(Construct::Collection, None, node, origin)
                 }
-                _ => self
-                    .builder
-                    .unsupported_expr(Construct::NonIntegerValue, origin),
+                _ => self.refuse_expr(Construct::NonIntegerValue, None, node, origin),
             },
 
             Expr::Name(name) => self.read(name.id.as_str(), node),
@@ -2470,9 +2617,9 @@ impl Translator<'_> {
                     {
                         return match recall(&binary.left) {
                             Some(base) => self.builder.pow(base, exponent, origin),
-                            None => self
-                                .builder
-                                .unsupported_expr(Construct::NonPolynomialPower, origin),
+                            None => {
+                                self.refuse_expr(Construct::NonPolynomialPower, None, node, origin)
+                            }
                         };
                     }
                     // `//`, `%`, `>>` and `<<` are not polynomials, but three
@@ -2498,37 +2645,30 @@ impl Translator<'_> {
                             ),
                         };
                     }
-                    return self
-                        .builder
-                        .unsupported_expr(refusal_for(&binary.op), origin);
+                    return self.refuse_expr(refusal_for(&binary.op), None, node, origin);
                 };
                 match (recall(&binary.left), recall(&binary.right)) {
                     (Some(left), Some(right)) => self.builder.arith(op, left, right, origin),
-                    _ => self
-                        .builder
-                        .unsupported_expr(Construct::NonIntegerValue, origin),
+                    _ => self.refuse_expr(Construct::NonIntegerValue, None, node, origin),
                 }
             }
 
             Expr::UnaryOp(unary) => match unary.op {
                 ast::UnaryOp::USub => match recall(&unary.operand) {
                     Some(operand) => self.builder.neg(operand, origin),
-                    None => self
-                        .builder
-                        .unsupported_expr(Construct::NonIntegerValue, origin),
+                    None => self.refuse_expr(Construct::NonIntegerValue, None, node, origin),
                 },
                 ast::UnaryOp::UAdd => recall(&unary.operand).unwrap_or_else(|| {
-                    self.builder
-                        .unsupported_expr(Construct::NonIntegerValue, origin)
+                    self.refuse_expr(Construct::NonIntegerValue, None, node, origin)
                 }),
                 // `~n` is a bitwise operator whose result the fragment has no
                 // rule for, and it stays refused wherever it is written. It is
                 // the arm next door on purpose: `Not` and `Invert` are one
                 // character apart in Python and one variant apart here, and the
                 // widening below must not reach this one.
-                ast::UnaryOp::Invert => self
-                    .builder
-                    .unsupported_expr(Construct::BitwiseOperator, origin),
+                ast::UnaryOp::Invert => {
+                    self.refuse_expr(Construct::BitwiseOperator, None, node, origin)
+                }
                 // `not x`, in a position that reads no value from it. The
                 // fourth member of the family below - see the `IfExp | BoolOp`
                 // arm for the argument, which is identical and if anything
@@ -2549,8 +2689,7 @@ impl Translator<'_> {
                     if self.value_discarded {
                         return self.builder.int(0, origin);
                     }
-                    self.builder
-                        .unsupported_expr(Construct::ConditionalExpression, origin)
+                    self.refuse_expr(Construct::ConditionalExpression, None, node, origin)
                 }
             },
 
@@ -2600,13 +2739,14 @@ impl Translator<'_> {
                 self.builder
                     .unsupported_expr_evaluating(Construct::Call, detail, evaluated, origin)
             }
-            Expr::Attribute(attribute) => self.builder.unsupported_expr_detailed(
+            Expr::Attribute(attribute) => self.refuse_expr(
                 Construct::Attribute,
-                attribute.attr.as_str(),
+                Some(attribute.attr.as_str()),
+                node,
                 origin,
             ),
             Expr::Subscript(_) | Expr::Slice(_) | Expr::Starred(_) => {
-                self.builder.unsupported_expr(Construct::Subscript, origin)
+                self.refuse_expr(Construct::Subscript, None, node, origin)
             }
             // A display, and the f-string that shares its shape. Building one
             // costs no source step, so in a discarded position it is free - and
@@ -2622,21 +2762,16 @@ impl Translator<'_> {
                 if self.discarding {
                     return self.builder.int(0, origin);
                 }
-                self.builder.unsupported_expr(Construct::Collection, origin)
+                self.refuse_expr(Construct::Collection, None, node, origin)
             }
             Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::GeneratorExp(_) => {
-                self.builder
-                    .unsupported_expr(Construct::Comprehension, origin)
+                self.refuse_expr(Construct::Comprehension, None, node, origin)
             }
-            Expr::Lambda(_) => self
-                .builder
-                .unsupported_expr(Construct::Declaration, origin),
+            Expr::Lambda(_) => self.refuse_expr(Construct::Declaration, None, node, origin),
             Expr::Await(_) | Expr::Yield(_) | Expr::YieldFrom(_) => {
-                self.builder.unsupported_expr(Construct::Coroutine, origin)
+                self.refuse_expr(Construct::Coroutine, None, node, origin)
             }
-            Expr::NamedExpr(_) => self
-                .builder
-                .unsupported_expr(Construct::BindingForm, origin),
+            Expr::NamedExpr(_) => self.refuse_expr(Construct::BindingForm, None, node, origin),
             // A ternary and an `and`/`or` chain, in a position that reads no
             // value from them. Neither costs a source step of its own and
             // neither can bind anything, so what is left is their operands -
@@ -2657,8 +2792,7 @@ impl Translator<'_> {
                 if self.value_discarded {
                     return self.builder.int(0, origin);
                 }
-                self.builder
-                    .unsupported_expr(Construct::ConditionalExpression, origin)
+                self.refuse_expr(Construct::ConditionalExpression, None, node, origin)
             }
             // A comparison, with the same argument and one exception. `in`,
             // `not in`, `is` and `is not` are refused whatever position they
@@ -2672,14 +2806,14 @@ impl Translator<'_> {
                     let Some(refused) = membership_or_identity(comparison) else {
                         return self.builder.int(0, origin);
                     };
-                    return self.builder.unsupported_expr_detailed(
+                    return self.refuse_expr(
                         refused,
-                        "membership or identity comparison",
+                        Some("membership or identity comparison"),
+                        node,
                         origin,
                     );
                 }
-                self.builder
-                    .unsupported_expr(Construct::ConditionalExpression, origin)
+                self.refuse_expr(Construct::ConditionalExpression, None, node, origin)
             }
         }
     }
@@ -2690,8 +2824,14 @@ impl Translator<'_> {
         if self.integers.contains(name) {
             return self.builder.var(VarName::new(name), origin);
         }
-        self.builder
-            .unsupported_expr_detailed(Construct::NonIntegerValue, name, origin)
+        // A name read has no interior and no effect: it is a value this
+        // fragment cannot hold, and nothing else. `LAN-100`.
+        self.builder.unsupported_expr_writing(
+            Construct::NonIntegerValue,
+            Some(Symbol::from(name)),
+            Writes::nothing(),
+            origin,
+        )
     }
 }
 
@@ -2852,6 +2992,158 @@ fn call_arguments(call: &ast::ExprCall) -> Vec<&Expr> {
         .iter()
         .chain(call.keywords.iter().map(|keyword| &keyword.value))
         .collect()
+}
+
+/// What evaluating expressions this fragment did **not** translate may change
+/// in the frame they stand in.
+///
+/// `LAN-100`. A refused expression becomes one `Unsupported` node whose
+/// interior is never inspected - which is what keeps a refused comprehension
+/// from producing a refusal per node inside it - so the interior has to be
+/// scanned *here*, once, for the two things that decide what the engine may
+/// keep reading across the node:
+///
+/// * a **call**, a **walrus**, an `await` or a `yield` may rebind a local of
+///   this frame - a call through a closure over it, a walrus directly - and
+///   the answer is the widest one, [`Writes::frame`]. It outranks the
+///   construct: `x[(n := 5)]` is a subscript, and a subscript's own answer is
+///   "nothing";
+/// * anything else runs at most user code in **its own** frame - a `property`,
+///   a `__getitem__`, an `__add__` on two objects - which cannot rebind a name
+///   here but may mutate an object, so a length read on entry is gone:
+///   [`Writes::at_most`] of no names;
+/// * a name, a literal, and a tuple or list of those do nothing at all:
+///   [`Writes::nothing`].
+///
+/// A lambda's body runs later, in its own frame, and is not scanned; its
+/// defaults are evaluated now and are. A comprehension's walrus binds in the
+/// *enclosing* scope, which is exactly why the scan does descend into one.
+fn effect_of_untranslated<'e>(roots: impl IntoIterator<Item = &'e Expr>) -> Writes {
+    let mut pure = true;
+    let mut work: Vec<&Expr> = roots.into_iter().collect();
+    while let Some(node) = work.pop() {
+        match node {
+            Expr::Call(_)
+            | Expr::NamedExpr(_)
+            | Expr::Await(_)
+            | Expr::Yield(_)
+            | Expr::YieldFrom(_) => return Writes::frame(),
+            Expr::Name(_) | Expr::Constant(_) => {}
+            Expr::Tuple(tuple) => work.extend(tuple.elts.iter()),
+            Expr::List(list) => work.extend(list.elts.iter()),
+            Expr::Lambda(lambda) => {
+                pure = false;
+                work.extend(lambda_defaults(&lambda.args));
+            }
+            other => {
+                pure = false;
+                work.extend(interior_of(other));
+            }
+        }
+    }
+    if pure {
+        Writes::nothing()
+    } else {
+        Writes::at_most([])
+    }
+}
+
+/// Whether [`effect_of_untranslated`] finds something that may rebind a local
+/// of this frame among `roots`.
+fn rebinds_the_frame<'e>(roots: impl IntoIterator<Item = &'e Expr>) -> bool {
+    matches!(effect_of_untranslated(roots).locals(), Locals::Any)
+}
+
+/// The operands a comparison evaluates, left to right.
+fn compare_operands(comparison: &ast::ExprCompare) -> Vec<&Expr> {
+    core::iter::once(comparison.left.as_ref())
+        .chain(comparison.comparators.iter())
+        .collect()
+}
+
+/// The default values a lambda evaluates when it is *defined*.
+fn lambda_defaults(args: &ast::Arguments) -> Vec<&Expr> {
+    args.posonlyargs
+        .iter()
+        .chain(args.args.iter())
+        .chain(args.kwonlyargs.iter())
+        .filter_map(|parameter| parameter.default.as_deref())
+        .collect()
+}
+
+/// Every direct sub-expression of `expr`, whatever its kind.
+///
+/// The exhaustive walk [`effect_of_untranslated`] needs, and deliberately
+/// separate from [`expression_children`], which lists what the *fragment*
+/// translates and must stay that way.
+fn interior_of(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::BoolOp(boolean) => boolean.values.iter().collect(),
+        Expr::NamedExpr(named) => vec![named.target.as_ref(), named.value.as_ref()],
+        Expr::BinOp(binary) => vec![binary.left.as_ref(), binary.right.as_ref()],
+        Expr::UnaryOp(unary) => vec![unary.operand.as_ref()],
+        Expr::Lambda(lambda) => lambda_defaults(&lambda.args),
+        Expr::IfExp(ternary) => vec![
+            ternary.test.as_ref(),
+            ternary.body.as_ref(),
+            ternary.orelse.as_ref(),
+        ],
+        Expr::Dict(dict) => dict
+            .keys
+            .iter()
+            .flatten()
+            .chain(dict.values.iter())
+            .collect(),
+        Expr::Set(set) => set.elts.iter().collect(),
+        Expr::ListComp(comprehension) => core::iter::once(comprehension.elt.as_ref())
+            .chain(generator_parts(&comprehension.generators))
+            .collect(),
+        Expr::SetComp(comprehension) => core::iter::once(comprehension.elt.as_ref())
+            .chain(generator_parts(&comprehension.generators))
+            .collect(),
+        Expr::GeneratorExp(comprehension) => core::iter::once(comprehension.elt.as_ref())
+            .chain(generator_parts(&comprehension.generators))
+            .collect(),
+        Expr::DictComp(comprehension) => [comprehension.key.as_ref(), comprehension.value.as_ref()]
+            .into_iter()
+            .chain(generator_parts(&comprehension.generators))
+            .collect(),
+        Expr::Await(awaited) => vec![awaited.value.as_ref()],
+        Expr::Yield(yielded) => yielded.value.as_deref().into_iter().collect(),
+        Expr::YieldFrom(yielded) => vec![yielded.value.as_ref()],
+        Expr::Compare(comparison) => compare_operands(comparison),
+        Expr::Call(call) => core::iter::once(call.func.as_ref())
+            .chain(call_arguments(call))
+            .collect(),
+        Expr::FormattedValue(formatted) => core::iter::once(formatted.value.as_ref())
+            .chain(formatted.format_spec.as_deref())
+            .collect(),
+        Expr::JoinedStr(joined) => joined.values.iter().collect(),
+        Expr::Constant(_) | Expr::Name(_) => Vec::new(),
+        Expr::Attribute(attribute) => vec![attribute.value.as_ref()],
+        Expr::Subscript(subscript) => vec![subscript.value.as_ref(), subscript.slice.as_ref()],
+        Expr::Starred(starred) => vec![starred.value.as_ref()],
+        Expr::List(list) => list.elts.iter().collect(),
+        Expr::Tuple(tuple) => tuple.elts.iter().collect(),
+        Expr::Slice(slice) => [
+            slice.lower.as_deref(),
+            slice.upper.as_deref(),
+            slice.step.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    }
+}
+
+/// The expressions a comprehension's `for` clauses evaluate: each target,
+/// iterable and filter.
+fn generator_parts(generators: &[ast::Comprehension]) -> impl Iterator<Item = &Expr> {
+    generators.iter().flat_map(|clause| {
+        [&clause.target, &clause.iter]
+            .into_iter()
+            .chain(clause.ifs.iter())
+    })
 }
 
 /// Whether evaluating `expr` costs nothing at all.

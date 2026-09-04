@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use landav_bound::{Bound, Origin, VarId};
 use landav_its::{
     CondId, Construct, CostEffect, DeclaredEffect, ExprId, Extent, NodeId, RangeSpec, SourceCond,
-    SourceExpr, SourceProgram, SourceStmt, StmtId, VarName,
+    SourceExpr, SourceProgram, SourceStmt, StmtId, VarName, Writes,
 };
 
 use crate::{expr_bound, hole::Hole, summation, trip_count::TripCount};
@@ -270,13 +270,14 @@ impl<'a> Walk<'a> {
                 construct,
                 extent,
                 declared,
+                writes,
                 ..
             } => {
                 let (extent, declared) = (*extent, *declared);
                 self.charged.insert(NodeId::Stmt(id));
-                // `Walk::region` is what forgets every readable value here; see
-                // the invariant recorded there.
-                let region = self.region(*construct, declared, self.stmt_origin(id));
+                // `Walk::region` is what forgets readable values here; see the
+                // invariant recorded there.
+                let region = self.region(*construct, declared, writes, self.stmt_origin(id));
                 match extent {
                     Extent::Statement => region.then(TripCount::Exact(Bound::one())),
                     Extent::Fragment => region,
@@ -590,9 +591,12 @@ impl<'a> Walk<'a> {
     /// # The invariant this is the single enforcement point for
     ///
     /// An unanalysable region may assign to anything, so **no earlier value
-    /// survives it**. The engine keeps no assignment environment, and holing a
-    /// call is sound *because* of that absence: nothing downstream may be
-    /// derived from a value the region could have changed.
+    /// survives it** - unless the program says which names the region can
+    /// reach, in which case exactly those are forgotten. The engine keeps no
+    /// assignment environment, and holing a call is sound *because* of that
+    /// absence: nothing downstream may be derived from a value the region
+    /// could have changed. See [`rebound`] for the one place the per-node
+    /// answer and the per-kind answer are combined.
     ///
     /// That rule used to be written at one of the three callers - the statement
     /// arm - which made it true for statements and silently false for
@@ -626,30 +630,45 @@ impl<'a> Walk<'a> {
         &mut self,
         construct: Construct,
         declared: Option<DeclaredEffect>,
+        writes: &Writes,
         origin: Origin,
     ) -> TripCount {
-        let rebinds = declared.map_or_else(
-            || construct.may_rebind_locals(),
-            DeclaredEffect::rebinds_locals,
-        );
         // A declaration that *also* claims not to mutate an argument keeps
         // everything, volatile names included. Nothing admitted so far claims
         // that - an `__instancecheck__` is user code and may call
         // `items.append(...)` - and the field exists so that a signature which
         // can claim it has somewhere to say so.
-        let mutates = declared.is_none_or(DeclaredEffect::mutates_arguments);
-        if rebinds {
-            self.readable.clear();
-        } else if mutates {
-            // A read runs foreign code, and foreign code cannot rebind a name in
-            // *this* frame - see `Construct::may_rebind_locals`, where that
-            // argument lives. What it can do is mutate an object, so anything
-            // standing for a property of one goes: a `property` getter is free
-            // to call `items.append(...)`, and `len(items)` on entry is then not
-            // the length the loop below runs over. Which names are of that kind
-            // is the frontend's to say, and it says so in the program.
-            let program = self.program;
-            self.readable.retain(|name| !program.is_volatile(name));
+        // A refusal answers the same question through `Writes`: `total = 0`
+        // touches no object, and a length read on entry survives it.
+        let mutates = declared.map_or_else(
+            || writes.mutates_objects(),
+            DeclaredEffect::mutates_arguments,
+        );
+        match rebound(construct, declared, writes) {
+            None => self.readable.clear(),
+            Some(names) => {
+                // `LAN-100`: a refused binding forgets the name it binds and
+                // nothing else. `total = <unreadable>` rebinds `total`; it
+                // cannot change how many entries a mapping three lines below
+                // has, and before this it did - the kind's answer for a
+                // `non-integer-value` is "anything", so this cleared the frame.
+                for name in &names {
+                    self.readable.remove(name);
+                }
+                if mutates {
+                    // A read runs foreign code, and foreign code cannot rebind
+                    // a name in *this* frame - see
+                    // `Construct::may_rebind_locals`, where that argument
+                    // lives. What it can do is mutate an object, so anything
+                    // standing for a property of one goes: a `property` getter
+                    // is free to call `items.append(...)`, and `len(items)` on
+                    // entry is then not the length the loop below runs over.
+                    // Which names are of that kind is the frontend's to say,
+                    // and it says so in the program.
+                    let program = self.program;
+                    self.readable.retain(|name| !program.is_volatile(name));
+                }
+            }
         }
         if let Some(effect) = declared {
             // Not a hole: the cost is known, so there is nothing to name and
@@ -684,6 +703,7 @@ impl<'a> Walk<'a> {
                 construct,
                 bounded_by,
                 declared,
+                writes,
                 ..
             }) = self.program.expr(id)
             else {
@@ -703,7 +723,7 @@ impl<'a> Walk<'a> {
             }
             let (construct, declared, origin) = (*construct, *declared, self.expr_origin(id));
             self.charged.insert(NodeId::Expr(id));
-            let region = self.region(construct, declared, origin);
+            let region = self.region(construct, declared, writes, origin);
             total = total.then(region);
         }
         total
@@ -717,12 +737,13 @@ impl<'a> Walk<'a> {
                 Some(SourceCond::Unsupported {
                     construct,
                     declared,
+                    writes,
                     ..
                 }) => {
                     let (construct, declared, origin) =
                         (*construct, *declared, self.cond_origin(id));
                     self.charged.insert(NodeId::Cond(id));
-                    let region = self.region(construct, declared, origin);
+                    let region = self.region(construct, declared, writes, origin);
                     total = total.then(region);
                 }
                 Some(SourceCond::Compare { left, right, .. }) => {
@@ -990,9 +1011,7 @@ fn writes_of(program: &SourceProgram, body: &[StmtId]) -> Option<BTreeSet<VarNam
         let stmt = program.stmt(id)?;
         match stmt {
             SourceStmt::Assign { target, value } => {
-                if expr_has_region(program, *value) {
-                    return None;
-                }
+                names.extend(expr_writes(program, *value)?);
                 names.insert(target.clone());
             }
             // Neither leaving the function nor abandoning a body assigns to
@@ -1015,15 +1034,11 @@ fn writes_of(program: &SourceProgram, body: &[StmtId]) -> Option<BTreeSet<VarNam
                 then_body,
                 else_body,
             } => {
-                if cond_has_region(program, *cond) {
-                    return None;
-                }
+                names.extend(cond_writes(program, *cond)?);
                 work.extend(then_body.iter().chain(else_body).copied());
             }
             SourceStmt::While { cond, body } => {
-                if cond_has_region(program, *cond) {
-                    return None;
-                }
+                names.extend(cond_writes(program, *cond)?);
                 work.extend(body.iter().copied());
             }
             SourceStmt::ForRange {
@@ -1031,9 +1046,8 @@ fn writes_of(program: &SourceProgram, body: &[StmtId]) -> Option<BTreeSet<VarNam
                 range,
                 body,
             } => {
-                if expr_has_region(program, range.start) || expr_has_region(program, range.stop) {
-                    return None;
-                }
+                names.extend(expr_writes(program, range.start)?);
+                names.extend(expr_writes(program, range.stop)?);
                 names.insert(target.clone());
                 work.extend(body.iter().copied());
             }
@@ -1043,10 +1057,16 @@ fn writes_of(program: &SourceProgram, body: &[StmtId]) -> Option<BTreeSet<VarNam
             // before a loop body containing one is walked, which costs the loop
             // its own endpoint - the failure this declaration exists to remove,
             // one nesting level down.
-            SourceStmt::Unsupported { declared, .. } => match declared {
-                Some(effect) if !effect.rebinds_locals() => {}
-                _ => return None,
-            },
+            //
+            // A refused statement that says which names it may rebind writes
+            // those - `total = <unreadable>` writes `total` - and one that says
+            // nothing writes whatever its kind may. See `rebound`.
+            SourceStmt::Unsupported {
+                construct,
+                declared,
+                writes,
+                ..
+            } => names.extend(rebound(*construct, *declared, writes)?),
         }
     }
     Some(names)
@@ -1101,7 +1121,33 @@ fn exits_within(program: &SourceProgram, id: StmtId) -> bool {
     false
 }
 
-/// Whether an expression contains a node this engine cannot read.
+/// The locals a node may have rebound, or `None` if it may have rebound any.
+///
+/// The one place the three answers are combined, so that no walk consults one
+/// and forgets another:
+///
+/// 1. a [`DeclaredEffect`] speaks for the node outright - it is not a refusal;
+/// 2. otherwise the node's own [`Writes`], which a frontend that saw the node
+///    can narrow (`total = <unreadable>` rebinds `total`) or widen (a walrus
+///    hidden in an operand it did not translate);
+/// 3. otherwise [`Construct::may_rebind_locals`], the answer for the kind.
+///
+/// `LAN-100`. The order matters and is the same one `Walk::region` has always
+/// used for the declaration; what is new is the middle step.
+fn rebound(
+    construct: Construct,
+    declared: Option<DeclaredEffect>,
+    writes: &Writes,
+) -> Option<BTreeSet<VarName>> {
+    match declared {
+        Some(effect) if effect.rebinds_locals() => None,
+        Some(_) => Some(BTreeSet::new()),
+        None => writes.rebound(construct).cloned(),
+    }
+}
+
+/// The locals an expression's regions may rebind, or `None` if any of them
+/// may rebind anything.
 ///
 /// A refusal that names an expression dominating its magnitude does not count.
 /// It is an arithmetic operator with no representation here, not an unknown
@@ -1109,33 +1155,46 @@ fn exits_within(program: &SourceProgram, id: StmtId) -> bool {
 /// contains one still writes exactly its own target. See
 /// [`SourceExpr::Unsupported`] and `Walk::expr_regions`, which draws the same
 /// line for the same reason.
-fn expr_has_region(program: &SourceProgram, root: ExprId) -> bool {
-    expr_nodes(program, root).into_iter().any(|id| {
-        matches!(
-            program.expr(id),
-            Some(SourceExpr::Unsupported {
-                bounded_by: None,
-                declared: None,
-                ..
-            })
-        )
-    })
+fn expr_writes(program: &SourceProgram, root: ExprId) -> Option<BTreeSet<VarName>> {
+    let mut names = BTreeSet::new();
+    for id in expr_nodes(program, root) {
+        let Some(SourceExpr::Unsupported {
+            construct,
+            bounded_by,
+            declared,
+            writes,
+            ..
+        }) = program.expr(id)
+        else {
+            continue;
+        };
+        if bounded_by.is_some() {
+            continue;
+        }
+        names.extend(rebound(*construct, *declared, writes)?);
+    }
+    Some(names)
 }
 
-/// Whether a condition contains a node this engine cannot read.
-fn cond_has_region(program: &SourceProgram, root: CondId) -> bool {
-    cond_nodes(program, root).into_iter().any(|id| {
+/// The locals a condition's regions may rebind, or `None` if any of them may
+/// rebind anything.
+fn cond_writes(program: &SourceProgram, root: CondId) -> Option<BTreeSet<VarName>> {
+    let mut names = BTreeSet::new();
+    for id in cond_nodes(program, root) {
         match program.cond(id) {
-            // A declared node is not a region for the same reason a `bounded_by`
-            // refusal is not: its *effect* is known. It costs a constant and
-            // assigns to nothing, so a name read across it still holds the value
-            // the caller supplied - which is the entire point of declaring it.
-            Some(SourceCond::Unsupported { declared, .. }) => declared.is_none(),
+            Some(SourceCond::Unsupported {
+                construct,
+                declared,
+                writes,
+                ..
+            }) => names.extend(rebound(*construct, *declared, writes)?),
             Some(SourceCond::Compare { left, right, .. }) => {
-                expr_has_region(program, *left) || expr_has_region(program, *right)
+                names.extend(expr_writes(program, *left)?);
+                names.extend(expr_writes(program, *right)?);
             }
             // `And`, `Or` and `Not` are already in the walk's output.
-            _ => false,
+            _ => {}
         }
-    })
+    }
+    Some(names)
 }
