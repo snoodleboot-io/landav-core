@@ -295,14 +295,15 @@ def stored(self, items: list) -> int:
 // 3 · what still forgets the frame, pinned so the narrowing cannot widen
 // ---------------------------------------------------------------------------
 
-/// **An unknown call still forgets the frame.** `event_name.split(".")` is the
-/// case from the ticket, and it is deliberately *not* fixed here: a callee the
-/// signature pack does not account for may be a closure over this frame, and
-/// the pack is the place to say otherwise, per callee.
+/// **An unknown call still forgets the frame.** `event_name.split(".")` was
+/// the case from the ticket, and `LAN-103` fixed it for a receiver annotated
+/// `str` through a pack row; see `call_rows.rs`. On an *unannotated* receiver
+/// the callee may be anything, including a closure over this frame, and the
+/// pack is the only place to say otherwise, per callee.
 #[test]
 fn an_unknown_call_still_forgets_the_frame() {
     let source = "\
-def split_first(meta: dict, event_name: str) -> int:
+def split_first(meta: dict, event_name) -> int:
     event_path = event_name.split('.')
     n = 0
     for k, v in meta.items():

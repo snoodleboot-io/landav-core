@@ -657,18 +657,19 @@ pub fn arb_havoc_body() -> impl Strategy<Value = Vec<StmtSpec>> {
                 }),
             1 => (0_i64..4, prop::collection::vec(inner.clone(), 0..3))
                 .prop_map(|(trips, body)| StmtSpec::While { trips, body }),
-            // Half the loops are `for i in range(0, n)`: the one symbolic
-            // shape `count_of` counts, and therefore the only loop whose
-            // endpoint a refusal above it can be seen to have kept or lost.
+            // `LAN-102` counts `range(k, n)` and `range(n, k, -1)` for any
+            // literal `k`, so a literal endpoint and the parameter is enough
+            // for a loop whose count a refusal above it can be seen to have
+            // kept or lost. Strides above one are uncounted by design and are
+            // drawn less often for it.
             6 => (
                     0_usize..MUTABLE.len(),
-                    prop_oneof![
-                        1 => (endpoint(), endpoint(), prop_oneof![Just(1_i64), Just(2), Just(-1), Just(-2)]),
-                        1 => Just((ExprSpec::Int(0), ExprSpec::Var(MUTABLE.len()), 1_i64)),
-                    ],
+                    endpoint(),
+                    endpoint(),
+                    prop_oneof![2 => Just(1_i64), 2 => Just(-1), 1 => Just(2), 1 => Just(-2)],
                     prop::collection::vec(inner, 0..3),
                 )
-                .prop_map(|(target, (start, stop, step), body)| StmtSpec::For {
+                .prop_map(|(target, start, stop, step, body)| StmtSpec::For {
                     target, start, stop, step, body
                 }),
         ]
