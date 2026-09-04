@@ -50,10 +50,10 @@ use landav_engine::{Hole, cost};
 use proptest::{prelude::*, strategy::ValueTree as _, test_runner::TestRunner};
 
 use crate::{
-    reference::{Ending, State, interpret},
+    reference::{Ending, State, interpret, interpret_with},
     support::{
-        ExprSpec, MUTABLE, Materialiser, PARAMS, StmtSpec, arb_body, arb_raising_body, arb_state,
-        raises_inside_a_loop,
+        ExprSpec, MUTABLE, Materialiser, PARAMS, StmtSpec, arb_body, arb_havoc_body,
+        arb_raising_body, arb_state, raises_inside_a_loop,
     },
 };
 
@@ -89,6 +89,46 @@ fn reported(program: &landav_its::SourceProgram, state: &State) -> Option<(bool,
     }
     let bound = derived.bound()?;
     Some((derived.is_exact(), bound.eval(&Inputs(state.clone()))))
+}
+
+/// The reported cost at `state` once every refused **binding** is filled in,
+/// or `None` when something else is still unknown.
+///
+/// # Why a refused binding's hole is filled with zero
+///
+/// The engine charges a refused statement as its own step plus a hole standing
+/// for the cost of the region - and a refused binding, as the reference
+/// interprets it, *is* one step: it binds a name and does nothing else. So the
+/// region's cost is nothing beyond the step already charged, and zero is the
+/// truth rather than a convenient value. Every other hole - a `while`, a
+/// counted loop that lost its endpoint - stands for real unknown work, and a
+/// bound still mentioning one makes no finite claim, so the case is skipped as
+/// the properties above skip a `Partial` result.
+///
+/// What is left is a bound in the caller's parameters that the engine derived
+/// **past** the refused bindings, and that is exactly the claim `LAN-100`
+/// makes: the values it kept reading across them were values the refusals
+/// could not have changed.
+fn reported_past_refused_bindings(
+    program: &landav_its::SourceProgram,
+    state: &State,
+) -> Option<Nat> {
+    let derived = cost(program);
+    let mut bound = derived.bound()?.clone();
+    for hole in derived.holes() {
+        if hole.construct() == "non-integer-value" {
+            bound = bound.subst(&hole.var(), &Bound::zero());
+        }
+    }
+    if bound.vars().iter().any(Hole::is_hole) {
+        return None;
+    }
+    assert!(
+        mentions_only_supplied(&bound, true),
+        "filled past its refused bindings, the bound {bound} mentions a name the \
+         caller cannot supply"
+    );
+    Some(bound.eval(&Inputs(state.clone())))
 }
 
 /// Whether a bound mentions anything the caller cannot supply.
@@ -519,6 +559,165 @@ fn the_corpus_produces_complete_bounds_to_compare() {
         "only {exact} of {compared} complete bound(s) was exact, so \
          `an_exact_bound_equals_the_truth` asserted almost nothing - and it is \
          the only test that distinguishes `Theta` from `O`"
+    );
+}
+
+/// **The havoc corpus derives bounds past refused bindings, in the parameter.**
+///
+/// The vacuity guard for `a_bound_derived_past_a_refused_binding_is_never_exceeded`.
+/// A generator whose refused bindings always cleared the frame - the behaviour
+/// before `LAN-100` - would leave every case skipped at the first counted loop
+/// past one, and the property green and empty. Measured rather than assumed.
+#[test]
+fn the_havoc_corpus_reads_the_parameter_past_refused_bindings() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = (arb_havoc_body(), arb_state());
+
+    let mut examined = 0_usize;
+    let mut compared = 0_usize;
+    let mut in_the_parameter = 0_usize;
+    for _ in 0..512 {
+        let Ok(case) = strategy.new_tree(&mut runner) else {
+            continue;
+        };
+        let (body, initial): (Vec<StmtSpec>, State) = case.current();
+        let (program, oracle) = Materialiser::new("havoc").finish_with_oracle(&body);
+        if !is_natural(&initial) {
+            continue;
+        }
+        let run = interpret_with(&program, &initial, STEP_BUDGET, &oracle);
+        if run.ending != Ending::Terminated {
+            continue;
+        }
+        examined += 1;
+        if reported_past_refused_bindings(&program, &initial).is_some() {
+            compared += 1;
+            let derived = cost(&program);
+            let mentions_parameter = derived.bound().is_some_and(|bound| {
+                bound
+                    .vars()
+                    .iter()
+                    .any(|var| PARAMS.contains(&var.symbol().as_str()))
+            });
+            if mentions_parameter {
+                in_the_parameter += 1;
+            }
+        }
+    }
+
+    assert!(examined > 0, "no generated program ran to completion");
+    assert!(
+        compared * 10 >= examined,
+        "only {compared} of {examined} program(s) produced a bound past their \
+         refused bindings, so the property above is close to vacuous"
+    );
+    // The bar is five, against a measured eight of thirty-eight at the time of
+    // writing, after `LAN-102` removed the bias that drew half the corpus's
+    // loops as `range(0, n)`. What this catches is the rate going to nothing.
+    assert!(
+        in_the_parameter >= 5,
+        "only {in_the_parameter} of {compared} bound(s) derived past a refused \
+         binding mention the parameter - the case `LAN-100` exists for, and the \
+         only one where forgetting too little would show"
+    );
+}
+
+/// **The witness: a refused binding of a local keeps the parameter readable.**
+///
+/// `x = <unreadable>; for i in range(0, n): a = 0`, spelled out rather than
+/// generated, so that the thing `LAN-100` buys is asserted once in the plainest
+/// possible terms: the bound is a function of `n`, and the only hole is the
+/// refusal itself.
+#[test]
+fn a_refused_binding_of_a_local_keeps_the_parameter_readable() {
+    let body = vec![
+        StmtSpec::Havoc {
+            target: 0,
+            value: 7,
+        },
+        StmtSpec::For {
+            target: 1,
+            start: ExprSpec::Int(0),
+            stop: ExprSpec::Var(3),
+            step: 1,
+            body: vec![StmtSpec::Assign {
+                target: 2,
+                value: ExprSpec::Int(0),
+            }],
+        },
+    ];
+    let (program, oracle) = Materialiser::new("witness").finish_with_oracle(&body);
+    let derived = cost(&program);
+    let bound = derived
+        .bound()
+        .expect("a loop over the parameter has a bound");
+    assert!(
+        bound.vars().iter().any(|var| var.symbol().as_str() == "n"),
+        "the bound {bound} must be a function of `n`: the refused binding of `a` \
+         cannot have changed it"
+    );
+    let holes: Vec<&str> = derived.holes().iter().map(Hole::construct).collect();
+    assert_eq!(
+        holes,
+        vec!["non-integer-value"],
+        "the refusal is the only region; the loop must be counted, not holed"
+    );
+
+    let initial: State = [("n".to_owned(), 5_i128)].into_iter().collect();
+    let run = interpret_with(&program, &initial, STEP_BUDGET, &oracle);
+    assert_eq!(run.ending, Ending::Terminated);
+    let reported = reported_past_refused_bindings(&program, &initial)
+        .expect("nothing but the refusal is unknown");
+    assert!(
+        reported.magnitude_cmp(Nat::Fin(run.charged)) != core::cmp::Ordering::Less,
+        "reported {reported:?} for a run costing {}",
+        run.charged
+    );
+}
+
+/// **The witness's converse: a refused binding of the parameter forgets it.**
+///
+/// `n = <unreadable>; for i in range(0, n): a = 0`. The environment chooses
+/// forty, the caller passed two, and a bound that still read `n` would be
+/// exceeded twentyfold. The engine must lose the endpoint instead: the loop is
+/// a hole, and the bound mentions no `n` at all.
+#[test]
+fn a_refused_binding_of_the_parameter_forgets_it() {
+    let body = vec![
+        StmtSpec::Havoc {
+            target: 3,
+            value: 40,
+        },
+        StmtSpec::For {
+            target: 1,
+            start: ExprSpec::Int(0),
+            stop: ExprSpec::Var(3),
+            step: 1,
+            body: vec![StmtSpec::Assign {
+                target: 2,
+                value: ExprSpec::Int(0),
+            }],
+        },
+    ];
+    let (program, oracle) = Materialiser::new("witness").finish_with_oracle(&body);
+    let derived = cost(&program);
+    let bound = derived.bound().expect("the engine is total");
+    assert!(
+        !bound.vars().iter().any(|var| var.symbol().as_str() == "n"),
+        "the bound {bound} reads `n` past a statement that rebound it"
+    );
+    assert!(
+        derived.holes().iter().any(|hole| hole.construct() == "for"),
+        "the loop lost its endpoint and must be a hole; holes are {:?}",
+        derived.holes()
+    );
+
+    let initial: State = [("n".to_owned(), 2_i128)].into_iter().collect();
+    let run = interpret_with(&program, &initial, STEP_BUDGET, &oracle);
+    assert_eq!(run.ending, Ending::Terminated);
+    assert!(
+        reported_past_refused_bindings(&program, &initial).is_none(),
+        "with the loop holed there is no finite claim to make"
     );
 }
 

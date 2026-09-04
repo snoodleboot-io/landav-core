@@ -9,6 +9,7 @@ use crate::{
     construct::Construct, declared_effect::DeclaredEffect, expr_id::ExprId, extent::Extent,
     range_spec::RangeSpec, source_cond::SourceCond, source_expr::SourceExpr,
     source_program::SourceProgram, source_stmt::SourceStmt, stmt_id::StmtId, var_name::VarName,
+    writes::Writes,
 };
 
 /// Builds a [`SourceProgram`] node by node.
@@ -108,6 +109,7 @@ impl SourceProgramBuilder {
                 bounded_by: None,
                 evaluates: Vec::new(),
                 declared: None,
+                writes: Writes::unstated(),
             },
             origin,
         )
@@ -127,6 +129,7 @@ impl SourceProgramBuilder {
                 bounded_by: None,
                 evaluates: Vec::new(),
                 declared: None,
+                writes: Writes::unstated(),
             },
             origin,
         )
@@ -152,6 +155,7 @@ impl SourceProgramBuilder {
                 bounded_by: Some(bounded_by),
                 evaluates: Vec::new(),
                 declared: None,
+                writes: Writes::unstated(),
             },
             origin,
         )
@@ -171,6 +175,31 @@ impl SourceProgramBuilder {
         evaluates: Vec<ExprId>,
         origin: Origin,
     ) -> ExprId {
+        self.unsupported_expr_evaluating_writing(
+            construct,
+            detail,
+            evaluates,
+            Writes::unstated(),
+            origin,
+        )
+    }
+
+    /// [`SourceProgramBuilder::unsupported_expr_evaluating`], saying which
+    /// locals evaluating the node may rebind.
+    ///
+    /// The shape of a call the frontend can say *that much* about and no more:
+    /// a signature row that declares the callee cannot rebind a local of the
+    /// caller's frame, while its cost stays unbounded. The node is still a
+    /// hole - `list(x)` is linear in a size this analysis cannot see - and the
+    /// loop below it keeps its trip count. `LAN-103`.
+    pub fn unsupported_expr_evaluating_writing(
+        &mut self,
+        construct: Construct,
+        detail: impl Into<Symbol>,
+        evaluates: Vec<ExprId>,
+        writes: Writes,
+        origin: Origin,
+    ) -> ExprId {
         self.push_expr(
             SourceExpr::Unsupported {
                 construct,
@@ -178,6 +207,7 @@ impl SourceProgramBuilder {
                 bounded_by: None,
                 evaluates,
                 declared: None,
+                writes,
             },
             origin,
         )
@@ -212,6 +242,33 @@ impl SourceProgramBuilder {
                 bounded_by: None,
                 evaluates,
                 declared: Some(declared),
+                writes: Writes::unstated(),
+            },
+            origin,
+        )
+    }
+
+    /// An expression the frontend could not translate, saying which locals
+    /// evaluating it may rebind.
+    ///
+    /// The refusal is unchanged - the node is still a hole and still a reason
+    /// the program does not lower - and only its *effect* is narrowed. See
+    /// [`Writes`] for what a frontend may claim and what it owes for the claim.
+    pub fn unsupported_expr_writing(
+        &mut self,
+        construct: Construct,
+        detail: Option<Symbol>,
+        writes: Writes,
+        origin: Origin,
+    ) -> ExprId {
+        self.push_expr(
+            SourceExpr::Unsupported {
+                construct,
+                detail,
+                bounded_by: None,
+                evaluates: Vec::new(),
+                declared: None,
+                writes,
             },
             origin,
         )
@@ -252,6 +309,7 @@ impl SourceProgramBuilder {
                 construct,
                 detail: None,
                 declared: None,
+                writes: Writes::unstated(),
             },
             origin,
         )
@@ -275,6 +333,7 @@ impl SourceProgramBuilder {
                 construct,
                 detail: Some(detail.into()),
                 declared: Some(declared),
+                writes: Writes::unstated(),
             },
             origin,
         )
@@ -292,6 +351,28 @@ impl SourceProgramBuilder {
                 construct,
                 detail: Some(detail.into()),
                 declared: None,
+                writes: Writes::unstated(),
+            },
+            origin,
+        )
+    }
+
+    /// A condition the frontend could not translate, saying which locals
+    /// evaluating it may rebind. The condition counterpart of
+    /// [`SourceProgramBuilder::unsupported_expr_writing`].
+    pub fn unsupported_cond_writing(
+        &mut self,
+        construct: Construct,
+        detail: Option<Symbol>,
+        writes: Writes,
+        origin: Origin,
+    ) -> CondId {
+        self.push_cond(
+            SourceCond::Unsupported {
+                construct,
+                detail,
+                declared: None,
+                writes,
             },
             origin,
         )
@@ -414,12 +495,31 @@ impl SourceProgramBuilder {
         extent: Extent,
         origin: Origin,
     ) -> StmtId {
+        self.unsupported_stmt_writing(construct, detail, extent, Writes::unstated(), origin)
+    }
+
+    /// A statement the frontend could not translate, saying which locals it
+    /// may rebind.
+    ///
+    /// The shape of a refused *binding*: `total = <unreadable>` is still
+    /// refused, and it rebinds `total` and nothing else, so a value the engine
+    /// knew for any other name survives it. See [`Writes`], and `LAN-100` for
+    /// the measurement that made this the next thing to build.
+    pub fn unsupported_stmt_writing(
+        &mut self,
+        construct: Construct,
+        detail: Option<Symbol>,
+        extent: Extent,
+        writes: Writes,
+        origin: Origin,
+    ) -> StmtId {
         self.push_stmt(
             SourceStmt::Unsupported {
                 construct,
                 detail,
                 extent,
                 declared: None,
+                writes,
             },
             origin,
         )
@@ -446,6 +546,7 @@ impl SourceProgramBuilder {
                 detail,
                 extent,
                 declared: Some(declared),
+                writes: Writes::unstated(),
             },
             origin,
         )

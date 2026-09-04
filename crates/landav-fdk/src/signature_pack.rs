@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::{pack_error::PackError, signature::Signature};
+use crate::{pack_error::PackError, result_length::ResultLength, signature::Signature};
 
 /// The OSS builtin pack, as data.
 ///
@@ -122,6 +122,36 @@ impl SignaturePack {
         Some(row)
     }
 
+    /// What `callee`'s result's length is, if this pack declares it and the
+    /// name is not bound in the source being analysed.
+    ///
+    /// # Two accessors, one shadowing gate, two admissibility gates
+    ///
+    /// This is deliberately **not** [`Self::signature`] with a different field
+    /// read off the end. The two answer different questions and admit different
+    /// rows, and `sorted` is the row that proves it: `signature` refuses it,
+    /// because its cost is `n log n` and no frontend may treat the call as
+    /// discharged; this one admits it, because its result holds exactly as many
+    /// values as its argument. A frontend that asked one question and used the
+    /// other answer would publish a complete bound for a program that sorts.
+    ///
+    /// What the two share is the shadowing rule, and they share it because it
+    /// is about the *name* rather than about the claim: a module that writes
+    /// `def sorted(x)` is not calling the builtin, and neither the cost nor the
+    /// length of a callee this pack has never seen is anything to declare. See
+    /// the type's own note for what that rule does and does not cover.
+    #[must_use]
+    pub fn length_relation<F>(&self, callee: &str, bound_names: F) -> Option<ResultLength>
+    where
+        F: FnOnce(&str) -> bool,
+    {
+        let row = self.rows.get(callee)?;
+        if !row.result_length.is_declared() || bound_names(callee) {
+            return None;
+        }
+        Some(row.result_length)
+    }
+
     /// The row for `callee`, resolvable or not.
     ///
     /// For a reader of the table - a report, a test - rather than for a
@@ -180,6 +210,56 @@ mod tests {
                 "`{callee}` must not be resolvable"
             );
         }
+    }
+
+    #[test]
+    fn a_length_relation_is_a_separate_claim_from_a_cost() {
+        let pack = SignaturePack::builtin().expect("the shipped pack must parse");
+        assert!(
+            pack.signature("sorted", |_| false).is_none(),
+            "`sorted` costs n log n and no frontend may treat the call as discharged"
+        );
+        assert_eq!(
+            pack.length_relation("sorted", |_| false),
+            Some(ResultLength::ExactlyArgument0),
+            "and its result still holds exactly as many values as its argument"
+        );
+    }
+
+    #[test]
+    fn a_set_declares_an_upper_bound_and_never_an_equality() {
+        let pack = SignaturePack::builtin().expect("the shipped pack must parse");
+        for callee in ["set", "frozenset"] {
+            assert_eq!(
+                pack.length_relation(callee, |_| false),
+                Some(ResultLength::AtMostArgument0),
+                "`{callee}` collapses equal elements, so its length is an inequality"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_declaring_no_length_confers_none() {
+        let pack = SignaturePack::builtin().expect("the shipped pack must parse");
+        for callee in ["isinstance", "join", "print", "append"] {
+            assert_eq!(
+                pack.length_relation(callee, |_| false),
+                None,
+                "`{callee}` says nothing about its result's length, so it confers none"
+            );
+        }
+        assert_eq!(pack.length_relation("mystery", |_| false), None);
+    }
+
+    #[test]
+    fn a_shadowed_name_gets_no_length_relation() {
+        let pack = SignaturePack::builtin().expect("the shipped pack must parse");
+        assert!(pack.length_relation("sorted", |_| false).is_some());
+        assert!(
+            pack.length_relation("sorted", |name| name == "sorted")
+                .is_none(),
+            "a module that binds `sorted` is not calling this one"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use landav_bound::Symbol;
 
 use crate::{
     compare_op::CompareOp, cond_id::CondId, construct::Construct, declared_effect::DeclaredEffect,
-    expr_id::ExprId,
+    expr_id::ExprId, writes::Writes,
 };
 
 /// A truth-valued condition, as one arena node.
@@ -80,5 +80,8 @@ pub enum SourceCond {
         /// What the frontend can nevertheless say about this node's cost and
         /// effect, if anything.
         declared: Option<DeclaredEffect>,
+        /// Which locals of the frame evaluating this may rebind, if the
+        /// frontend can say. See [`Writes`].
+        writes: Writes,
     },
 }

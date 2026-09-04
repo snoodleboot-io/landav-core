@@ -4,7 +4,7 @@ use landav_bound::Symbol;
 
 use crate::{
     cond_id::CondId, construct::Construct, declared_effect::DeclaredEffect, expr_id::ExprId,
-    extent::Extent, range_spec::RangeSpec, stmt_id::StmtId, var_name::VarName,
+    extent::Extent, range_spec::RangeSpec, stmt_id::StmtId, var_name::VarName, writes::Writes,
 };
 
 /// A statement, as one arena node.
@@ -175,5 +175,9 @@ pub enum SourceStmt {
         /// decides whether the source step is charged here or by the statement
         /// beside it. See [`DeclaredEffect`].
         declared: Option<DeclaredEffect>,
+        /// Which locals of the frame this statement may rebind, if the
+        /// frontend can say. A refused binding of one name says that name;
+        /// see [`Writes`].
+        writes: Writes,
     },
 }

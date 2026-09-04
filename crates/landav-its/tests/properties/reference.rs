@@ -25,8 +25,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use landav_its::{
-    ArithOp, CompareOp, CondId, Constraint, ExprId, Its, LocationId, Polynomial, Relation,
-    SourceCond, SourceExpr, SourceProgram, SourceStmt, StmtId, Transition,
+    ArithOp, CompareOp, CondId, Constraint, ExprId, Extent, Its, Locals, LocationId, Polynomial,
+    Relation, SourceCond, SourceExpr, SourceProgram, SourceStmt, StmtId, Transition,
 };
 
 /// A valuation of named integer variables.
@@ -36,6 +36,17 @@ use landav_its::{
 /// reference could not do without reproducing the crate's own checked
 /// arithmetic.
 pub type State = BTreeMap<String, i128>;
+
+/// The values the environment supplies to a program's refused bindings, keyed
+/// by the origin of the refused statement.
+///
+/// A refused binding - `x = <something the fragment cannot read>` - has no
+/// value in the program, and that is the point of it: the engine must assume
+/// nothing about what `x` holds afterwards. The reference still has to run the
+/// program, so it is told, per statement, what the environment chose. An
+/// oracle with no entry for a refused statement leaves the run undefined, which
+/// is what every property that predates `LAN-100` relies on.
+pub type Oracle = BTreeMap<String, i128>;
 
 /// How a source-level run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,9 +141,34 @@ enum Flow {
 ///   execute.
 #[must_use]
 pub fn interpret(program: &SourceProgram, initial: &State, budget: u64) -> Run {
+    interpret_with(program, initial, budget, &Oracle::new())
+}
+
+/// [`interpret`], with the environment's answers for refused bindings.
+///
+/// One more clause in the semantics: a refused statement carrying
+/// `Writes::only` of a single name binds that name to whatever `oracle` holds
+/// for the statement's origin, costs one source step if it stands for a whole
+/// statement, and changes nothing else. That is written from
+/// [`landav_its::Writes`] and [`landav_its::SourceStmt::Unsupported`], and it
+/// is the entire claim `LAN-100` makes about such a node.
+#[must_use]
+pub fn interpret_with(
+    program: &SourceProgram,
+    initial: &State,
+    budget: u64,
+    oracle: &Oracle,
+) -> Run {
     let mut state = initial.clone();
     let mut tally = Tally::default();
-    let flow = run_block(program, program.body(), &mut state, &mut tally, budget);
+    let flow = run_block(
+        program,
+        oracle,
+        program.body(),
+        &mut state,
+        &mut tally,
+        budget,
+    );
     Run {
         state,
         steps: tally.steps,
@@ -148,13 +184,14 @@ pub fn interpret(program: &SourceProgram, initial: &State, budget: u64) -> Run {
 
 fn run_block(
     program: &SourceProgram,
+    oracle: &Oracle,
     body: &[StmtId],
     state: &mut State,
     tally: &mut Tally,
     budget: u64,
 ) -> Flow {
     for id in body {
-        let flow = run_stmt(program, *id, state, tally, budget);
+        let flow = run_stmt(program, oracle, *id, state, tally, budget);
         if flow != Flow::Normal {
             return flow;
         }
@@ -164,6 +201,7 @@ fn run_block(
 
 fn run_stmt(
     program: &SourceProgram,
+    oracle: &Oracle,
     id: StmtId,
     state: &mut State,
     tally: &mut Tally,
@@ -199,8 +237,8 @@ fn run_stmt(
             // The test itself, charged once whichever arm is taken.
             tally.charged += 1;
             match decide(program, *cond, state) {
-                Some(true) => run_block(program, then_body, state, tally, budget),
-                Some(false) => run_block(program, else_body, state, tally, budget),
+                Some(true) => run_block(program, oracle, then_body, state, tally, budget),
+                Some(false) => run_block(program, oracle, else_body, state, tally, budget),
                 None => Flow::Undefined,
             }
         }
@@ -219,7 +257,7 @@ fn run_stmt(
             // failing test is not an iteration and costs nothing in the
             // engine's unit; the loop statement itself costs nothing either.
             tally.charged += 1;
-            let flow = run_block(program, body, state, tally, budget);
+            let flow = run_block(program, oracle, body, state, tally, budget);
             if flow != Flow::Normal {
                 return flow;
             }
@@ -255,7 +293,7 @@ fn run_stmt(
                 // statement and none for the test that ends it.
                 tally.charged += 1;
                 state.insert(target.as_str().to_owned(), counter);
-                let flow = run_block(program, body, state, tally, budget);
+                let flow = run_block(program, oracle, body, state, tally, budget);
                 if flow != Flow::Normal {
                     return flow;
                 }
@@ -293,17 +331,17 @@ fn run_stmt(
             handler,
             cleanup,
         } => {
-            let attempted = run_block(program, body, state, tally, budget);
+            let attempted = run_block(program, oracle, body, state, tally, budget);
             let after = match attempted {
                 Flow::Exhausted | Flow::Undefined => return attempted,
                 Flow::Raised if !handler.is_empty() => {
-                    run_block(program, handler, state, tally, budget)
+                    run_block(program, oracle, handler, state, tally, budget)
                 }
                 other => other,
             };
             match after {
                 Flow::Exhausted | Flow::Undefined => after,
-                _ => match run_block(program, cleanup, state, tally, budget) {
+                _ => match run_block(program, oracle, cleanup, state, tally, budget) {
                     // The cleanup completing leaves the body's own outcome in
                     // force; the cleanup raising or returning replaces it.
                     Flow::Normal => after,
@@ -312,9 +350,38 @@ fn run_stmt(
             }
         }
 
-        // A refused construct has no source semantics: the reference declines
-        // rather than inventing one. Programs containing these are never fed
-        // to the soundness property, because `lower` refuses them.
+        // A refused **binding** of one name. Its value is the environment's to
+        // choose, and the oracle is that environment: the statement binds the
+        // name to what the oracle holds for its origin, costs its step, and
+        // changes nothing else. Written from `Writes::only`.
+        SourceStmt::Unsupported {
+            extent,
+            declared: None,
+            writes,
+            ..
+        } if !writes.mutates_objects() => {
+            let Locals::AtMost(names) = writes.locals() else {
+                return Flow::Undefined;
+            };
+            let (Some(name), 1) = (names.iter().next(), names.len()) else {
+                return Flow::Undefined;
+            };
+            let Some(value) = program
+                .stmt_origin(id)
+                .and_then(|origin| oracle.get(origin.as_str()))
+            else {
+                return Flow::Undefined;
+            };
+            if *extent == Extent::Statement {
+                tally.charged += 1;
+            }
+            state.insert(name.as_str().to_owned(), *value);
+            Flow::Normal
+        }
+
+        // Any other refused construct has no source semantics: the reference
+        // declines rather than inventing one. Programs containing these are
+        // never fed to the soundness property, because `lower` refuses them.
         SourceStmt::Unsupported { .. } => Flow::Undefined,
     }
 }

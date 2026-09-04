@@ -53,8 +53,8 @@ use std::{
 use landav_bound::{Origin, Symbol};
 use landav_fdk::{Signature, SignaturePack};
 use landav_its::{
-    ArithOp, CompareOp, CondId, Construct, DeclaredEffect, ExprId, Extent, RangeSpec,
-    SourceProgramBuilder, StmtId, VarName,
+    ArithOp, CompareOp, CondId, Construct, DeclaredEffect, ExprId, Extent, Locals, RangeSpec,
+    SourceProgramBuilder, StmtId, VarName, Writes,
 };
 use rustpython_parser::ast::{self, Constant, Expr, Ranged, Stmt, text_size::TextRange};
 
@@ -221,8 +221,13 @@ fn lower_function(
     // Every name that is bound anywhere this call site can see it: the module's
     // own bindings, this function's parameters, and everything its body binds.
     // A callee found here gets no signature, whatever the pack says.
+    // What the body binds, on its own: a parameter never named here still
+    // holds what the caller passed, which is what lets a method row match its
+    // receiver (`LAN-103`). `None` when the body could not be enumerated, and
+    // that refuses every receiver, as it refuses every callee below.
+    let rebound = bindings_of(function.body);
     let shadowed = module_bound
-        .zip(bindings_of(function.body))
+        .zip(rebound.clone())
         .map(|(module_names, mut names)| {
             names.extend(module_names.iter().cloned());
             names.extend(parameter_names(function));
@@ -236,6 +241,7 @@ fn lower_function(
         integers,
         collections,
         shadowed,
+        rebound,
         pack: builtin_pack(),
         walks: 0,
         discarding: false,
@@ -528,14 +534,43 @@ fn annotation_is_collection(annotation: Option<&Expr>) -> bool {
 
 /// The parameters annotated with a sized builtin collection, in declaration
 /// order.
+///
+/// # A parameter a loop or a `with` rebinds is not one
+///
+/// `items: list` rebound by `for items in rows:` holds, inside and after that
+/// loop, whatever `rows` yielded - and the length the caller supplied is not a
+/// fact about it any more. The program records no such binding: a collection
+/// walk counts on a synthetic counter and binds its target to nothing (see
+/// [`Translator::walk_collection`]), and a `with ... as items` is the same.
+/// So `len(items)` stayed readable across them, and a loop over `items` below
+/// counted by the caller's length. `LAN-101`: such a parameter has no length
+/// variable at all, so nothing downstream can read one.
+///
+/// # A parameter an *assignment* rebinds still is one
+///
+/// Deliberately, and measured. `items = []` is a refused binding carrying
+/// `LAN-100`'s write set - `items` and `len(items)` both, see
+/// [`Translator::rebound_names`] - so the length is forgotten exactly where
+/// the program changes it, and a loop over `items` *above* the assignment is
+/// still counted. Excluding assignments here as well was tried and cost three
+/// of the typed corpus's fifty counted loops, in functions that rebind the
+/// parameter after or inside the loop, for no soundness gain. The rule is:
+/// a rebinding the program records at a statement is handled there; one it
+/// does not record is handled by never declaring the length.
+///
+/// The walk does not descend into a nested `def` - a binding there is that
+/// scope's, not this one's - and a body it cannot enumerate (`match`)
+/// disqualifies every parameter, which costs coverage and never soundness.
 fn collection_parameters(function: Definition<'_>) -> Vec<String> {
     let arguments = function.args;
+    let rebound = target_bindings_of(function.body);
     arguments
         .posonlyargs
         .iter()
         .chain(arguments.args.iter())
         .filter(|parameter| annotation_is_collection(parameter.def.annotation.as_deref()))
         .map(|parameter| parameter.def.arg.to_string())
+        .filter(|name| !rebound.as_ref().is_none_or(|names| names.contains(name)))
         .collect()
 }
 
@@ -547,6 +582,69 @@ fn collection_parameters(function: Definition<'_>) -> Vec<String> {
 /// `Hole` uses for `#hole0`.
 fn length_var(name: &str) -> VarName {
     VarName::new(format!("len({name})"))
+}
+
+/// The names bound by a `for` target or a `with ... as` target anywhere in
+/// `statements`, or `None` if a statement binds names this walk cannot read.
+///
+/// The subset of [`bindings_of`] that [`collection_parameters`] needs: the
+/// binding forms the translated program does **not** record at a statement.
+/// Same descent - every block that shares this scope, never a nested
+/// definition - and the same answer for a `match`.
+fn target_bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let mut work: Vec<&Stmt> = statements.iter().rev().collect();
+    while let Some(statement) = work.pop() {
+        match statement {
+            Stmt::For(node) => {
+                collect_target_names(&node.target, &mut names);
+                work.extend(node.body.iter().chain(node.orelse.iter()));
+            }
+            Stmt::AsyncFor(node) => {
+                collect_target_names(&node.target, &mut names);
+                work.extend(node.body.iter().chain(node.orelse.iter()));
+            }
+            Stmt::With(node) => {
+                for item in &node.items {
+                    if let Some(target) = &item.optional_vars {
+                        collect_target_names(target, &mut names);
+                    }
+                }
+                work.extend(node.body.iter());
+            }
+            Stmt::AsyncWith(node) => {
+                for item in &node.items {
+                    if let Some(target) = &item.optional_vars {
+                        collect_target_names(target, &mut names);
+                    }
+                }
+                work.extend(node.body.iter());
+            }
+            Stmt::While(node) => work.extend(node.body.iter().chain(node.orelse.iter())),
+            Stmt::If(node) => work.extend(node.body.iter().chain(node.orelse.iter())),
+            Stmt::Try(node) => {
+                work.extend(node.body.iter());
+                for handler in &node.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    work.extend(handler.body.iter());
+                }
+                work.extend(node.orelse.iter().chain(node.finalbody.iter()));
+            }
+            Stmt::TryStar(node) => {
+                work.extend(node.body.iter());
+                for handler in &node.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    work.extend(handler.body.iter());
+                }
+                work.extend(node.orelse.iter().chain(node.finalbody.iter()));
+            }
+            Stmt::Match(_) => return None,
+            // Every assignment form is a statement the program records with
+            // its own write set; a nested definition is its own scope.
+            _ => {}
+        }
+    }
+    Some(names)
 }
 
 /// The names that provably hold integers throughout `function`.
@@ -844,6 +942,23 @@ fn walked_display(expr: &Expr) -> Option<(u64, bool)> {
     }
 }
 
+/// How many values an iterable yields, where a signature row says so.
+///
+/// The count is *always* the length of a collection parameter - that is the only
+/// length this fragment has a bound variable for - and the relation is what
+/// connects the iterable to it. `sorted(records)` and `enumerate(sorted(records))`
+/// both answer `records`; `set(records)` answers `records` inexactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LengthWalk {
+    /// The collection parameter whose length bounds the walk.
+    collection: String,
+    /// Whether that length is the count itself rather than an upper bound on
+    /// it. Conjunctive down the chain: one collapsing callee makes the whole
+    /// reading inexact, and an inexact reading is reported as `O` and never as
+    /// `Theta`.
+    exact: bool,
+}
+
 /// The collection parameter this expression iterates, if it is a bare name for
 /// one.
 fn walked_collection(expr: &Expr, collections: &BTreeSet<String>) -> Option<String> {
@@ -1053,6 +1168,11 @@ struct Translator<'a> {
     /// `None` disqualifies every signature: see [`bindings_of`], and
     /// [`landav_fdk::SignaturePack`] for the residual case neither covers.
     shadowed: Option<BTreeSet<String>>,
+    /// Every name this function's body binds, parameters excluded. A
+    /// parameter absent from here holds what the caller passed at every point
+    /// in the body, which is what a method row's receiver rule needs.
+    /// `None` refuses every receiver: see [`bindings_of`].
+    rebound: Option<BTreeSet<String>>,
     /// The signatures a call may be resolved against.
     pack: &'static SignaturePack,
     /// How many collection walks have been lowered, to keep their synthetic
@@ -1300,11 +1420,10 @@ impl Translator<'_> {
                 && (self.integers.contains(name.as_str())
                     || self.collections.contains(name.as_str()))
             {
-                let origin = self.origin(clause);
-                handler.push(self.builder.unsupported_stmt_detailed(
+                handler.push(self.refuse_named_binding(
                     Construct::BindingForm,
                     name.as_str(),
-                    origin,
+                    clause,
                 ));
             }
             handler.extend(self.block(&clause.body));
@@ -1387,12 +1506,12 @@ impl Translator<'_> {
         let [target] = assign.targets.as_slice() else {
             // `a = b = 0` binds two names; the fragment's assignment binds one.
             let mut statements = self.refusals_of(&assign.value);
-            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            statements.push(self.refuse_targets(assign, assign.targets.iter()));
             return statements;
         };
         let Expr::Name(name) = target else {
             let mut statements = self.refusals_of(&assign.value);
-            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            statements.push(self.refuse_targets(assign, [target]));
             return statements;
         };
         self.bind_expression(name.id.as_str(), target, &assign.value, assign, 0)
@@ -1458,11 +1577,27 @@ impl Translator<'_> {
     fn aug_assign(&mut self, assign: &ast::StmtAugAssign) -> Vec<StmtId> {
         let Expr::Name(name) = assign.target.as_ref() else {
             let mut statements = self.refusals_of(&assign.value);
-            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            statements.push(self.refuse_targets(assign, [assign.target.as_ref()]));
             return statements;
         };
         let Some(op) = arith_of(&assign.op) else {
-            return vec![self.refuse_stmt(refusal_for(&assign.op), assign)];
+            // `x //= e` rebinds `x`, and the operator may run user code on
+            // whatever `x` holds. The value is not translated here, so its
+            // interior speaks for the statement.
+            let mut writes = self.target_writes([assign.target.as_ref()]);
+            if rebinds_the_frame([assign.value.as_ref()]) {
+                writes = Writes::frame();
+            } else if let Locals::AtMost(names) = writes.locals() {
+                writes = Writes::at_most(names.iter().cloned());
+            }
+            let origin = self.origin(assign);
+            return vec![self.builder.unsupported_stmt_writing(
+                refusal_for(&assign.op),
+                None,
+                Extent::Statement,
+                writes,
+                origin,
+            )];
         };
         if !self.integers.contains(name.id.as_str()) {
             // `x += e` reads `x` as well as writing it, and both are refusals
@@ -1493,12 +1628,12 @@ impl Translator<'_> {
         };
         let Expr::Name(name) = assign.target.as_ref() else {
             let mut statements = self.refusals_of(value);
-            statements.push(self.refuse_stmt(Construct::ComplexAssignmentTarget, assign));
+            statements.push(self.refuse_targets(assign, [assign.target.as_ref()]));
             return statements;
         };
         if !annotation_is_int(Some(&assign.annotation)) {
             let mut statements = self.refusals_of(value);
-            statements.push(self.refuse_stmt_detailed(
+            statements.push(self.refuse_named_binding(
                 Construct::NonIntegerValue,
                 name.id.as_str(),
                 assign,
@@ -1527,13 +1662,142 @@ impl Translator<'_> {
     /// [`Translator::refusals_of`].
     fn refuse_binding(&mut self, name: &str, target: &Expr, value: &Expr) -> Vec<StmtId> {
         let mut statements = self.refusals_of(value);
-        let origin = self.origin(target);
-        statements.push(self.builder.unsupported_stmt_detailed(
-            Construct::NonIntegerValue,
-            name,
-            origin,
-        ));
+        statements.push(self.refuse_named_binding(Construct::NonIntegerValue, name, target));
         statements
+    }
+
+    /// Refuses a statement that binds exactly `name`, saying so.
+    ///
+    /// `LAN-100`. The statement stays refused - its value is one this fragment
+    /// cannot hold - but what it *does* is known: it rebinds one local and
+    /// touches no object, so every other value the engine knew survives it. A
+    /// collection parameter's length is a name the source cannot spell, and it
+    /// is rebound with the parameter, so it is listed beside it.
+    fn refuse_named_binding<T: Ranged>(
+        &mut self,
+        construct: Construct,
+        name: &str,
+        node: &T,
+    ) -> StmtId {
+        let origin = self.origin(node);
+        self.builder.unsupported_stmt_writing(
+            construct,
+            Some(Symbol::from(name)),
+            Extent::Statement,
+            Writes::only(self.rebound_names(name)),
+            origin,
+        )
+    }
+
+    /// Refuses an assignment whose targets this fragment cannot bind, saying
+    /// which locals they reach.
+    ///
+    /// `LAN-100`. `a = b = 0` rebinds two known names and nothing else; `x.y =
+    /// v` rebinds no local and runs a setter; `a, b = pair` rebinds two names
+    /// and runs an `__iter__`. Each is narrower than "anything", which is what
+    /// the construct answers for all three, and each is what the engine needs
+    /// to keep a trip count read three lines earlier. The value's own refusals
+    /// are hoisted separately by the caller and carry their own answer.
+    fn refuse_targets<'e, T: Ranged>(
+        &mut self,
+        node: &T,
+        targets: impl IntoIterator<Item = &'e Expr>,
+    ) -> StmtId {
+        let writes = self.target_writes(targets);
+        let origin = self.origin(node);
+        self.builder.unsupported_stmt_writing(
+            Construct::ComplexAssignmentTarget,
+            None,
+            Extent::Statement,
+            writes,
+            origin,
+        )
+    }
+
+    /// The variables a binding of `name` rebinds: the name, and the length
+    /// variable standing beside it if `name` is a collection parameter.
+    fn rebound_names(&self, name: &str) -> Vec<VarName> {
+        let mut names = vec![VarName::new(name)];
+        if self.collections.contains(name) {
+            names.push(length_var(name));
+        }
+        names
+    }
+
+    /// What binding `targets` may change. See [`Translator::refuse_targets`].
+    fn target_writes<'e>(&self, targets: impl IntoIterator<Item = &'e Expr>) -> Writes {
+        let mut names: Vec<VarName> = Vec::new();
+        let mut mutates = false;
+        let mut work: Vec<&Expr> = targets.into_iter().collect();
+        while let Some(target) = work.pop() {
+            match target {
+                Expr::Name(name) => names.extend(self.rebound_names(name.id.as_str())),
+                // Unpacking runs an `__iter__` on the value, which is user code.
+                Expr::Tuple(tuple) => {
+                    mutates = true;
+                    work.extend(tuple.elts.iter());
+                }
+                Expr::List(list) => {
+                    mutates = true;
+                    work.extend(list.elts.iter());
+                }
+                Expr::Starred(starred) => {
+                    mutates = true;
+                    work.push(starred.value.as_ref());
+                }
+                // A setter and a `__setitem__` run in their own frame and
+                // rebind nothing here - unless the object or the index hides a
+                // walrus or a call, which the fragment did not translate.
+                Expr::Attribute(attribute) => {
+                    mutates = true;
+                    if rebinds_the_frame([attribute.value.as_ref()]) {
+                        return Writes::frame();
+                    }
+                }
+                Expr::Subscript(subscript) => {
+                    mutates = true;
+                    if rebinds_the_frame([subscript.value.as_ref(), subscript.slice.as_ref()]) {
+                        return Writes::frame();
+                    }
+                }
+                // Not a target Python accepts; refuse as widely as possible
+                // rather than guess.
+                _ => return Writes::frame(),
+            }
+        }
+        if mutates {
+            Writes::at_most(names)
+        } else {
+            Writes::only(names)
+        }
+    }
+
+    /// Refuses an expression, saying what its untranslated interior may
+    /// change. See [`effect_of_untranslated`].
+    fn refuse_expr(
+        &mut self,
+        construct: Construct,
+        detail: Option<&str>,
+        node: &Expr,
+        origin: Origin,
+    ) -> ExprId {
+        let writes = effect_of_untranslated([node]);
+        self.builder
+            .unsupported_expr_writing(construct, detail.map(Symbol::from), writes, origin)
+    }
+
+    /// The condition counterpart of [`Translator::refuse_expr`], over every
+    /// operand the refused condition would have evaluated.
+    fn refuse_cond<'e>(
+        &mut self,
+        construct: Construct,
+        detail: Option<&str>,
+        roots: impl IntoIterator<Item = &'e Expr>,
+        origin: Origin,
+    ) -> CondId {
+        let writes = effect_of_untranslated(roots);
+        self.builder
+            .unsupported_cond_writing(construct, detail.map(Symbol::from), writes, origin)
     }
 
     /// `for x in items:` where `items` is a collection parameter.
@@ -1555,8 +1819,7 @@ impl Translator<'_> {
         let origin = self.origin(loop_stmt);
         let start = self.builder.int(0, origin.clone());
         let stop = self.builder.var(length_var(collection), origin.clone());
-        let counter = VarName::new(format!("#walk{}", self.walks));
-        self.walks += 1;
+        let counter = self.walk_counter();
 
         let body = self.block(&loop_stmt.body);
         let Some(stride) = core::num::NonZeroI64::new(1) else {
@@ -1606,8 +1869,7 @@ impl Translator<'_> {
                 origin.clone(),
             )
         };
-        let counter = VarName::new(format!("#walk{}", self.walks));
-        self.walks += 1;
+        let counter = self.walk_counter();
 
         let body = self.block(&loop_stmt.body);
         let Some(stride) = core::num::NonZeroI64::new(1) else {
@@ -1622,6 +1884,224 @@ impl Translator<'_> {
         statements
     }
 
+    /// A fresh synthetic loop counter.
+    ///
+    /// `#` is not legal in a Python identifier, so one of these can never
+    /// collide with a name the source bound. Every counted walk over something
+    /// that is not an integer range uses one, for the reason
+    /// [`Translator::walk_collection`] gives: the target holds a value, the
+    /// counter holds a number, and one name may not stand for both.
+    fn walk_counter(&mut self) -> VarName {
+        let counter = VarName::new(format!("#walk{}", self.walks));
+        self.walks += 1;
+        counter
+    }
+
+    /// `for r in sorted(records):` - a walk over the result of a
+    /// length-preserving call, counted by the length of that call's argument.
+    ///
+    /// # Why the call's own cost is charged **after** the loop
+    ///
+    /// This is the one ordering decision in `LAN-99` and it is load bearing, so
+    /// here is the argument.
+    ///
+    /// The call is a region, and a region forgets: `Construct::Call` may rebind
+    /// a local, and a collection's length variable is volatile besides
+    /// ([`landav_its::SourceProgram::is_volatile`]), so charging it in front of
+    /// the loop clears `len(records)` from the set of names the engine may read
+    /// and the loop loses the very count this ticket exists to derive.
+    ///
+    /// Charging it after is not a way round that rule; it is the rule applied to
+    /// the right state. `sorted(records)` copies `records` into a list and only
+    /// then compares, so **the number of values it yields is fixed before any
+    /// effect of the call can be observed** - the trip count is a reading of the
+    /// state on entry to the statement, which is exactly what a
+    /// [`landav_bound::Bound`] over `len(records)` denotes. The region then
+    /// forgets everything downstream of the loop, which is where a mutation
+    /// performed by a comparison could first be seen. The total is unchanged
+    /// either way: the call runs once, and it is charged once, outside the
+    /// multiplication.
+    ///
+    /// The residual is narrow and worth writing down: the loop **body** is
+    /// walked with the entry state, so a body that reads `len(records)` while a
+    /// comparison inside `sorted` appended to `records` would read a stale
+    /// length. Closing that needs the engine to distinguish "before the
+    /// iterable" from "after the iterable" within one statement, which the
+    /// statement list it walks cannot express today. `LAN-11`.
+    fn walk_length(&mut self, loop_stmt: &ast::StmtFor, walk: &LengthWalk) -> Vec<StmtId> {
+        let origin = self.origin(loop_stmt);
+        let start = self.builder.int(0, origin.clone());
+        let length = self
+            .builder
+            .var(length_var(&walk.collection), origin.clone());
+        // An inexact relation - `set`, whose equal elements collapse - becomes a
+        // refusal *bounded by* the argument's length, which the engine reads as
+        // an upper bound and reports as `O` rather than `Theta`. The same
+        // constructor `walk_display` reaches for, for the same reason, and it is
+        // the reason exactness lives in `ResultLength`'s value rather than in a
+        // flag beside it.
+        let stop = if walk.exact {
+            length
+        } else {
+            self.builder.unsupported_expr_bounded(
+                Construct::Collection,
+                "a callee whose result collapses equal elements",
+                length,
+                origin.clone(),
+            )
+        };
+        let counter = self.walk_counter();
+
+        let body = self.block(&loop_stmt.body);
+        let Some(stride) = core::num::NonZeroI64::new(1) else {
+            unreachable!("1 is non-zero")
+        };
+        let mut statements = vec![self.builder.for_range(
+            counter,
+            RangeSpec::new(start, stop, stride),
+            body,
+            origin,
+        )];
+        // The call itself: `sorted` is n log n and stays a hole, `enumerate` is
+        // constant and is discharged by its signature row. Whichever it is, the
+        // callee is named where a reader can find it and an unknown call written
+        // inside it - `sorted(expensive(records))` - is named beside it.
+        statements.extend(self.refusals_of(&loop_stmt.iter));
+        statements
+    }
+
+    /// A `range` endpoint, with the cost of producing it deferred to
+    /// `trailing`.
+    ///
+    /// Ordinary endpoints translate exactly as they always did and defer
+    /// nothing. The one exception is `len(<a length-preserving call>)`, which
+    /// reads as the argument's length variable - so that `LAN-89`'s
+    /// `for i in range(len(...))` idiom gets the relation too - and whose
+    /// callees are charged after the loop for the reason
+    /// [`Translator::walk_length`] gives at length.
+    fn endpoint(&mut self, expr: &Expr, trailing: &mut Vec<StmtId>) -> ExprId {
+        let Some((walk, measured)) = self.measured_length(expr) else {
+            return self.expression(expr);
+        };
+        let origin = self.origin(expr);
+        let length = self
+            .builder
+            .var(length_var(&walk.collection), origin.clone());
+        let reading = if walk.exact {
+            length
+        } else {
+            self.builder.unsupported_expr_bounded(
+                Construct::Collection,
+                "a callee whose result collapses equal elements",
+                length,
+                origin,
+            )
+        };
+        trailing.extend(self.refusals_of(measured));
+        reading
+    }
+
+    /// `len(x)` where `x`'s length is known through a relation rather than
+    /// because `x` is a collection parameter.
+    ///
+    /// Returns the relation and the expression whose cost still has to be
+    /// charged. `len(items)` for a bare collection parameter is deliberately
+    /// **not** matched here: [`length_of_collection`] already reads it as a
+    /// variable, it costs nothing, and there is nothing to charge.
+    fn measured_length<'e>(&self, expr: &'e Expr) -> Option<(LengthWalk, &'e Expr)> {
+        let Expr::Call(call) = expr else {
+            return None;
+        };
+        let Expr::Name(callee) = call.func.as_ref() else {
+            return None;
+        };
+        if callee.id.as_str() != "len" || !call.keywords.is_empty() {
+            return None;
+        }
+        // A *call* whose length is known, and nothing else. `len(items)` for a
+        // bare collection parameter is [`length_of_collection`]'s, which reads
+        // it as a variable and charges nothing - translating it here instead
+        // would refuse `items` as `non-integer-value` for its value, which is
+        // not the question `len` asks.
+        let [measured @ Expr::Call(_)] = call.args.as_slice() else {
+            return None;
+        };
+        // `len` itself is matched by name, exactly as `length_of_collection`
+        // matches it and on the same trust the `int` annotation already gets.
+        // The *inner* callee goes through the pack and its shadowing gate.
+        self.walked_length(measured).map(|walk| (walk, measured))
+    }
+
+    /// The length relation an iterable's element count is known by, if any.
+    ///
+    /// # The relation is conditional on the ARGUMENT, never on the callee's name
+    ///
+    /// `enumerate(x)` yields `len(x)` pairs only when `x` has a length to yield.
+    /// So this descends: a bare collection parameter is the base case, a
+    /// declared row over an argument that is itself one of these composes, and
+    /// anything else answers `None`: a generator, a comprehension, a local, an
+    /// unknown callee. A row keyed on the name alone would fire on
+    /// `enumerate(stream())` and publish an equality for a count nothing knows.
+    ///
+    /// Exactness is conjunctive: one `at-most` anywhere in the chain makes the
+    /// whole reading an upper bound, because `set` of a `sorted` holds at most
+    /// as many values as the original and possibly fewer.
+    ///
+    /// # Argument 0 is the receiver for a method
+    ///
+    /// `d.items()` has as many values as `d`, and `len(d.items()) == len(d)`
+    /// needs no vocabulary beyond "argument 0". This is where a pack row first
+    /// bites on a bare attribute: [`Translator::declaration_for`] refuses to
+    /// resolve a method's *cost*, because a row keyed `items` matches any
+    /// object's `.items()` and the receiver's class is something this analysis
+    /// has never seen. The length claim is admitted where the cost claim is not,
+    /// and the difference is the gate rather than the row: the receiver has to
+    /// be a collection the caller supplied.
+    ///
+    /// Iterative rather than recursive: each step descends strictly into a
+    /// subexpression, so it terminates, and expression depth is capped at ten
+    /// thousand - deep enough that a recursive version would risk the stack.
+    fn walked_length(&self, iterable: &Expr) -> Option<LengthWalk> {
+        let mut node = iterable;
+        let mut exact = true;
+        loop {
+            if let Some(collection) = walked_collection(node, &self.collections) {
+                return Some(LengthWalk { collection, exact });
+            }
+            let Expr::Call(call) = node else {
+                return None;
+            };
+            // A keyword argument means this is some other spelling of the call
+            // than the one the row was written for.
+            if !call.keywords.is_empty() {
+                return None;
+            }
+            let (callee, receiver) = match call.func.as_ref() {
+                Expr::Name(name) => (name.id.as_str(), None),
+                Expr::Attribute(attribute) => {
+                    (attribute.attr.as_str(), Some(attribute.value.as_ref()))
+                }
+                _ => return None,
+            };
+            let relation = self
+                .pack
+                .length_relation(callee, |name| self.is_shadowed(name))?;
+            let argument = match receiver {
+                // A method row's argument 0 is its receiver, and the row was
+                // written for the no-argument spelling: `d.items()`, never
+                // `d.items(something)`.
+                Some(receiver) if call.args.is_empty() => receiver,
+                Some(_) => return None,
+                None => match call.args.as_slice() {
+                    [only] => only,
+                    _ => return None,
+                },
+            };
+            exact = exact && relation.is_exact();
+            node = argument;
+        }
+    }
+
     fn for_loop(&mut self, loop_stmt: &ast::StmtFor) -> Vec<StmtId> {
         if !loop_stmt.orelse.is_empty() {
             return vec![self.refuse_stmt_detailed(
@@ -1630,8 +2110,27 @@ impl Translator<'_> {
                 loop_stmt,
             )];
         }
-        let Expr::Name(target) = loop_stmt.target.as_ref() else {
-            return vec![self.refuse_stmt(Construct::ComplexAssignmentTarget, loop_stmt)];
+        // How many times a `for` runs is a property of the **iterable**, and no
+        // property of the target bears on it: `for a, b in pairs` yields one
+        // value per element of `pairs` exactly as `for x in pairs` does, and
+        // then takes that element apart. So a tuple, a list or a starred target
+        // is counted rather than refused, and it binds nothing - `a` and `b`
+        // hold pieces of an element, an element of a `list` may be a string, and
+        // [`landav_its::VarName`] promises a mathematical integer. They are in
+        // exactly the position `x` is already in for `for x in items`, which
+        // `walk_collection` counts through a synthetic `#walk` counter without
+        // mentioning the target at all. `integer_names` dooms every name in the
+        // tree (`written_names` already recurses through `Tuple`, `List` and
+        // `Starred`), so a read of one keeps refusing as `non-integer-value`.
+        // `LAN-99`.
+        //
+        // A subscript or an attribute target - `for a[i] in xs` - is a *write
+        // through an object*, which is a different question with a different
+        // answer, and it stays refused.
+        let target = match loop_stmt.target.as_ref() {
+            Expr::Name(name) => Some(name.id.as_str()),
+            Expr::Tuple(_) | Expr::List(_) | Expr::Starred(_) => None,
+            _ => return vec![self.refuse_stmt(Construct::ComplexAssignmentTarget, loop_stmt)],
         };
         let Some(arguments) = range_arguments(&loop_stmt.iter) else {
             // Walking a collection **parameter** is counted by its length.
@@ -1639,14 +2138,26 @@ impl Translator<'_> {
             if let Some(collection) = walked_collection(&loop_stmt.iter, &self.collections) {
                 return self.walk_collection(loop_stmt, &collection);
             }
+            // Walking the result of a **length-preserving call** is counted by
+            // the length of that call's argument. `LAN-99`.
+            if let Some(walk) = self.walked_length(&loop_stmt.iter) {
+                return self.walk_length(loop_stmt, &walk);
+            }
             // Walking a **display** is counted by how many values it holds,
             // which is written in the source. `LAN-91`.
             if let Some((length, exact)) = walked_display(&loop_stmt.iter) {
                 return self.walk_display(loop_stmt, length, exact);
             }
-            // Iteration over any other container, a generator, `enumerate`,
-            // `zip`: all need a size model this fragment does not have.
-            return vec![self.refuse_stmt(Construct::UnboundedIteration, loop_stmt)];
+            // Iteration over any other container, a generator, `zip`: all need a
+            // size model this fragment does not have. The iterable is still
+            // translated, because it is still *evaluated*: a call written in it
+            // is a call this program issues, and leaving it out of every arena
+            // makes it invisible to the refusal ledger and to the walk alike.
+            // Measured before `LAN-99`, `for r in sorted(expensive(records))`
+            // named neither callee anywhere.
+            let mut statements = self.refusals_of(&loop_stmt.iter);
+            statements.push(self.refuse_stmt(Construct::UnboundedIteration, loop_stmt));
+            return statements;
         };
         // A counter this pass could not prove integral does **not** refuse the
         // loop. Refusing it here reported `non-integer-value` on the `for` line,
@@ -1663,21 +2174,25 @@ impl Translator<'_> {
         // a `landav_its::VarName` the engine may read. Whatever refused in the
         // endpoint is translated below and charged where it stands, and a read
         // of the target inside the body keeps refusing as it always did.
-        let counter = if self.integers.contains(target.id.as_str()) {
-            VarName::new(target.id.as_str())
-        } else {
-            let synthetic = VarName::new(format!("#walk{}", self.walks));
-            self.walks += 1;
-            synthetic
+        let counter = match target {
+            Some(name) if self.integers.contains(name) => VarName::new(name),
+            _ => self.walk_counter(),
         };
 
         let origin = self.origin(loop_stmt);
+        // The cost of producing an endpoint, charged **after** the loop. See
+        // [`Translator::endpoint`], which is the only thing that ever fills it.
+        let mut trailing: Vec<StmtId> = Vec::new();
         let (start, stop, step) = match arguments {
             [stop] => {
                 let zero = self.builder.int(0, origin.clone());
-                (zero, self.expression(stop), 1_i64)
+                (zero, self.endpoint(stop, &mut trailing), 1_i64)
             }
-            [start, stop] => (self.expression(start), self.expression(stop), 1_i64),
+            [start, stop] => (
+                self.expression(start),
+                self.endpoint(stop, &mut trailing),
+                1_i64,
+            ),
             [start, stop, step] => {
                 let Some(literal) = literal_step(step) else {
                     // The sign of the step decides which way the guard points,
@@ -1688,7 +2203,11 @@ impl Translator<'_> {
                         loop_stmt,
                     )];
                 };
-                (self.expression(start), self.expression(stop), literal)
+                (
+                    self.expression(start),
+                    self.endpoint(stop, &mut trailing),
+                    literal,
+                )
             }
             _ => return vec![self.refuse_stmt(Construct::UnboundedIteration, loop_stmt)],
         };
@@ -1702,10 +2221,14 @@ impl Translator<'_> {
         };
 
         let body = self.block(&loop_stmt.body);
-        vec![
-            self.builder
-                .for_range(counter, RangeSpec::new(start, stop, stride), body, origin),
-        ]
+        let mut statements = vec![self.builder.for_range(
+            counter,
+            RangeSpec::new(start, stop, stride),
+            body,
+            origin,
+        )];
+        statements.extend(trailing);
+        statements
     }
 
     /// A statement that is just an expression.
@@ -1854,10 +2377,14 @@ impl Translator<'_> {
                         effect,
                         node.origin().clone(),
                     ),
-                    None => self.builder.unsupported_stmt_with(
+                    // And so does what the node said it may change, for the
+                    // same reason: a refused binding that lost its write set
+                    // on the way across would forget the frame again.
+                    None => self.builder.unsupported_stmt_writing(
                         node.construct(),
                         node.detail().cloned(),
                         extent,
+                        node.writes().clone(),
                         node.origin().clone(),
                     ),
                 }
@@ -1910,6 +2437,94 @@ impl Translator<'_> {
             return None;
         }
         Some(effect_of(row))
+    }
+
+    /// What a call the pack cannot *resolve* may nevertheless change in this
+    /// frame. `LAN-103`.
+    ///
+    /// [`Translator::declaration_for`] answers for a callee whose cost is a
+    /// constant; the node stops being a hole. This answers for the rest: a row
+    /// that says the callee cannot rebind a local of the caller's frame - which
+    /// is every row in the pack, `list` and `sorted` and `split` included -
+    /// while saying nothing it can bound about the cost. The call stays a hole
+    /// and denotes omega; what it no longer does is forget the frame, so
+    /// `directories = list(...)` above `for d in directories_list` no longer
+    /// costs that loop its trip count. Measured: 13 of the 42 typed-corpus
+    /// loops still uncounted after `LAN-100` were blocked by exactly this.
+    ///
+    /// # What the row does not cover, and the scan does
+    ///
+    /// The row speaks for the callee. An operand the fragment did not
+    /// translate - the receiver, an argument that reaches no call - may hide a
+    /// walrus or a call to a closure over this frame, and the row knows nothing
+    /// about that. Those are scanned as any refused expression's interior is
+    /// ([`effect_of_untranslated`]); an argument that reaches a call is its own
+    /// node with its own answer and is not scanned twice.
+    ///
+    /// `mutates_arguments` is carried through as the object half of the answer
+    /// and is `true` for every row today: `list(x)` runs `x.__iter__`, which is
+    /// user code, so a collection's length read on entry still goes.
+    fn writes_of_call(&self, call: &ast::ExprCall) -> Writes {
+        let Some(row) = self.row_for(call) else {
+            return Writes::unstated();
+        };
+        if row.rebinds_locals {
+            return Writes::unstated();
+        }
+        let untranslated = core::iter::once(call.func.as_ref()).chain(
+            call_arguments(call).into_iter().filter(|argument| {
+                !reaches_a_call(
+                    argument,
+                    &self.integers,
+                    &self.collections,
+                    self.discarding,
+                    self.value_discarded,
+                )
+            }),
+        );
+        if rebinds_the_frame(untranslated) {
+            return Writes::unstated();
+        }
+        if row.mutates_arguments {
+            Writes::at_most([])
+        } else {
+            Writes::only([])
+        }
+    }
+
+    /// The pack row for a call site, resolvable or not.
+    ///
+    /// A bare name matches under `LAN-94`'s rule: not bound in this module or
+    /// this function. A method matches under `LAN-99`'s: the receiver is a
+    /// parameter annotated with the builtin the row was written for, and -
+    /// the part `LAN-99` did not need, because a rebound receiver has no known
+    /// length either way - never rebound here, so it still holds what the
+    /// caller passed. `obj.copy()` on an unannotated `obj` matches nothing.
+    fn row_for(&self, call: &ast::ExprCall) -> Option<&'static Signature> {
+        match call.func.as_ref() {
+            Expr::Name(callee) => {
+                let callee = callee.id.as_str();
+                if self.is_shadowed(callee) {
+                    return None;
+                }
+                self.pack.row(callee)
+            }
+            Expr::Attribute(method) => {
+                let Expr::Name(receiver) = method.value.as_ref() else {
+                    return None;
+                };
+                let receiver = receiver.id.as_str();
+                let rebound = self
+                    .rebound
+                    .as_ref()
+                    .is_none_or(|names| names.contains(receiver));
+                if !self.collections.contains(receiver) || rebound {
+                    return None;
+                }
+                self.pack.row(method.attr.as_str())
+            }
+            _ => None,
+        }
     }
 
     /// Whether `name` means something in this source other than the builtin.
@@ -1992,8 +2607,7 @@ impl Translator<'_> {
             .copied()
             .unwrap_or_else(|| {
                 let origin = self.origin(root);
-                self.builder
-                    .unsupported_cond(Construct::ConditionalExpression, origin)
+                self.refuse_cond(Construct::ConditionalExpression, None, [root], origin)
             })
     }
 
@@ -2017,17 +2631,16 @@ impl Translator<'_> {
                     });
                 }
                 combined.unwrap_or_else(|| {
-                    self.builder
-                        .unsupported_cond(Construct::ConditionalExpression, origin)
+                    self.refuse_cond(Construct::ConditionalExpression, None, [node], origin)
                 })
             }
 
             Expr::UnaryOp(unary) if matches!(unary.op, ast::UnaryOp::Not) => {
                 match recall(&unary.operand) {
                     Some(operand) => self.builder.not(operand, origin),
-                    None => self
-                        .builder
-                        .unsupported_cond(Construct::ConditionalExpression, origin),
+                    None => {
+                        self.refuse_cond(Construct::ConditionalExpression, None, [node], origin)
+                    }
                 }
             }
 
@@ -2078,9 +2691,10 @@ impl Translator<'_> {
                 ast::CmpOp::In | ast::CmpOp::NotIn => Construct::Collection,
                 _ => Construct::NonIntegerValue,
             };
-            return self.builder.unsupported_cond_detailed(
+            return self.refuse_cond(
                 construct,
-                "membership or identity comparison",
+                Some("membership or identity comparison"),
+                compare_operands(comparison),
                 origin,
             );
         }
@@ -2098,9 +2712,10 @@ impl Translator<'_> {
                     ast::CmpOp::In | ast::CmpOp::NotIn => Construct::Collection,
                     _ => Construct::NonIntegerValue,
                 };
-                return self.builder.unsupported_cond_detailed(
+                return self.refuse_cond(
                     construct,
-                    "membership or identity comparison",
+                    Some("membership or identity comparison"),
+                    compare_operands(comparison),
                     origin,
                 );
             };
@@ -2115,8 +2730,12 @@ impl Translator<'_> {
         }
 
         combined.unwrap_or_else(|| {
-            self.builder
-                .unsupported_cond(Construct::ConditionalExpression, origin)
+            self.refuse_cond(
+                Construct::ConditionalExpression,
+                None,
+                compare_operands(comparison),
+                origin,
+            )
         })
     }
 
@@ -2147,8 +2766,7 @@ impl Translator<'_> {
             .copied()
             .unwrap_or_else(|| {
                 let origin = self.origin(root);
-                self.builder
-                    .unsupported_expr(Construct::NonIntegerValue, origin)
+                self.refuse_expr(Construct::NonIntegerValue, None, root, origin)
             })
     }
 
@@ -2162,9 +2780,7 @@ impl Translator<'_> {
                     Ok(literal) => self.builder.int(literal, origin),
                     // Python integers are unbounded; the fragment's are not.
                     // Truncating would change the program, so it refuses.
-                    Err(_) => self
-                        .builder
-                        .unsupported_expr(Construct::ArithmeticOverflow, origin),
+                    Err(_) => self.refuse_expr(Construct::ArithmeticOverflow, None, node, origin),
                 },
                 // `True` is `1` and `False` is `0`, exactly, in Python.
                 Constant::Bool(flag) => self.builder.int(i64::from(*flag), origin),
@@ -2176,11 +2792,9 @@ impl Translator<'_> {
                     if self.discarding {
                         return self.builder.int(0, origin);
                     }
-                    self.builder.unsupported_expr(Construct::Collection, origin)
+                    self.refuse_expr(Construct::Collection, None, node, origin)
                 }
-                _ => self
-                    .builder
-                    .unsupported_expr(Construct::NonIntegerValue, origin),
+                _ => self.refuse_expr(Construct::NonIntegerValue, None, node, origin),
             },
 
             Expr::Name(name) => self.read(name.id.as_str(), node),
@@ -2194,9 +2808,9 @@ impl Translator<'_> {
                     {
                         return match recall(&binary.left) {
                             Some(base) => self.builder.pow(base, exponent, origin),
-                            None => self
-                                .builder
-                                .unsupported_expr(Construct::NonPolynomialPower, origin),
+                            None => {
+                                self.refuse_expr(Construct::NonPolynomialPower, None, node, origin)
+                            }
                         };
                     }
                     // `//`, `%`, `>>` and `<<` are not polynomials, but three
@@ -2222,37 +2836,30 @@ impl Translator<'_> {
                             ),
                         };
                     }
-                    return self
-                        .builder
-                        .unsupported_expr(refusal_for(&binary.op), origin);
+                    return self.refuse_expr(refusal_for(&binary.op), None, node, origin);
                 };
                 match (recall(&binary.left), recall(&binary.right)) {
                     (Some(left), Some(right)) => self.builder.arith(op, left, right, origin),
-                    _ => self
-                        .builder
-                        .unsupported_expr(Construct::NonIntegerValue, origin),
+                    _ => self.refuse_expr(Construct::NonIntegerValue, None, node, origin),
                 }
             }
 
             Expr::UnaryOp(unary) => match unary.op {
                 ast::UnaryOp::USub => match recall(&unary.operand) {
                     Some(operand) => self.builder.neg(operand, origin),
-                    None => self
-                        .builder
-                        .unsupported_expr(Construct::NonIntegerValue, origin),
+                    None => self.refuse_expr(Construct::NonIntegerValue, None, node, origin),
                 },
                 ast::UnaryOp::UAdd => recall(&unary.operand).unwrap_or_else(|| {
-                    self.builder
-                        .unsupported_expr(Construct::NonIntegerValue, origin)
+                    self.refuse_expr(Construct::NonIntegerValue, None, node, origin)
                 }),
                 // `~n` is a bitwise operator whose result the fragment has no
                 // rule for, and it stays refused wherever it is written. It is
                 // the arm next door on purpose: `Not` and `Invert` are one
                 // character apart in Python and one variant apart here, and the
                 // widening below must not reach this one.
-                ast::UnaryOp::Invert => self
-                    .builder
-                    .unsupported_expr(Construct::BitwiseOperator, origin),
+                ast::UnaryOp::Invert => {
+                    self.refuse_expr(Construct::BitwiseOperator, None, node, origin)
+                }
                 // `not x`, in a position that reads no value from it. The
                 // fourth member of the family below - see the `IfExp | BoolOp`
                 // arm for the argument, which is identical and if anything
@@ -2273,8 +2880,7 @@ impl Translator<'_> {
                     if self.value_discarded {
                         return self.builder.int(0, origin);
                     }
-                    self.builder
-                        .unsupported_expr(Construct::ConditionalExpression, origin)
+                    self.refuse_expr(Construct::ConditionalExpression, None, node, origin)
                 }
             },
 
@@ -2321,16 +2927,26 @@ impl Translator<'_> {
                         origin,
                     );
                 }
-                self.builder
-                    .unsupported_expr_evaluating(Construct::Call, detail, evaluated, origin)
+                // A callee the pack knows cannot rebind a local, at a cost it
+                // cannot bound. `LAN-103`: the call stays a hole and the loop
+                // below it keeps its trip count.
+                let writes = self.writes_of_call(call);
+                self.builder.unsupported_expr_evaluating_writing(
+                    Construct::Call,
+                    detail,
+                    evaluated,
+                    writes,
+                    origin,
+                )
             }
-            Expr::Attribute(attribute) => self.builder.unsupported_expr_detailed(
+            Expr::Attribute(attribute) => self.refuse_expr(
                 Construct::Attribute,
-                attribute.attr.as_str(),
+                Some(attribute.attr.as_str()),
+                node,
                 origin,
             ),
             Expr::Subscript(_) | Expr::Slice(_) | Expr::Starred(_) => {
-                self.builder.unsupported_expr(Construct::Subscript, origin)
+                self.refuse_expr(Construct::Subscript, None, node, origin)
             }
             // A display, and the f-string that shares its shape. Building one
             // costs no source step, so in a discarded position it is free - and
@@ -2346,21 +2962,16 @@ impl Translator<'_> {
                 if self.discarding {
                     return self.builder.int(0, origin);
                 }
-                self.builder.unsupported_expr(Construct::Collection, origin)
+                self.refuse_expr(Construct::Collection, None, node, origin)
             }
             Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::GeneratorExp(_) => {
-                self.builder
-                    .unsupported_expr(Construct::Comprehension, origin)
+                self.refuse_expr(Construct::Comprehension, None, node, origin)
             }
-            Expr::Lambda(_) => self
-                .builder
-                .unsupported_expr(Construct::Declaration, origin),
+            Expr::Lambda(_) => self.refuse_expr(Construct::Declaration, None, node, origin),
             Expr::Await(_) | Expr::Yield(_) | Expr::YieldFrom(_) => {
-                self.builder.unsupported_expr(Construct::Coroutine, origin)
+                self.refuse_expr(Construct::Coroutine, None, node, origin)
             }
-            Expr::NamedExpr(_) => self
-                .builder
-                .unsupported_expr(Construct::BindingForm, origin),
+            Expr::NamedExpr(_) => self.refuse_expr(Construct::BindingForm, None, node, origin),
             // A ternary and an `and`/`or` chain, in a position that reads no
             // value from them. Neither costs a source step of its own and
             // neither can bind anything, so what is left is their operands -
@@ -2381,8 +2992,7 @@ impl Translator<'_> {
                 if self.value_discarded {
                     return self.builder.int(0, origin);
                 }
-                self.builder
-                    .unsupported_expr(Construct::ConditionalExpression, origin)
+                self.refuse_expr(Construct::ConditionalExpression, None, node, origin)
             }
             // A comparison, with the same argument and one exception. `in`,
             // `not in`, `is` and `is not` are refused whatever position they
@@ -2396,14 +3006,14 @@ impl Translator<'_> {
                     let Some(refused) = membership_or_identity(comparison) else {
                         return self.builder.int(0, origin);
                     };
-                    return self.builder.unsupported_expr_detailed(
+                    return self.refuse_expr(
                         refused,
-                        "membership or identity comparison",
+                        Some("membership or identity comparison"),
+                        node,
                         origin,
                     );
                 }
-                self.builder
-                    .unsupported_expr(Construct::ConditionalExpression, origin)
+                self.refuse_expr(Construct::ConditionalExpression, None, node, origin)
             }
         }
     }
@@ -2414,8 +3024,14 @@ impl Translator<'_> {
         if self.integers.contains(name) {
             return self.builder.var(VarName::new(name), origin);
         }
-        self.builder
-            .unsupported_expr_detailed(Construct::NonIntegerValue, name, origin)
+        // A name read has no interior and no effect: it is a value this
+        // fragment cannot hold, and nothing else. `LAN-100`.
+        self.builder.unsupported_expr_writing(
+            Construct::NonIntegerValue,
+            Some(Symbol::from(name)),
+            Writes::nothing(),
+            origin,
+        )
     }
 }
 
@@ -2576,6 +3192,158 @@ fn call_arguments(call: &ast::ExprCall) -> Vec<&Expr> {
         .iter()
         .chain(call.keywords.iter().map(|keyword| &keyword.value))
         .collect()
+}
+
+/// What evaluating expressions this fragment did **not** translate may change
+/// in the frame they stand in.
+///
+/// `LAN-100`. A refused expression becomes one `Unsupported` node whose
+/// interior is never inspected - which is what keeps a refused comprehension
+/// from producing a refusal per node inside it - so the interior has to be
+/// scanned *here*, once, for the two things that decide what the engine may
+/// keep reading across the node:
+///
+/// * a **call**, a **walrus**, an `await` or a `yield` may rebind a local of
+///   this frame - a call through a closure over it, a walrus directly - and
+///   the answer is the widest one, [`Writes::frame`]. It outranks the
+///   construct: `x[(n := 5)]` is a subscript, and a subscript's own answer is
+///   "nothing";
+/// * anything else runs at most user code in **its own** frame - a `property`,
+///   a `__getitem__`, an `__add__` on two objects - which cannot rebind a name
+///   here but may mutate an object, so a length read on entry is gone:
+///   [`Writes::at_most`] of no names;
+/// * a name, a literal, and a tuple or list of those do nothing at all:
+///   [`Writes::nothing`].
+///
+/// A lambda's body runs later, in its own frame, and is not scanned; its
+/// defaults are evaluated now and are. A comprehension's walrus binds in the
+/// *enclosing* scope, which is exactly why the scan does descend into one.
+fn effect_of_untranslated<'e>(roots: impl IntoIterator<Item = &'e Expr>) -> Writes {
+    let mut pure = true;
+    let mut work: Vec<&Expr> = roots.into_iter().collect();
+    while let Some(node) = work.pop() {
+        match node {
+            Expr::Call(_)
+            | Expr::NamedExpr(_)
+            | Expr::Await(_)
+            | Expr::Yield(_)
+            | Expr::YieldFrom(_) => return Writes::frame(),
+            Expr::Name(_) | Expr::Constant(_) => {}
+            Expr::Tuple(tuple) => work.extend(tuple.elts.iter()),
+            Expr::List(list) => work.extend(list.elts.iter()),
+            Expr::Lambda(lambda) => {
+                pure = false;
+                work.extend(lambda_defaults(&lambda.args));
+            }
+            other => {
+                pure = false;
+                work.extend(interior_of(other));
+            }
+        }
+    }
+    if pure {
+        Writes::nothing()
+    } else {
+        Writes::at_most([])
+    }
+}
+
+/// Whether [`effect_of_untranslated`] finds something that may rebind a local
+/// of this frame among `roots`.
+fn rebinds_the_frame<'e>(roots: impl IntoIterator<Item = &'e Expr>) -> bool {
+    matches!(effect_of_untranslated(roots).locals(), Locals::Any)
+}
+
+/// The operands a comparison evaluates, left to right.
+fn compare_operands(comparison: &ast::ExprCompare) -> Vec<&Expr> {
+    core::iter::once(comparison.left.as_ref())
+        .chain(comparison.comparators.iter())
+        .collect()
+}
+
+/// The default values a lambda evaluates when it is *defined*.
+fn lambda_defaults(args: &ast::Arguments) -> Vec<&Expr> {
+    args.posonlyargs
+        .iter()
+        .chain(args.args.iter())
+        .chain(args.kwonlyargs.iter())
+        .filter_map(|parameter| parameter.default.as_deref())
+        .collect()
+}
+
+/// Every direct sub-expression of `expr`, whatever its kind.
+///
+/// The exhaustive walk [`effect_of_untranslated`] needs, and deliberately
+/// separate from [`expression_children`], which lists what the *fragment*
+/// translates and must stay that way.
+fn interior_of(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::BoolOp(boolean) => boolean.values.iter().collect(),
+        Expr::NamedExpr(named) => vec![named.target.as_ref(), named.value.as_ref()],
+        Expr::BinOp(binary) => vec![binary.left.as_ref(), binary.right.as_ref()],
+        Expr::UnaryOp(unary) => vec![unary.operand.as_ref()],
+        Expr::Lambda(lambda) => lambda_defaults(&lambda.args),
+        Expr::IfExp(ternary) => vec![
+            ternary.test.as_ref(),
+            ternary.body.as_ref(),
+            ternary.orelse.as_ref(),
+        ],
+        Expr::Dict(dict) => dict
+            .keys
+            .iter()
+            .flatten()
+            .chain(dict.values.iter())
+            .collect(),
+        Expr::Set(set) => set.elts.iter().collect(),
+        Expr::ListComp(comprehension) => core::iter::once(comprehension.elt.as_ref())
+            .chain(generator_parts(&comprehension.generators))
+            .collect(),
+        Expr::SetComp(comprehension) => core::iter::once(comprehension.elt.as_ref())
+            .chain(generator_parts(&comprehension.generators))
+            .collect(),
+        Expr::GeneratorExp(comprehension) => core::iter::once(comprehension.elt.as_ref())
+            .chain(generator_parts(&comprehension.generators))
+            .collect(),
+        Expr::DictComp(comprehension) => [comprehension.key.as_ref(), comprehension.value.as_ref()]
+            .into_iter()
+            .chain(generator_parts(&comprehension.generators))
+            .collect(),
+        Expr::Await(awaited) => vec![awaited.value.as_ref()],
+        Expr::Yield(yielded) => yielded.value.as_deref().into_iter().collect(),
+        Expr::YieldFrom(yielded) => vec![yielded.value.as_ref()],
+        Expr::Compare(comparison) => compare_operands(comparison),
+        Expr::Call(call) => core::iter::once(call.func.as_ref())
+            .chain(call_arguments(call))
+            .collect(),
+        Expr::FormattedValue(formatted) => core::iter::once(formatted.value.as_ref())
+            .chain(formatted.format_spec.as_deref())
+            .collect(),
+        Expr::JoinedStr(joined) => joined.values.iter().collect(),
+        Expr::Constant(_) | Expr::Name(_) => Vec::new(),
+        Expr::Attribute(attribute) => vec![attribute.value.as_ref()],
+        Expr::Subscript(subscript) => vec![subscript.value.as_ref(), subscript.slice.as_ref()],
+        Expr::Starred(starred) => vec![starred.value.as_ref()],
+        Expr::List(list) => list.elts.iter().collect(),
+        Expr::Tuple(tuple) => tuple.elts.iter().collect(),
+        Expr::Slice(slice) => [
+            slice.lower.as_deref(),
+            slice.upper.as_deref(),
+            slice.step.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    }
+}
+
+/// The expressions a comprehension's `for` clauses evaluate: each target,
+/// iterable and filter.
+fn generator_parts(generators: &[ast::Comprehension]) -> impl Iterator<Item = &Expr> {
+    generators.iter().flat_map(|clause| {
+        [&clause.target, &clause.iter]
+            .into_iter()
+            .chain(clause.ifs.iter())
+    })
 }
 
 /// Whether evaluating `expr` costs nothing at all.
