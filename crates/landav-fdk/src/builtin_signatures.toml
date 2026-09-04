@@ -512,3 +512,96 @@ And exactly as many values, one per entry, duplicates included — `values()` do
 NOT collapse equal values the way `set` does, so this is an equality and not an
 upper bound. Same gate and same cost refusal as `items`.
 """
+
+# ---------------------------------------------------------------------------
+# LAN-103 — cannot rebind a local; cost unresolvable; the call STAYS a hole
+# ---------------------------------------------------------------------------
+#
+# None of these is resolvable: every cost below is `unbounded` or linear in a
+# size this analysis cannot see. What a row here buys is the OTHER field. A
+# refused call carrying `rebinds_locals = false` forgets no local of the
+# caller's frame (`landav_its::Writes`), so a loop below it keeps the trip
+# count it read above it. Measured on the typed corpus after LAN-100: 13 of
+# the 42 still-uncounted loops over a sized parameter were blocked by exactly
+# one of these calls and nothing else.
+#
+# `mutates_arguments` is `true` for every constructor: `list(x)` runs
+# `x.__iter__` and `set(x)` runs each element's `__hash__`, and both are user
+# code. It is `false` for the str and container methods below, and that is the
+# one place a row here is stronger than LAN-94's: the frontend matches a method
+# row only on a receiver that is a parameter annotated with the builtin and
+# never rebound, and `list.copy` and `str.split` on a builtin receiver run no
+# user code at all - no element method, no hash, no comparison. A length read
+# on entry survives them, which is what the ticket was measured on.
+
+[[signature]]
+callee = "map"
+cost = "unbounded"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builds a lazy iterator, but calls iter() on every iterable argument at construction, which is user code; consuming it runs the function once per element. Runs in its own frame."
+
+[[signature]]
+callee = "dict"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = true
+result_length = "at-most-argument0"
+why = "Copies its argument's entries, hashing each key with user code. Duplicate keys collapse, so the result is at most as long as the argument. Runs in its own frame."
+
+[[signature]]
+callee = "defaultdict"
+cost = "unbounded"
+rebinds_locals = false
+mutates_arguments = true
+why = "defaultdict(list) is a constant; defaultdict(list, mapping) copies the mapping. One row covers both spellings by claiming the weaker cost. Runs in its own frame."
+
+[[signature]]
+callee = "copy"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = false
+result_length = "exactly-argument0"
+why = "A shallow copy of the receiver, one slot per element, copying references and calling nothing on them. Matched only on a receiver that is a parameter annotated with a builtin collection and never rebound, so this is the builtin's copy and runs no user code."
+
+[[signature]]
+callee = "split"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = false
+why = "One pass over the receiver string, calling nothing. Matched only on a receiver annotated str and never rebound, so this is str.split and runs no user code; a user class's split is not this row."
+
+[[signature]]
+callee = "strip"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = false
+why = "One pass over the receiver string from each end, calling nothing. Receiver rule as for split."
+
+[[signature]]
+callee = "lstrip"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = false
+why = "One pass over the receiver string from the left, calling nothing. Receiver rule as for split."
+
+[[signature]]
+callee = "lower"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = false
+why = "One pass over the receiver string, calling nothing. Receiver rule as for split."
+
+[[signature]]
+callee = "upper"
+cost = "linear-in-argument"
+rebinds_locals = false
+mutates_arguments = false
+why = "One pass over the receiver string, calling nothing. Receiver rule as for split."
+
+[[signature]]
+callee = "get"
+cost = "unbounded"
+rebinds_locals = false
+mutates_arguments = true
+why = "A hash lookup on the receiver, and hashing the key is user code. Matched only on a receiver annotated dict."
