@@ -534,14 +534,43 @@ fn annotation_is_collection(annotation: Option<&Expr>) -> bool {
 
 /// The parameters annotated with a sized builtin collection, in declaration
 /// order.
+///
+/// # A parameter a loop or a `with` rebinds is not one
+///
+/// `items: list` rebound by `for items in rows:` holds, inside and after that
+/// loop, whatever `rows` yielded - and the length the caller supplied is not a
+/// fact about it any more. The program records no such binding: a collection
+/// walk counts on a synthetic counter and binds its target to nothing (see
+/// [`Translator::walk_collection`]), and a `with ... as items` is the same.
+/// So `len(items)` stayed readable across them, and a loop over `items` below
+/// counted by the caller's length. `LAN-101`: such a parameter has no length
+/// variable at all, so nothing downstream can read one.
+///
+/// # A parameter an *assignment* rebinds still is one
+///
+/// Deliberately, and measured. `items = []` is a refused binding carrying
+/// `LAN-100`'s write set - `items` and `len(items)` both, see
+/// [`Translator::rebound_names`] - so the length is forgotten exactly where
+/// the program changes it, and a loop over `items` *above* the assignment is
+/// still counted. Excluding assignments here as well was tried and cost three
+/// of the typed corpus's fifty counted loops, in functions that rebind the
+/// parameter after or inside the loop, for no soundness gain. The rule is:
+/// a rebinding the program records at a statement is handled there; one it
+/// does not record is handled by never declaring the length.
+///
+/// The walk does not descend into a nested `def` - a binding there is that
+/// scope's, not this one's - and a body it cannot enumerate (`match`)
+/// disqualifies every parameter, which costs coverage and never soundness.
 fn collection_parameters(function: Definition<'_>) -> Vec<String> {
     let arguments = function.args;
+    let rebound = target_bindings_of(function.body);
     arguments
         .posonlyargs
         .iter()
         .chain(arguments.args.iter())
         .filter(|parameter| annotation_is_collection(parameter.def.annotation.as_deref()))
         .map(|parameter| parameter.def.arg.to_string())
+        .filter(|name| !rebound.as_ref().is_none_or(|names| names.contains(name)))
         .collect()
 }
 
@@ -553,6 +582,69 @@ fn collection_parameters(function: Definition<'_>) -> Vec<String> {
 /// `Hole` uses for `#hole0`.
 fn length_var(name: &str) -> VarName {
     VarName::new(format!("len({name})"))
+}
+
+/// The names bound by a `for` target or a `with ... as` target anywhere in
+/// `statements`, or `None` if a statement binds names this walk cannot read.
+///
+/// The subset of [`bindings_of`] that [`collection_parameters`] needs: the
+/// binding forms the translated program does **not** record at a statement.
+/// Same descent - every block that shares this scope, never a nested
+/// definition - and the same answer for a `match`.
+fn target_bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let mut work: Vec<&Stmt> = statements.iter().rev().collect();
+    while let Some(statement) = work.pop() {
+        match statement {
+            Stmt::For(node) => {
+                collect_target_names(&node.target, &mut names);
+                work.extend(node.body.iter().chain(node.orelse.iter()));
+            }
+            Stmt::AsyncFor(node) => {
+                collect_target_names(&node.target, &mut names);
+                work.extend(node.body.iter().chain(node.orelse.iter()));
+            }
+            Stmt::With(node) => {
+                for item in &node.items {
+                    if let Some(target) = &item.optional_vars {
+                        collect_target_names(target, &mut names);
+                    }
+                }
+                work.extend(node.body.iter());
+            }
+            Stmt::AsyncWith(node) => {
+                for item in &node.items {
+                    if let Some(target) = &item.optional_vars {
+                        collect_target_names(target, &mut names);
+                    }
+                }
+                work.extend(node.body.iter());
+            }
+            Stmt::While(node) => work.extend(node.body.iter().chain(node.orelse.iter())),
+            Stmt::If(node) => work.extend(node.body.iter().chain(node.orelse.iter())),
+            Stmt::Try(node) => {
+                work.extend(node.body.iter());
+                for handler in &node.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    work.extend(handler.body.iter());
+                }
+                work.extend(node.orelse.iter().chain(node.finalbody.iter()));
+            }
+            Stmt::TryStar(node) => {
+                work.extend(node.body.iter());
+                for handler in &node.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    work.extend(handler.body.iter());
+                }
+                work.extend(node.orelse.iter().chain(node.finalbody.iter()));
+            }
+            Stmt::Match(_) => return None,
+            // Every assignment form is a statement the program records with
+            // its own write set; a nested definition is its own scope.
+            _ => {}
+        }
+    }
+    Some(names)
 }
 
 /// The names that provably hold integers throughout `function`.
