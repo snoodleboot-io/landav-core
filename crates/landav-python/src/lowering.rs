@@ -221,8 +221,13 @@ fn lower_function(
     // Every name that is bound anywhere this call site can see it: the module's
     // own bindings, this function's parameters, and everything its body binds.
     // A callee found here gets no signature, whatever the pack says.
+    // What the body binds, on its own: a parameter never named here still
+    // holds what the caller passed, which is what lets a method row match its
+    // receiver (`LAN-103`). `None` when the body could not be enumerated, and
+    // that refuses every receiver, as it refuses every callee below.
+    let rebound = bindings_of(function.body);
     let shadowed = module_bound
-        .zip(bindings_of(function.body))
+        .zip(rebound.clone())
         .map(|(module_names, mut names)| {
             names.extend(module_names.iter().cloned());
             names.extend(parameter_names(function));
@@ -236,6 +241,7 @@ fn lower_function(
         integers,
         collections,
         shadowed,
+        rebound,
         pack: builtin_pack(),
         walks: 0,
         discarding: false,
@@ -1070,6 +1076,11 @@ struct Translator<'a> {
     /// `None` disqualifies every signature: see [`bindings_of`], and
     /// [`landav_fdk::SignaturePack`] for the residual case neither covers.
     shadowed: Option<BTreeSet<String>>,
+    /// Every name this function's body binds, parameters excluded. A
+    /// parameter absent from here holds what the caller passed at every point
+    /// in the body, which is what a method row's receiver rule needs.
+    /// `None` refuses every receiver: see [`bindings_of`].
+    rebound: Option<BTreeSet<String>>,
     /// The signatures a call may be resolved against.
     pack: &'static SignaturePack,
     /// How many collection walks have been lowered, to keep their synthetic
@@ -2336,6 +2347,94 @@ impl Translator<'_> {
         Some(effect_of(row))
     }
 
+    /// What a call the pack cannot *resolve* may nevertheless change in this
+    /// frame. `LAN-103`.
+    ///
+    /// [`Translator::declaration_for`] answers for a callee whose cost is a
+    /// constant; the node stops being a hole. This answers for the rest: a row
+    /// that says the callee cannot rebind a local of the caller's frame - which
+    /// is every row in the pack, `list` and `sorted` and `split` included -
+    /// while saying nothing it can bound about the cost. The call stays a hole
+    /// and denotes omega; what it no longer does is forget the frame, so
+    /// `directories = list(...)` above `for d in directories_list` no longer
+    /// costs that loop its trip count. Measured: 13 of the 42 typed-corpus
+    /// loops still uncounted after `LAN-100` were blocked by exactly this.
+    ///
+    /// # What the row does not cover, and the scan does
+    ///
+    /// The row speaks for the callee. An operand the fragment did not
+    /// translate - the receiver, an argument that reaches no call - may hide a
+    /// walrus or a call to a closure over this frame, and the row knows nothing
+    /// about that. Those are scanned as any refused expression's interior is
+    /// ([`effect_of_untranslated`]); an argument that reaches a call is its own
+    /// node with its own answer and is not scanned twice.
+    ///
+    /// `mutates_arguments` is carried through as the object half of the answer
+    /// and is `true` for every row today: `list(x)` runs `x.__iter__`, which is
+    /// user code, so a collection's length read on entry still goes.
+    fn writes_of_call(&self, call: &ast::ExprCall) -> Writes {
+        let Some(row) = self.row_for(call) else {
+            return Writes::unstated();
+        };
+        if row.rebinds_locals {
+            return Writes::unstated();
+        }
+        let untranslated = core::iter::once(call.func.as_ref()).chain(
+            call_arguments(call).into_iter().filter(|argument| {
+                !reaches_a_call(
+                    argument,
+                    &self.integers,
+                    &self.collections,
+                    self.discarding,
+                    self.value_discarded,
+                )
+            }),
+        );
+        if rebinds_the_frame(untranslated) {
+            return Writes::unstated();
+        }
+        if row.mutates_arguments {
+            Writes::at_most([])
+        } else {
+            Writes::only([])
+        }
+    }
+
+    /// The pack row for a call site, resolvable or not.
+    ///
+    /// A bare name matches under `LAN-94`'s rule: not bound in this module or
+    /// this function. A method matches under `LAN-99`'s: the receiver is a
+    /// parameter annotated with the builtin the row was written for, and -
+    /// the part `LAN-99` did not need, because a rebound receiver has no known
+    /// length either way - never rebound here, so it still holds what the
+    /// caller passed. `obj.copy()` on an unannotated `obj` matches nothing.
+    fn row_for(&self, call: &ast::ExprCall) -> Option<&'static Signature> {
+        match call.func.as_ref() {
+            Expr::Name(callee) => {
+                let callee = callee.id.as_str();
+                if self.is_shadowed(callee) {
+                    return None;
+                }
+                self.pack.row(callee)
+            }
+            Expr::Attribute(method) => {
+                let Expr::Name(receiver) = method.value.as_ref() else {
+                    return None;
+                };
+                let receiver = receiver.id.as_str();
+                let rebound = self
+                    .rebound
+                    .as_ref()
+                    .is_none_or(|names| names.contains(receiver));
+                if !self.collections.contains(receiver) || rebound {
+                    return None;
+                }
+                self.pack.row(method.attr.as_str())
+            }
+            _ => None,
+        }
+    }
+
     /// Whether `name` means something in this source other than the builtin.
     ///
     /// A scope whose bindings could not be enumerated answers `true` for every
@@ -2736,8 +2835,17 @@ impl Translator<'_> {
                         origin,
                     );
                 }
-                self.builder
-                    .unsupported_expr_evaluating(Construct::Call, detail, evaluated, origin)
+                // A callee the pack knows cannot rebind a local, at a cost it
+                // cannot bound. `LAN-103`: the call stays a hole and the loop
+                // below it keeps its trip count.
+                let writes = self.writes_of_call(call);
+                self.builder.unsupported_expr_evaluating_writing(
+                    Construct::Call,
+                    detail,
+                    evaluated,
+                    writes,
+                    origin,
+                )
             }
             Expr::Attribute(attribute) => self.refuse_expr(
                 Construct::Attribute,

@@ -175,6 +175,31 @@ impl SourceProgramBuilder {
         evaluates: Vec<ExprId>,
         origin: Origin,
     ) -> ExprId {
+        self.unsupported_expr_evaluating_writing(
+            construct,
+            detail,
+            evaluates,
+            Writes::unstated(),
+            origin,
+        )
+    }
+
+    /// [`SourceProgramBuilder::unsupported_expr_evaluating`], saying which
+    /// locals evaluating the node may rebind.
+    ///
+    /// The shape of a call the frontend can say *that much* about and no more:
+    /// a signature row that declares the callee cannot rebind a local of the
+    /// caller's frame, while its cost stays unbounded. The node is still a
+    /// hole - `list(x)` is linear in a size this analysis cannot see - and the
+    /// loop below it keeps its trip count. `LAN-103`.
+    pub fn unsupported_expr_evaluating_writing(
+        &mut self,
+        construct: Construct,
+        detail: impl Into<Symbol>,
+        evaluates: Vec<ExprId>,
+        writes: Writes,
+        origin: Origin,
+    ) -> ExprId {
         self.push_expr(
             SourceExpr::Unsupported {
                 construct,
@@ -182,7 +207,7 @@ impl SourceProgramBuilder {
                 bounded_by: None,
                 evaluates,
                 declared: None,
-                writes: Writes::unstated(),
+                writes,
             },
             origin,
         )
