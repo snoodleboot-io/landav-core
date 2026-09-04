@@ -611,8 +611,11 @@ fn the_havoc_corpus_reads_the_parameter_past_refused_bindings() {
         "only {compared} of {examined} program(s) produced a bound past their \
          refused bindings, so the property above is close to vacuous"
     );
+    // The bar is five, against a measured eight of thirty-eight at the time of
+    // writing, after `LAN-102` removed the bias that drew half the corpus's
+    // loops as `range(0, n)`. What this catches is the rate going to nothing.
     assert!(
-        in_the_parameter >= 10,
+        in_the_parameter >= 5,
         "only {in_the_parameter} of {compared} bound(s) derived past a refused \
          binding mention the parameter - the case `LAN-100` exists for, and the \
          only one where forgetting too little would show"

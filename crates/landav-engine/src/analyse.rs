@@ -499,17 +499,15 @@ impl<'a> Walk<'a> {
     ///
     /// Everything else is an over-approximation, and says so.
     fn count_of(&self, range: RangeSpec) -> TripCount {
-        let start = self.program.expr(range.start);
-        let stop = self.program.expr(range.stop);
+        let start = self.literal(range.start);
+        let stop = self.literal(range.stop);
         let step = range.step.get();
 
         // Both endpoints literal: compute the count outright. `i128` because
         // `stop - start` can exceed `i64` when the two straddle the range, and
         // a wrapped subtraction here would be a silently wrong trip count.
-        if let (Some(SourceExpr::Int { value: from }), Some(SourceExpr::Int { value: to })) =
-            (start, stop)
-        {
-            let (from, to, step) = (i128::from(*from), i128::from(*to), i128::from(step));
+        if let (Some(from), Some(to)) = (start, stop) {
+            let (from, to, step) = (i128::from(from), i128::from(to), i128::from(step));
             let span = if step > 0 { to - from } else { from - to };
             let stride = step.abs();
             let count = if span <= 0 {
@@ -532,7 +530,7 @@ impl<'a> Walk<'a> {
         // a `Theta`. Wrapping every reading in `Exact` was sound only while
         // every reading was exact, and `LAN-91` is where that stopped being
         // true. See [`expr_bound::Reading`].
-        if step == 1 && matches!(start, Some(SourceExpr::Int { value: 0 })) {
+        if step == 1 && start == Some(0) {
             return expr_bound::read(self.program, range.stop, &self.readable).map_or(
                 TripCount::Unknown,
                 |reading| {
@@ -545,11 +543,66 @@ impl<'a> Walk<'a> {
             );
         }
 
-        // A symbolic start would need `stop - start`, and a stride above one
-        // would need division. Neither is expressible, and neither has a sound
-        // over-approximation that does not first require knowing the start is
-        // non-negative - which nothing here establishes.
+        // One literal endpoint and one symbolic, unit step either way: `range(k,
+        // n)` and its mirror `range(n, k, -1)`. `LAN-102`. The count is
+        // `max(0, n - k)`, and which of the two it is decides what can be said:
+        //
+        // * `k >= 0`: `n` dominates the count, so `n` is an upper bound and
+        //   nothing here is an equality - `Bound` has no maximum, and `n - k`
+        //   is not a value over the naturals when `n < k`. The counter is still
+        //   dominated by `n`, so `counter_ceiling` is unchanged.
+        // * `k < 0`: the count is `n + |k|`, which *is* a polynomial, and is
+        //   exact exactly when the reading of `n` is.
+        //
+        // A symbolic start *and* stop would need `stop - start`, and a stride
+        // above one would need division. Neither is expressible, and neither
+        // has a sound over-approximation that does not first require knowing
+        // the difference is non-negative - which nothing here establishes.
+        let literal_and_symbolic = match (start, stop, step) {
+            (Some(from), None, 1) => Some((from, range.stop)),
+            (None, Some(to), -1) => Some((to, range.start)),
+            _ => None,
+        };
+        if let Some((literal, symbolic)) = literal_and_symbolic {
+            return expr_bound::read(self.program, symbolic, &self.readable).map_or(
+                TripCount::Unknown,
+                |reading| {
+                    if literal >= 0 {
+                        return TripCount::AtMost(reading.into_bound());
+                    }
+                    let exact = reading.is_exact();
+                    let count = Bound::sum([
+                        reading.into_bound(),
+                        Bound::constant(literal.unsigned_abs()),
+                    ]);
+                    if exact {
+                        TripCount::Exact(count)
+                    } else {
+                        TripCount::AtMost(count)
+                    }
+                },
+            );
+        }
         TripCount::Unknown
+    }
+
+    /// The value of `id` if it is a literal, negated or not.
+    ///
+    /// A frontend writes `-2` as the negation of `2` - it is one in Python's
+    /// grammar - so a loop `range(-2, n)` reached this engine with a start that
+    /// was not [`SourceExpr::Int`] and was holed for it, and so was
+    /// `range(-3, 4)` with both endpoints in hand. `LAN-102`. Only a literal
+    /// under at most one negation qualifies: anything else is arithmetic the
+    /// reading routes handle.
+    fn literal(&self, id: ExprId) -> Option<i64> {
+        match self.program.expr(id)? {
+            SourceExpr::Int { value } => Some(*value),
+            SourceExpr::Neg { operand } => match self.program.expr(*operand)? {
+                SourceExpr::Int { value } => value.checked_neg(),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// A bound on **every value the counter takes**, for `close_over_counter`.
