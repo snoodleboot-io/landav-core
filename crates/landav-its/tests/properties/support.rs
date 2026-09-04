@@ -27,14 +27,14 @@
 
 use std::{collections::BTreeMap, num::NonZeroI64};
 
-use landav_bound::Origin;
+use landav_bound::{Origin, Symbol};
 use landav_its::{
-    ArithOp, CompareOp, CondId, ExprId, RangeSpec, SourceProgram, SourceProgramBuilder, StmtId,
-    VarName,
+    ArithOp, CompareOp, CondId, Construct, ExprId, Extent, RangeSpec, SourceProgram,
+    SourceProgramBuilder, StmtId, VarName, Writes,
 };
 use proptest::prelude::*;
 
-use crate::reference::State;
+use crate::reference::{Oracle, State};
 
 /// The variables a generated assignment may target.
 pub const MUTABLE: [&str; 3] = ["a", "b", "c"];
@@ -113,6 +113,24 @@ pub enum StmtSpec {
         /// The loop body.
         body: Vec<StmtSpec>,
     },
+    /// `READABLE[target] = <a value the engine cannot read>`.
+    ///
+    /// A **refused binding**: the statement is an `Unsupported` node carrying
+    /// `Writes::only` of the one name, and the value it binds is one the
+    /// program does not say - the reference is told it through an [`Oracle`]
+    /// and the engine is told nothing. `LAN-100`: the engine must forget
+    /// exactly `target` here, and a bound derived past this statement must
+    /// still hold whatever `value` turns out to be.
+    ///
+    /// The target ranges over `READABLE`, not `MUTABLE`, on purpose: the
+    /// parameter is the only name the engine can read at all, so rebinding it
+    /// is the one case where reading past the refusal would show.
+    Havoc {
+        /// Which readable variable.
+        target: usize,
+        /// The value the environment supplies.
+        value: i64,
+    },
     /// Return from the function.
     Return,
     /// Abandon the run: `raise`.
@@ -141,6 +159,7 @@ pub struct Materialiser {
     builder: SourceProgramBuilder,
     counters: usize,
     origins: usize,
+    oracle: Oracle,
 }
 
 impl Materialiser {
@@ -155,12 +174,23 @@ impl Materialiser {
             ),
             counters: 0,
             origins: 0,
+            oracle: Oracle::new(),
         }
     }
 
     /// The finished program.
     #[must_use]
-    pub fn finish(mut self, body: &[StmtSpec]) -> SourceProgram {
+    pub fn finish(self, body: &[StmtSpec]) -> SourceProgram {
+        self.finish_with_oracle(body).0
+    }
+
+    /// The finished program, and the values its refused bindings take.
+    ///
+    /// The oracle is keyed by the origin of each [`StmtSpec::Havoc`], which is
+    /// the only thing the program and the reference can agree on about a node
+    /// that has no value in the program.
+    #[must_use]
+    pub fn finish_with_oracle(mut self, body: &[StmtSpec]) -> (SourceProgram, Oracle) {
         // Every variable is initialised on entry, so that the source
         // interpreter and the emitted system start from the same state and no
         // read is of an unbound name.
@@ -174,7 +204,7 @@ impl Materialiser {
         for spec in body {
             statements.extend(self.stmt(spec));
         }
-        self.builder.build(statements)
+        (self.builder.build(statements), self.oracle)
     }
 
     fn origin(&mut self) -> Origin {
@@ -300,6 +330,20 @@ impl Materialiser {
                 )]
             }
 
+            StmtSpec::Havoc { target, value } => {
+                let origin = self.origin();
+                let name = READABLE[target % READABLE.len()];
+                self.oracle
+                    .insert(origin.as_str().to_owned(), i128::from(*value));
+                vec![self.builder.unsupported_stmt_writing(
+                    Construct::NonIntegerValue,
+                    Some(Symbol::from(name)),
+                    Extent::Statement,
+                    Writes::only([VarName::new(name)]),
+                    origin,
+                )]
+            }
+
             StmtSpec::Return => {
                 let origin = self.origin();
                 vec![self.builder.return_stmt(origin)]
@@ -386,7 +430,9 @@ fn contains_loop(body: &[StmtSpec], depth: usize) -> bool {
                 || contains_loop(handler, depth)
                 || contains_loop(cleanup, depth)
         }
-        StmtSpec::Assign { .. } | StmtSpec::Return | StmtSpec::Raise => false,
+        StmtSpec::Assign { .. } | StmtSpec::Havoc { .. } | StmtSpec::Return | StmtSpec::Raise => {
+            false
+        }
     })
 }
 
@@ -403,7 +449,9 @@ fn contains_conditional(body: &[StmtSpec]) -> bool {
                 || contains_conditional(handler)
                 || contains_conditional(cleanup)
         }
-        StmtSpec::Assign { .. } | StmtSpec::Return | StmtSpec::Raise => false,
+        StmtSpec::Assign { .. } | StmtSpec::Havoc { .. } | StmtSpec::Return | StmtSpec::Raise => {
+            false
+        }
     })
 }
 
@@ -423,7 +471,7 @@ pub fn contains_raise(body: &[StmtSpec]) -> bool {
             handler,
             cleanup,
         } => contains_raise(body) || contains_raise(handler) || contains_raise(cleanup),
-        StmtSpec::Assign { .. } | StmtSpec::Return => false,
+        StmtSpec::Assign { .. } | StmtSpec::Havoc { .. } | StmtSpec::Return => false,
     })
 }
 
@@ -455,7 +503,9 @@ pub fn raises_inside_a_loop(body: &[StmtSpec]) -> bool {
                 || raises_inside_a_loop(handler)
                 || raises_inside_a_loop(cleanup)
         }
-        StmtSpec::Assign { .. } | StmtSpec::Return | StmtSpec::Raise => false,
+        StmtSpec::Assign { .. } | StmtSpec::Havoc { .. } | StmtSpec::Return | StmtSpec::Raise => {
+            false
+        }
     })
 }
 
@@ -553,6 +603,70 @@ pub fn arb_body() -> impl Strategy<Value = Vec<StmtSpec>> {
                     arb_endpoint(),
                     arb_endpoint(),
                     prop_oneof![Just(1_i64), Just(2), Just(-1), Just(-2)],
+                    prop::collection::vec(inner, 0..3),
+                )
+                .prop_map(|(target, start, stop, step, body)| StmtSpec::For {
+                    target, start, stop, step, body
+                }),
+        ]
+    });
+
+    prop::collection::vec(statement, 1..4)
+}
+
+/// A statement body with refused bindings in it.
+///
+/// [`arb_body`] with one more leaf: a [`StmtSpec::Havoc`], weighted to land on
+/// the parameter a third of the time, because that is the one name the engine
+/// can read and therefore the one place a refusal that forgot too little would
+/// show. Values run past the parameter's own range so that a bound which read
+/// the parameter across the refusal is exceeded rather than merely wrong.
+///
+/// Deliberately **not** part of [`arb_body`]: `landav_its::lower` refuses the
+/// node, so the transition-system properties would have nothing to compare;
+/// the cost engine is total and does. See `engine_cost`.
+pub fn arb_havoc_body() -> impl Strategy<Value = Vec<StmtSpec>> {
+    let leaf = prop_oneof![
+        6 => (0_usize..MUTABLE.len(), arb_expr())
+            .prop_map(|(target, value)| StmtSpec::Assign { target, value }),
+        3 => (
+                prop_oneof![3 => 0_usize..MUTABLE.len(), 1 => Just(MUTABLE.len())],
+                0_i64..40,
+            )
+            .prop_map(|(target, value)| StmtSpec::Havoc { target, value }),
+        1 => Just(StmtSpec::Return),
+    ];
+
+    // Lighter on `while` than `arb_body`, and heavier on the parameter as an
+    // endpoint: the engine holes every `while` by design, and a hole that is
+    // not a refused binding skips the case. What this corpus is for is a loop
+    // counted on the parameter *past* a refusal, so the weight goes there.
+    let endpoint = || {
+        prop_oneof![
+            2 => arb_small().prop_map(ExprSpec::Int),
+            2 => Just(ExprSpec::Var(MUTABLE.len())),
+            1 => (0_usize..MUTABLE.len()).prop_map(ExprSpec::Var),
+        ]
+    };
+    let statement = leaf.prop_recursive(3, 24, 3, move |inner| {
+        prop_oneof![
+            3 => (arb_cond(), prop::collection::vec(inner.clone(), 0..3),
+                  prop::collection::vec(inner.clone(), 0..3))
+                .prop_map(|(cond, then_body, else_body)| StmtSpec::If {
+                    cond, then_body, else_body
+                }),
+            1 => (0_i64..4, prop::collection::vec(inner.clone(), 0..3))
+                .prop_map(|(trips, body)| StmtSpec::While { trips, body }),
+            // `LAN-102` counts `range(k, n)` and `range(n, k, -1)` for any
+            // literal `k`, so a literal endpoint and the parameter is enough
+            // for a loop whose count a refusal above it can be seen to have
+            // kept or lost. Strides above one are uncounted by design and are
+            // drawn less often for it.
+            6 => (
+                    0_usize..MUTABLE.len(),
+                    endpoint(),
+                    endpoint(),
+                    prop_oneof![2 => Just(1_i64), 2 => Just(-1), 1 => Just(2), 1 => Just(-2)],
                     prop::collection::vec(inner, 0..3),
                 )
                 .prop_map(|(target, start, stop, step, body)| StmtSpec::For {

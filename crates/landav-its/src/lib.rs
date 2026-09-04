@@ -193,6 +193,13 @@
 //! declared refuses exactly as it always has, so the mechanism is an opt-in per
 //! node and never a relaxation of the default.
 //!
+//! A refused node may also say what it can *change* without ceasing to be a
+//! refusal: [`Writes`] names the locals it may rebind and whether it may mutate
+//! an object. [`lower`] ignores it — the node still refuses the program — and
+//! `landav-engine` reads it to decide which values survive the region, in place
+//! of the construct's answer for its whole kind. Same discipline: a node that
+//! says nothing inherits the kind's answer, which is the conservative one.
+//!
 //! ## All-or-nothing is a property of *this path*, not of the toolchain
 //!
 //! It is worth being exact about the scope, because it narrowed. All-or-nothing
@@ -295,18 +302,45 @@ pub mod unsupported;
 pub mod unsupported_node;
 pub mod update;
 pub mod var_name;
+pub mod writes;
 
 pub use crate::{
-    arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId, constraint::Constraint,
-    construct::Construct, cost::Cost, cost_effect::CostEffect, coverage::Coverage,
-    declared_effect::DeclaredEffect, expr_id::ExprId, extent::Extent, guard::Guard, its::Its,
-    its_var::ItsVar, location::Location, location_id::LocationId, lowering::lower,
-    lowering_error::LoweringError, monomial::Monomial, node_id::NodeId, polynomial::Polynomial,
-    range_spec::RangeSpec, refusals::Refusals, relation::Relation, source_cond::SourceCond,
-    source_expr::SourceExpr, source_program::SourceProgram,
-    source_program_builder::SourceProgramBuilder, source_stmt::SourceStmt, stmt_id::StmtId,
-    transition::Transition, unsupported::Unsupported, unsupported_node::UnsupportedNode,
-    update::Update, var_name::VarName,
+    arith_op::ArithOp,
+    compare_op::CompareOp,
+    cond_id::CondId,
+    constraint::Constraint,
+    construct::Construct,
+    cost::Cost,
+    cost_effect::CostEffect,
+    coverage::Coverage,
+    declared_effect::DeclaredEffect,
+    expr_id::ExprId,
+    extent::Extent,
+    guard::Guard,
+    its::Its,
+    its_var::ItsVar,
+    location::Location,
+    location_id::LocationId,
+    lowering::lower,
+    lowering_error::LoweringError,
+    monomial::Monomial,
+    node_id::NodeId,
+    polynomial::Polynomial,
+    range_spec::RangeSpec,
+    refusals::Refusals,
+    relation::Relation,
+    source_cond::SourceCond,
+    source_expr::SourceExpr,
+    source_program::SourceProgram,
+    source_program_builder::SourceProgramBuilder,
+    source_stmt::SourceStmt,
+    stmt_id::StmtId,
+    transition::Transition,
+    unsupported::Unsupported,
+    unsupported_node::UnsupportedNode,
+    update::Update,
+    var_name::VarName,
+    writes::{Locals, Writes},
 };
 
 /// The highest total degree a [`Polynomial`] may reach.

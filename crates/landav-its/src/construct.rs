@@ -222,7 +222,11 @@ impl Construct {
     /// argument is the same one made above for `x.y`. A frontend that can tell
     /// the two apart says so on the node rather than here, and this stays the
     /// **default** that a node with nothing to declare inherits. See
-    /// [`crate::DeclaredEffect`].
+    /// [`crate::DeclaredEffect`] for a node that is no longer a refusal, and
+    /// [`crate::Writes`] for one that still is but knows what it binds:
+    /// `NonIntegerValue` answers `true` because it is also the kind of a
+    /// refused expression hiding a walrus, and `total = <unreadable>` - the
+    /// same kind - overrides it with the one name it rebinds (`LAN-100`).
     #[must_use]
     pub const fn may_rebind_locals(self) -> bool {
         match self {

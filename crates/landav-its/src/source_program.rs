@@ -190,6 +190,7 @@ impl SourceProgram {
                 construct,
                 detail,
                 declared,
+                writes,
                 ..
             } = node
             else {
@@ -202,7 +203,8 @@ impl SourceProgram {
                     origin_at(&self.expr_origins, index, &self.origin),
                     detail.clone(),
                 )
-                .declaring(*declared),
+                .declaring(*declared)
+                .writing(writes.clone()),
             )
         });
         let conds = self.conds.iter().enumerate().filter_map(|(index, node)| {
@@ -210,6 +212,7 @@ impl SourceProgram {
                 construct,
                 detail,
                 declared,
+                writes,
             } = node
             else {
                 return None;
@@ -221,7 +224,8 @@ impl SourceProgram {
                     origin_at(&self.cond_origins, index, &self.origin),
                     detail.clone(),
                 )
-                .declaring(*declared),
+                .declaring(*declared)
+                .writing(writes.clone()),
             )
         });
         let stmts = self.stmts.iter().enumerate().filter_map(|(index, node)| {
@@ -229,6 +233,7 @@ impl SourceProgram {
                 construct,
                 detail,
                 declared,
+                writes,
                 ..
             } = node
             else {
@@ -241,7 +246,8 @@ impl SourceProgram {
                     origin_at(&self.stmt_origins, index, &self.origin),
                     detail.clone(),
                 )
-                .declaring(*declared),
+                .declaring(*declared)
+                .writing(writes.clone()),
             )
         });
         exprs.chain(conds).chain(stmts)

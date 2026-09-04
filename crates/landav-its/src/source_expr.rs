@@ -4,7 +4,7 @@ use landav_bound::Symbol;
 
 use crate::{
     arith_op::ArithOp, construct::Construct, declared_effect::DeclaredEffect, expr_id::ExprId,
-    var_name::VarName,
+    var_name::VarName, writes::Writes,
 };
 
 /// An integer-valued expression, as one arena node.
@@ -207,5 +207,8 @@ pub enum SourceExpr {
         /// What the frontend can nevertheless say about this node's cost and
         /// effect, if anything.
         declared: Option<DeclaredEffect>,
+        /// Which locals of the frame evaluating this may rebind, if the
+        /// frontend can say. See [`Writes`].
+        writes: Writes,
     },
 }
