@@ -97,7 +97,7 @@ pub fn lower_module(path: &Path, source: &str) -> Result<Vec<LoweredFunction>, P
     // empty set.
     let mut lowered = Vec::new();
     for statement in &module {
-        if let Some(definition) = Definition::of(statement) {
+        for definition in Definition::all_of(statement) {
             lowered.push(lower_function(
                 path,
                 &index,
@@ -133,10 +133,45 @@ pub fn lower_module(path: &Path, source: &str) -> Result<Vec<LoweredFunction>, P
 ///
 /// Borrowed and [`Copy`]: the AST stays the sole owner of every part, and
 /// building one of these costs nothing.
+///
+/// # A method is a definition too - `LAN-104`
+///
+/// `lower_module` used to hand over only the definitions in `module.body`, and
+/// a `ClassDef` is not one, so a method was never a [`LoweredFunction`]: not
+/// refused, not holed, not in the coverage denominator - the silence `LAN-93`
+/// closed for `async def`, one nesting level down. Measured on the typed
+/// corpus, that was 35,413 methods against 7,790 module-level functions, and
+/// 69% of the loops. [`Definition::all_of`] yields each `def` directly inside
+/// a module-level class, carrying the class's name so a report says
+/// `Class.method`.
+///
+/// A method body is a function body and the same translator runs over it.
+/// Nothing is claimed about `self`: it is an unannotated parameter, reads of
+/// `self.x` are `Attribute` refusals and stores are `complex-assignment-target`
+/// refusals, exactly as for any other object parameter. A decorator changes
+/// how the function is *called*, not what its body costs, so `@classmethod`,
+/// `@staticmethod` and `@property` are lowered as any method is.
+///
+/// # What a method does not see
+///
+/// A name bound in the **class body** is not visible inside a method as a bare
+/// name - Python resolves `isinstance(x, int)` in a method against the module
+/// and the builtins, never against a class attribute of that name - so the
+/// class body's bindings do **not** join the shadowing set. The module's do,
+/// and the method's own do, as for any function.
+///
+/// # What stays out
+///
+/// A `def` nested inside a function, and a class nested inside a function or
+/// another class. Both are reached only through a scope this walk does not
+/// enter, and a test pins that the omission is a decision.
 #[derive(Clone, Copy)]
 struct Definition<'a> {
     /// The name as written.
     name: &'a str,
+    /// The class this is a method of, if any. `None` for a module-level
+    /// function.
+    class: Option<&'a str>,
     /// The parameter list, which is where `int` and collection annotations are
     /// read from.
     args: &'a ast::Arguments,
@@ -159,17 +194,48 @@ impl<'a> Definition<'a> {
         match statement {
             Stmt::FunctionDef(function) => Some(Self {
                 name: function.name.as_str(),
+                class: None,
                 args: function.args.as_ref(),
                 body: &function.body,
                 range: function.range,
             }),
             Stmt::AsyncFunctionDef(function) => Some(Self {
                 name: function.name.as_str(),
+                class: None,
                 args: function.args.as_ref(),
                 body: &function.body,
                 range: function.range,
             }),
             _ => None,
+        }
+    }
+
+    /// Every definition a module-level `statement` holds: the function it is,
+    /// or the methods of the class it is. See the type's doc for `LAN-104`.
+    fn all_of(statement: &'a Stmt) -> Vec<Self> {
+        if let Some(function) = Self::of(statement) {
+            return vec![function];
+        }
+        let Stmt::ClassDef(class) = statement else {
+            return Vec::new();
+        };
+        class
+            .body
+            .iter()
+            .filter_map(Self::of)
+            .map(|method| Self {
+                class: Some(class.name.as_str()),
+                ..method
+            })
+            .collect()
+    }
+
+    /// The name a report uses: `Class.method` for a method, the bare name
+    /// otherwise.
+    fn qualified_name(&self) -> String {
+        match self.class {
+            Some(class) => format!("{class}.{}", self.name),
+            None => self.name.to_owned(),
         }
     }
 }
@@ -188,7 +254,8 @@ fn lower_function(
     module_bound: Option<&BTreeSet<String>>,
 ) -> LoweredFunction {
     let integers = integer_names(function);
-    let name = function.name.to_owned();
+    let name = function.qualified_name();
+    let class = function.class.map(str::to_owned);
     let location = position(path, index, &function);
     let origin = origin_of(path, index, &function);
 
@@ -251,7 +318,7 @@ fn lower_function(
     let body = translator.block(function.body);
     let program = translator.builder.build(body);
 
-    LoweredFunction::new(name, location, program)
+    LoweredFunction::new(name, class, location, program)
 }
 
 // ---------------------------------------------------------------------------

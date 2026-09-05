@@ -21,6 +21,7 @@ use crate::location::Location;
 #[derive(Debug, Clone)]
 pub struct LoweredFunction {
     name: String,
+    class: Option<String>,
     location: Location,
     program: SourceProgram,
 }
@@ -28,12 +29,28 @@ pub struct LoweredFunction {
 impl LoweredFunction {
     /// Pairs a name and position with the translated program.
     #[must_use]
-    pub const fn new(name: String, location: Location, program: SourceProgram) -> Self {
+    pub const fn new(
+        name: String,
+        class: Option<String>,
+        location: Location,
+        program: SourceProgram,
+    ) -> Self {
         Self {
             name,
+            class,
             location,
             program,
         }
+    }
+
+    /// The class this is a method of, or `None` for a module-level function.
+    ///
+    /// `LAN-104`. [`Self::name`] already carries the qualifier
+    /// (`Class.method`); this is the class on its own, for a consumer that
+    /// groups by it.
+    #[must_use]
+    pub fn class(&self) -> Option<&str> {
+        self.class.as_deref()
     }
 
     /// The function's name, as written.

@@ -154,7 +154,12 @@ pub struct FunctionResource {
 /// One function, and everything concluded about it.
 #[derive(Debug, Serialize)]
 pub struct Function {
+    /// `Class.method` for a method, the bare name otherwise.
     pub name: String,
+    /// The class a method belongs to; absent for a module-level function.
+    /// Added by `LAN-104` without a schema bump: a new field, not a changed one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
     pub file: String,
     pub line: u32,
     pub column: u32,
@@ -382,6 +387,7 @@ impl Collector {
 
         self.functions.push(Function {
             name: function.name().to_owned(),
+            class: function.class().map(str::to_owned),
             file: at.file().display().to_string(),
             line: at.line(),
             column: at.column(),
