@@ -377,7 +377,8 @@ impl Collector {
             .filter(|kind| crate::resource::derives(*kind))
             .and(derived.as_ref())
             .map(|cost| {
-                let projected = crate::resource_bound::ResourceBound::queries_of(cost);
+                let projected =
+                    crate::resource_bound::ResourceBound::queries_of(cost, function.program());
                 FunctionResource {
                     bound: projected.bound,
                     bound_kind: projected.kind,

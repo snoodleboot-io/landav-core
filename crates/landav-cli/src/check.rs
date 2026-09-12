@@ -854,7 +854,7 @@ fn describe_bound(
         );
     };
     let line = describe_cost(&where_, function, derived, records);
-    match resource_clause(derived, resource) {
+    match resource_clause(derived, function.program(), resource) {
         Some(clause) => format!("{line}; {clause}"),
         None => line,
     }
@@ -868,11 +868,12 @@ fn describe_bound(
 /// cannot be given different numbers for the same function.
 fn resource_clause(
     derived: &landav_engine::TripCount,
+    program: &landav_its::SourceProgram,
     resource: Option<ResourceKind>,
 ) -> Option<String> {
     let kind = resource.filter(|kind| crate::resource::derives(*kind))?;
     let descriptor = kind.descriptor();
-    let projected = crate::resource_bound::ResourceBound::queries_of(derived);
+    let projected = crate::resource_bound::ResourceBound::queries_of(derived, program);
     // Silence would read as zero, which is the one reading this whole surface
     // exists to prevent, so a function the projection could not read says so on
     // its own line rather than dropping the clause.
