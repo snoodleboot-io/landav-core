@@ -101,10 +101,29 @@ fn a_symlink_loop_is_a_tool_error_and_terminates() -> io::Result<()> {
 
 /// A directory that contains a symlink back to itself. A naive recursive walk
 /// never returns; the assertion is that the process terminates at all, with a
-/// code, and does not claim the tree is clean.
+/// code.
+///
+/// # This test asserted `!= EXIT_CLEAN`, and `LAN-95` changed the right answer
+///
+/// It was written when the walk followed directory symlinks, so this tree
+/// really did contain a cycle: the walk met it, refused to traverse it, and
+/// reporting the tree clean would have been a claim about files it had not
+/// finished looking at.
+///
+/// `LAN-95` stopped the walk descending a directory symlink at all - a venv's
+/// `lib64 -> lib` was analysing every file under it twice - so there is no
+/// longer a cycle here to meet. The tree beneath `src` is exactly `clean.py`,
+/// every file in it was read, and clean is the truthful answer rather than a
+/// concession. Asserting the old code would now be asserting that the tool
+/// withholds a verdict it is entitled to give.
+///
+/// **The half that was load bearing is unchanged and is why this test stays:**
+/// the process terminates, with a sanctioned code, on a tree that would hang a
+/// naive walk. That is the hazard; the exit code was a consequence of the walk
+/// policy, and the policy moved.
 #[cfg(unix)]
 #[test]
-fn a_directory_symlink_cycle_does_not_hang_or_report_clean() -> io::Result<()> {
+fn a_directory_symlink_cycle_does_not_hang() -> io::Result<()> {
     use std::os::unix::fs::symlink;
 
     let project = Project::new()?;
@@ -116,11 +135,18 @@ fn a_directory_symlink_cycle_does_not_hang_or_report_clean() -> io::Result<()> {
 
     run.assert_did_not_crash();
     run.assert_code_is_sanctioned();
-    assert_ne!(
+    assert_eq!(
         run.code,
         EXIT_CLEAN,
-        "the walk met a cycle it could not fully traverse and still reported \
-         the tree clean.\n{}",
+        "the link is not followed, so the tree is `clean.py` and nothing else, \
+         and every file in it was read. A tool error here would be reporting a \
+         cycle that the walk no longer meets.\n{}",
+        run.describe()
+    );
+    assert!(
+        !run.mentions("cannot be traversed"),
+        "there is no cycle to report: a directory symlink is not descended \
+         into.\n{}",
         run.describe()
     );
     Ok(())

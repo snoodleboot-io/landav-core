@@ -31,6 +31,7 @@
 //! controlled on a pull-request gate, where a timed-out job carries no exit
 //! code at all.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::diagnostic::ToolError;
@@ -83,6 +84,72 @@ fn dir_id(_path: &Path, meta: &std::fs::Metadata) -> Result<DirId, ToolError> {
 fn dir_id(path: &Path, _meta: &std::fs::Metadata) -> Result<DirId, ToolError> {
     std::fs::canonicalize(path)
         .map_err(|err| ToolError::at_path(path, format!("cannot be resolved: {err}")))
+}
+
+/// Whether `path` is itself a symbolic link, rather than what it resolves to.
+///
+/// A failure to `lstat` answers `false`: the caller has already resolved the
+/// path through [`std::fs::metadata`], so the entry exists, and the honest
+/// reading of "cannot tell" here is to treat it as the ordinary directory the
+/// resolution says it is. Skipping on a failed check would drop a real
+/// directory's contents on a transient error.
+fn is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// A source file's identity on the filesystem.
+///
+/// The same notion [`DirId`] carries for a directory, and deliberately not a
+/// canonical path: two **hard links** to one inode are two distinct canonical
+/// paths, so a canonical-path key analyses that file twice and reports it
+/// twice. `(device, inode)` sees it, and sees a bind mount too.
+#[cfg(unix)]
+type FileId = (u64, u64);
+
+/// A source file's identity on the filesystem: a canonical path where inode
+/// numbers are not available.
+#[cfg(not(unix))]
+type FileId = PathBuf;
+
+/// Identify a source file, or `None` if it cannot be resolved.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Identify a source file, or `None` if it cannot be resolved.
+#[cfg(not(unix))]
+fn file_id(path: &Path) -> Option<FileId> {
+    std::fs::canonicalize(path).ok()
+}
+
+/// Drop every source that names a file already in the list.
+///
+/// # Why this is not subsumed by the walk policy
+///
+/// Not descending a directory symlink fixes the case that prompted `LAN-95` -
+/// a venv's `lib64 -> lib` - and it is a rule about *directories*. Two paths
+/// can still reach one file without one: a `.py` symlink to a file inside the
+/// target (which the walk follows deliberately, because it is source), a hard
+/// link, a bind mount. Keying on the file's identity is what makes the count
+/// *correct* rather than usually-correct, and it is what a consumer comparing
+/// two runs needs.
+///
+/// The surviving path is the lexicographically first, because the list is
+/// sorted before this runs - so which of two names for one file gets reported
+/// does not depend on `read_dir` order, and two runs over one tree report the
+/// same path.
+///
+/// A path that cannot be identified is **kept**, under its own name. It was
+/// resolvable a moment ago or it would not be in this list; failing to
+/// deduplicate is a file analysed twice, and dropping it is a file analysed
+/// never, which is the direction that turns a defect into silence.
+fn deduplicate(sources: &mut Vec<PathBuf>) {
+    let mut seen: BTreeSet<FileId> = BTreeSet::new();
+    sources.retain(|path| file_id(path).is_none_or(|id| seen.insert(id)));
 }
 
 /// One directory being walked, and the subdirectories it still owes.
@@ -147,6 +214,7 @@ pub fn collect(target: &Path) -> Result<(Target, Walk), ToolError> {
         Err(problem) => walk.problems.push(problem),
     }
     walk.sources.sort();
+    deduplicate(&mut walk.sources);
     walk.problems.sort_by_key(ToolError::to_string);
     Ok((Target::Directory, walk))
 }
@@ -243,8 +311,31 @@ fn read_level(dir: &Path, walk: &mut Walk) -> Option<Vec<(PathBuf, DirId)>> {
         };
 
         if meta.is_dir() {
+            // A directory reached through a symbolic link is **not** descended
+            // into. `LAN-95`: a CPython virtual environment contains
+            // `lib64 -> lib`, so following it analysed every file under
+            // `.venv/lib` twice - once under each path - and doubled the file
+            // count, the coverage denominator, every `--resource` total, the
+            // findings a CI gate counts, and the wall time. `ruff`, `mypy` and
+            // `pytest` all decline for the same reason.
+            //
+            // Silent rather than a recorded problem, because it is a policy and
+            // not a failure. Where the link points inside the target, the files
+            // are analysed under their real path and nothing is lost; where it
+            // points outside, they are no more this run's business than any
+            // other file outside the target - which is also what stops
+            // `landav check .` being induced to read arbitrary files.
+            //
+            // This leaves the cycle check below nearly unreachable, since a
+            // symbolic link is the ordinary way to make a directory its own
+            // ancestor. It is kept because a bind mount is the other way, and a
+            // walk that does not terminate has no exit code at all.
+            //
             // Note this runs for a directory *named* `something.py` too, which
             // is a directory and not a file that failed to be one.
+            if is_link(&path) {
+                continue;
+            }
             match dir_id(&path, &meta) {
                 Ok(id) => subdirectories.push((path, id)),
                 Err(problem) => walk.problems.push(problem),
