@@ -34,9 +34,12 @@
 //! The two `def` columns agree exactly with what landav reports, which is what
 //! makes the third column a clean measurement of what is missing rather than an
 //! estimate. (`LAN-93` quotes 219 for the second corpus. 219 is the count with
-//! symlinks unfollowed; landav's own walk follows `.venv/lib64 -> lib` and so
-//! analyses that tree twice, which is why its denominator is 14952 rather than
-//! 7571. Against landav's own denominator the loss is 353.)
+//! symlinks unfollowed; the walk followed `.venv/lib64 -> lib` at the time and
+//! so analysed that tree twice, which is why its denominator is 14952 rather
+//! than 7571. Against that denominator the loss is 353. `LAN-95` has since
+//! made the walk analyse each file once, so a run today reports the
+//! undoubled figures; the ratio each column states is unchanged, which is
+//! why the conclusion drawn here still holds.)
 //!
 //! # What the fix owes, and what it does not
 //!
