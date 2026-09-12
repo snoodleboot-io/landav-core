@@ -2423,6 +2423,12 @@ impl Translator<'_> {
             // truncated ledger.
             self.builder.mark_overflowed();
         }
+        if discarded.conceals_a_call() {
+            // And so does a call the scratch could not account for. Losing this
+            // on the way across would publish exactly the confident under-count
+            // `LAN-97` closed, for every value hoisted out of a binding.
+            self.builder.mark_concealed_call();
+        }
         let refusals: Vec<_> = discarded.unsupported_nodes().collect();
         refusals
             .into_iter()
@@ -2821,6 +2827,13 @@ impl Translator<'_> {
                 value_discarded,
             )
         });
+        // `LAN-97`: a call this traversal did not reach gets no node, so it is
+        // in no ledger and no bound, and a projection counting calls would
+        // report a *confident* number below the truth. The program says so
+        // once, here, rather than at each of the arms that can do it.
+        if conceals_a_call(root, &ordered) {
+            self.builder.mark_concealed_call();
+        }
         let mut built: HashMap<usize, ExprId> = HashMap::new();
 
         for node in ordered {
@@ -3413,6 +3426,50 @@ fn generator_parts(generators: &[ast::Comprehension]) -> impl Iterator<Item = &E
     })
 }
 
+/// Whether a call inside `root` is one the traversal that translated it never
+/// reached, and which therefore has no node in the program.
+///
+/// # Why this is asked centrally rather than at each refusal
+///
+/// [`expression_children`] descends into what the *fragment* translates, and a
+/// refused form is deliberately one node whose interior is left alone - that is
+/// what keeps a refused comprehension from producing a refusal per node inside
+/// it, and it is sound for a **cost**, because the enclosing region denotes
+/// `omega` and dominates whatever is inside.
+///
+/// It is not sound for a **count of calls**, and `LAN-96` closed the largest
+/// case by translating a refused call's arguments where one of them reaches a
+/// call. What was left is a list of containers - a callee, a refused binary
+/// operator's operands, a subscript index - each its own widening with its own
+/// blame cost, and a count that was wrong in the meantime. Asking the question
+/// here answers it for every container at once, including the ones nobody has
+/// enumerated yet: whatever the traversal did not reach, it says so.
+///
+/// # What counts as reached
+///
+/// Node identity, not shape. A call the traversal visited has something in the
+/// arena standing for it - a `call` region, a declared node, or the variable
+/// `len(items)` becomes - and is accounted for. Anything else is not.
+///
+/// A **lambda body** is deliberately not walked: [`interior_of`] yields a
+/// lambda's defaults, which are evaluated where it is written, and not its
+/// body, which runs when it is called. A call there is not one this statement
+/// issues.
+fn conceals_a_call(root: &Expr, translated: &[&Expr]) -> bool {
+    let reached: BTreeSet<usize> = translated
+        .iter()
+        .map(|node| std::ptr::from_ref(*node) as usize)
+        .collect();
+    let mut work = vec![root];
+    while let Some(node) = work.pop() {
+        if matches!(node, Expr::Call(_)) && !reached.contains(&(std::ptr::from_ref(node) as usize))
+        {
+            return true;
+        }
+        work.extend(interior_of(node));
+    }
+    false
+}
 /// Whether evaluating `expr` costs nothing at all.
 ///
 /// A name lookup and a literal are free, and a display of free things is free -
