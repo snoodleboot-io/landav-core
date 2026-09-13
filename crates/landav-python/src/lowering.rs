@@ -45,7 +45,7 @@
 //! `MAX_NESTING_DEPTH` (120) before the parser ever runs.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::OnceLock,
 };
@@ -92,12 +92,15 @@ pub fn lower_module(path: &Path, source: &str) -> Result<Vec<LoweredFunction>, P
     // calling the builtin - see `SignaturePack` for the whole caveat and for
     // what this does not cover.
     let module_bound = bindings_of(&module);
+    // What an annotation may read as `typing`'s spelling of a builtin. Computed
+    // once per module, from the same walk as `module_bound`. `LAN-106`.
+    let typing = TypingNames::of(&module);
     // `None` means "this scope binds names this pass could not enumerate", and
     // it disqualifies every signature rather than being silently treated as an
     // empty set.
     let mut lowered = Vec::new();
     for statement in &module {
-        for definition in Definition::all_of(statement) {
+        for definition in Definition::all_of(statement, &typing) {
             lowered.push(lower_function(
                 path,
                 &index,
@@ -172,6 +175,12 @@ struct Definition<'a> {
     /// The class this is a method of, if any. `None` for a module-level
     /// function.
     class: Option<&'a str>,
+    /// That class's body, for a method. A parameter annotation is evaluated in
+    /// the class scope, so what the body binds can change what it means; see
+    /// [`annotation_is_collection`].
+    class_body: Option<&'a [Stmt]>,
+    /// What the module binds only to `typing`. See [`TypingNames`].
+    typing: &'a TypingNames,
     /// The parameter list, which is where `int` and collection annotations are
     /// read from.
     args: &'a ast::Arguments,
@@ -190,11 +199,13 @@ impl<'a> Definition<'a> {
     /// place that decides what counts as a top-level function, so a node type
     /// missing from it is missing from the denominator and says nothing about
     /// itself anywhere in the output. That silence is the whole of `LAN-93`.
-    fn of(statement: &'a Stmt) -> Option<Self> {
+    fn of(statement: &'a Stmt, typing: &'a TypingNames) -> Option<Self> {
         match statement {
             Stmt::FunctionDef(function) => Some(Self {
                 name: function.name.as_str(),
                 class: None,
+                class_body: None,
+                typing,
                 args: function.args.as_ref(),
                 body: &function.body,
                 range: function.range,
@@ -202,6 +213,8 @@ impl<'a> Definition<'a> {
             Stmt::AsyncFunctionDef(function) => Some(Self {
                 name: function.name.as_str(),
                 class: None,
+                class_body: None,
+                typing,
                 args: function.args.as_ref(),
                 body: &function.body,
                 range: function.range,
@@ -212,8 +225,8 @@ impl<'a> Definition<'a> {
 
     /// Every definition a module-level `statement` holds: the function it is,
     /// or the methods of the class it is. See the type's doc for `LAN-104`.
-    fn all_of(statement: &'a Stmt) -> Vec<Self> {
-        if let Some(function) = Self::of(statement) {
+    fn all_of(statement: &'a Stmt, typing: &'a TypingNames) -> Vec<Self> {
+        if let Some(function) = Self::of(statement, typing) {
             return vec![function];
         }
         let Stmt::ClassDef(class) = statement else {
@@ -222,9 +235,10 @@ impl<'a> Definition<'a> {
         class
             .body
             .iter()
-            .filter_map(Self::of)
+            .filter_map(|member| Self::of(member, typing))
             .map(|method| Self {
                 class: Some(class.name.as_str()),
+                class_body: Some(&class.body),
                 ..method
             })
             .collect()
@@ -366,6 +380,49 @@ fn parameter_names(function: Definition<'_>) -> Vec<String> {
         .collect()
 }
 
+/// How one binding site binds its name.
+///
+/// [`bindings_of`] needs only *whether* a name is bound, which is what the
+/// signature pack's shadowing rule asks. Recognising `typing.List` as `list`
+/// needs *how*: a name qualifies only if every one of its bindings is the
+/// `typing` import, and a `class List:` or a `List = something` anywhere in
+/// scope disqualifies it. Both answers come from [`binding_sites`], so the two
+/// consumers cannot come to disagree about which statements bind what.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Binding {
+    /// `from typing import List`, or `... as L`: a `typing` spelling of one of
+    /// [`SIZED_BUILTINS`]. See [`typing_sized_alias`].
+    SizedTypingAlias,
+    /// `import typing`, or `import typing as t`.
+    TypingModule,
+    /// Anything else.
+    Other,
+}
+
+/// The names a scope binds, or `None` if it binds names this pass cannot
+/// enumerate.
+///
+/// A thin reading of [`binding_sites`]; see it for what counts as a binding.
+fn bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    binding_sites(statements, &mut |name, _| {
+        names.insert(name);
+    })
+    .then_some(names)
+}
+
+/// Report each target-bound name as an ordinary binding.
+fn report_targets(target: &Expr, report: &mut dyn FnMut(String, Binding)) {
+    let mut names = BTreeSet::new();
+    collect_target_names(target, &mut names);
+    for name in names {
+        report(name, Binding::Other);
+    }
+}
+
+/// Every binding site in a scope, with how it binds, or `false` if the scope
+/// binds names this pass cannot enumerate.
+///
 /// Every name `statements` bind **in their own scope**.
 ///
 /// # What this is for
@@ -390,26 +447,25 @@ fn parameter_names(function: Definition<'_>) -> Vec<String> {
 ///
 /// A name bound on one branch of an `if` counts as bound. Being wrong in this
 /// direction costs a signature and nothing else.
-fn bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
-    let mut names = BTreeSet::new();
+fn binding_sites(statements: &[Stmt], report: &mut dyn FnMut(String, Binding)) -> bool {
     let mut work: Vec<&Stmt> = statements.iter().rev().collect();
     while let Some(statement) = work.pop() {
         match statement {
             Stmt::Assign(assign) => {
                 for target in &assign.targets {
-                    collect_target_names(target, &mut names);
+                    report_targets(target, report);
                 }
             }
-            Stmt::AnnAssign(assign) => collect_target_names(&assign.target, &mut names),
-            Stmt::AugAssign(assign) => collect_target_names(&assign.target, &mut names),
+            Stmt::AnnAssign(assign) => report_targets(&assign.target, report),
+            Stmt::AugAssign(assign) => report_targets(&assign.target, report),
             Stmt::FunctionDef(node) => {
-                names.insert(node.name.to_string());
+                report(node.name.to_string(), Binding::Other);
             }
             Stmt::AsyncFunctionDef(node) => {
-                names.insert(node.name.to_string());
+                report(node.name.to_string(), Binding::Other);
             }
             Stmt::ClassDef(node) => {
-                names.insert(node.name.to_string());
+                report(node.name.to_string(), Binding::Other);
             }
             Stmt::Import(node) => {
                 for alias in &node.names {
@@ -425,10 +481,23 @@ fn bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
                         },
                         |name| name.to_string(),
                     );
-                    names.insert(bound);
+                    let how = if alias.name.as_str() == "typing" {
+                        Binding::TypingModule
+                    } else {
+                        Binding::Other
+                    };
+                    report(bound, how);
                 }
             }
             Stmt::ImportFrom(node) => {
+                // Only an absolute `from typing import ...`: a relative
+                // `from .typing import List` names a module of this package
+                // that happens to be called `typing`.
+                let from_typing = node
+                    .module
+                    .as_ref()
+                    .is_some_and(|module| module.as_str() == "typing")
+                    && node.level.is_none_or(|level| level.to_u32() == 0);
                 for alias in &node.names {
                     // `from m import *` binds names this pass cannot enumerate.
                     // Recorded as the residual risk in `SignaturePack` rather
@@ -437,17 +506,28 @@ fn bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
                         .asname
                         .as_ref()
                         .map_or_else(|| alias.name.to_string(), |name| name.to_string());
-                    names.insert(bound);
+                    let how = if from_typing && typing_sized_alias(alias.name.as_str()).is_some() {
+                        Binding::SizedTypingAlias
+                    } else {
+                        Binding::Other
+                    };
+                    report(bound, how);
                 }
             }
-            Stmt::Global(node) => names.extend(node.names.iter().map(ToString::to_string)),
-            Stmt::Nonlocal(node) => names.extend(node.names.iter().map(ToString::to_string)),
+            Stmt::Global(node) => node
+                .names
+                .iter()
+                .for_each(|name| report(name.to_string(), Binding::Other)),
+            Stmt::Nonlocal(node) => node
+                .names
+                .iter()
+                .for_each(|name| report(name.to_string(), Binding::Other)),
             Stmt::For(node) => {
-                collect_target_names(&node.target, &mut names);
+                report_targets(&node.target, report);
                 work.extend(node.body.iter().chain(node.orelse.iter()));
             }
             Stmt::AsyncFor(node) => {
-                collect_target_names(&node.target, &mut names);
+                report_targets(&node.target, report);
                 work.extend(node.body.iter().chain(node.orelse.iter()));
             }
             Stmt::While(node) => work.extend(node.body.iter().chain(node.orelse.iter())),
@@ -455,7 +535,7 @@ fn bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
             Stmt::With(node) => {
                 for item in &node.items {
                     if let Some(target) = &item.optional_vars {
-                        collect_target_names(target, &mut names);
+                        report_targets(target, report);
                     }
                 }
                 work.extend(node.body.iter());
@@ -463,7 +543,7 @@ fn bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
             Stmt::AsyncWith(node) => {
                 for item in &node.items {
                     if let Some(target) = &item.optional_vars {
-                        collect_target_names(target, &mut names);
+                        report_targets(target, report);
                     }
                 }
                 work.extend(node.body.iter());
@@ -472,7 +552,7 @@ fn bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
                 for handler in &node.handlers {
                     let ast::ExceptHandler::ExceptHandler(clause) = handler;
                     if let Some(name) = &clause.name {
-                        names.insert(name.to_string());
+                        report(name.to_string(), Binding::Other);
                     }
                     work.extend(clause.body.iter());
                 }
@@ -487,7 +567,7 @@ fn bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
                 for handler in &node.handlers {
                     let ast::ExceptHandler::ExceptHandler(clause) = handler;
                     if let Some(name) = &clause.name {
-                        names.insert(name.to_string());
+                        report(name.to_string(), Binding::Other);
                     }
                     work.extend(clause.body.iter());
                 }
@@ -504,8 +584,8 @@ fn bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
             // disqualifies every signature in it. `match` is refused as a
             // construct anyway, so the coverage this costs is a function that
             // was already blocked.
-            Stmt::Match(_) => return None,
-            Stmt::TypeAlias(node) => collect_target_names(&node.name, &mut names),
+            Stmt::Match(_) => return false,
+            Stmt::TypeAlias(node) => report_targets(&node.name, report),
             Stmt::Return(_)
             | Stmt::Delete(_)
             | Stmt::Raise(_)
@@ -516,7 +596,7 @@ fn bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
             | Stmt::Continue(_) => {}
         }
     }
-    Some(names)
+    true
 }
 
 /// Every plain name an assignment target binds, through tuples and stars.
@@ -576,6 +656,80 @@ fn annotation_is_int(annotation: Option<&Expr>) -> bool {
 /// `__iter__` are two methods that need not agree.
 const SIZED_BUILTINS: [&str; 7] = ["list", "tuple", "set", "frozenset", "dict", "str", "bytes"];
 
+/// `typing`'s spellings of [`SIZED_BUILTINS`], and the builtin each one is.
+///
+/// `LAN-106`. `typing.List[str]` *is* `list[str]`: PEP 585 made the lowercase
+/// spelling subscriptable and deprecated these, and nothing else changed. So
+/// recognising them adds no trust the frontend does not already place in the
+/// lowercase name - see [`annotation_is_collection`] - and measured on the typed
+/// corpus, 28 loops iterate a parameter annotated with one, 8 of which survive
+/// to a bound.
+///
+/// Deliberately **not** the abstract types. `Sequence`, `Collection` and
+/// `Mapping` are not builtins under another name: `len()` on one calls a user
+/// `__len__`, which a broken implementation can make disagree with how many
+/// times a `for` runs, and CPython guarantees that agreement only for the
+/// concrete builtins. Admitting them is a weaker trust and is `LAN-106`'s
+/// second half, a decision rather than a gap.
+const TYPING_SIZED_ALIASES: [(&str, &str); 6] = [
+    ("List", "list"),
+    ("Tuple", "tuple"),
+    ("Set", "set"),
+    ("FrozenSet", "frozenset"),
+    ("Dict", "dict"),
+    ("Text", "str"),
+];
+
+/// The builtin a `typing` name stands for, if it is one of [`SIZED_BUILTINS`].
+fn typing_sized_alias(name: &str) -> Option<&'static str> {
+    TYPING_SIZED_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map(|(_, builtin)| *builtin)
+}
+
+/// The names a module binds **only** to `typing`, as an annotation sees them.
+///
+/// A name qualifies only if *every* binding of it in the module is the `typing`
+/// import. `from typing import List` then `class List: ...`, or a second
+/// `from mymodels import List`, leaves `List` meaning something else by the
+/// time an annotation reads it, and is not admitted. That is why this is read
+/// from [`binding_sites`] - the same walk the signature pack's shadowing rule
+/// uses - rather than from the import statements alone.
+///
+/// A scope whose bindings cannot be enumerated admits nothing, which costs
+/// coverage and never soundness.
+#[derive(Debug, Default)]
+struct TypingNames {
+    /// Bound only to a sized alias: `List`, or `L` for `from typing import List as L`.
+    aliases: BTreeSet<String>,
+    /// Bound only to the `typing` module: `typing`, or `t` for `import typing as t`.
+    modules: BTreeSet<String>,
+}
+
+impl TypingNames {
+    /// What `statements` bind only to `typing`.
+    fn of(statements: &[Stmt]) -> Self {
+        let mut how: BTreeMap<String, BTreeSet<Binding>> = BTreeMap::new();
+        let enumerable = binding_sites(statements, &mut |name, binding| {
+            how.entry(name).or_default().insert(binding);
+        });
+        if !enumerable {
+            return Self::default();
+        }
+        let only = |wanted: Binding| {
+            how.iter()
+                .filter(|(_, bindings)| bindings.len() == 1 && bindings.contains(&wanted))
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        Self {
+            aliases: only(Binding::SizedTypingAlias),
+            modules: only(Binding::TypingModule),
+        }
+    }
+}
+
 /// Whether an annotation names a builtin collection whose length bounds
 /// iteration over it.
 ///
@@ -586,17 +740,83 @@ const SIZED_BUILTINS: [&str; 7] = ["list", "tuple", "set", "frozenset", "dict", 
 /// This trusts the annotation exactly as far as [`annotation_is_int`] trusts
 /// `int`: Python does not enforce either at runtime, and a frontend that
 /// declines to trust annotations has nothing left to reason from.
-fn annotation_is_collection(annotation: Option<&Expr>) -> bool {
+///
+/// # `typing`'s spellings - `LAN-106`
+///
+/// `List[int]` after `from typing import List`, and `typing.List[int]` or
+/// `t.List[int]` after `import typing [as t]`, are the same builtin under an
+/// older name, and are admitted on the same trust. See [`TYPING_SIZED_ALIASES`]
+/// for why the abstract collection types are not.
+///
+/// The name has to be `typing`'s where the annotation is read. `class_bound`
+/// is the enclosing class body's bindings, for a method: a parameter annotation
+/// is evaluated in the **class** scope when the `def` runs, so a class that
+/// binds `List` for itself has changed what the annotation means. That is the
+/// opposite of what `LAN-104` found for a bare name in a method *body*, which
+/// skips the class scope; annotations are the one place it does not.
+fn annotation_is_collection(
+    annotation: Option<&Expr>,
+    typing: &TypingNames,
+    class_bound: &ClassBound,
+) -> bool {
+    // `list[int]`, `dict[str, int]`, `List[int]`, `typing.List[int]` - the
+    // value is what is subscripted, and the element type says nothing about how
+    // many there are.
     let named = match annotation {
-        Some(Expr::Name(name)) => name.id.as_str(),
-        // `list[int]`, `dict[str, int]` - the value is what is subscripted.
-        Some(Expr::Subscript(subscript)) => match subscript.value.as_ref() {
-            Expr::Name(name) => name.id.as_str(),
-            _ => return false,
-        },
-        _ => return false,
+        Some(Expr::Subscript(subscript)) => subscript.value.as_ref(),
+        Some(other) => other,
+        None => return false,
     };
-    SIZED_BUILTINS.contains(&named)
+    match named {
+        Expr::Name(name) => {
+            let name = name.id.as_str();
+            SIZED_BUILTINS.contains(&name)
+                || (typing.aliases.contains(name) && !class_bound.binds(name))
+        }
+        Expr::Attribute(attribute) => match attribute.value.as_ref() {
+            Expr::Name(module) => {
+                let module = module.id.as_str();
+                typing.modules.contains(module)
+                    && !class_bound.binds(module)
+                    && typing_sized_alias(attribute.attr.as_str()).is_some()
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The names a method's enclosing class body binds, for the annotation check.
+///
+/// Three states rather than an `Option`, because "not a method" and "a class
+/// body whose bindings cannot be enumerated" are opposite answers: the first
+/// shadows nothing, the second may shadow anything.
+enum ClassBound {
+    /// A module-level function: no class scope to shadow anything.
+    NotAMethod,
+    /// A method, and the names its class body binds.
+    Binds(BTreeSet<String>),
+    /// A method whose class body binds names this pass cannot enumerate.
+    Unknown,
+}
+
+impl ClassBound {
+    /// For `function`, from its class body if it has one.
+    fn of(function: Definition<'_>) -> Self {
+        match function.class_body {
+            None => Self::NotAMethod,
+            Some(body) => bindings_of(body).map_or(Self::Unknown, Self::Binds),
+        }
+    }
+
+    /// Whether the class scope may rebind `name`.
+    fn binds(&self, name: &str) -> bool {
+        match self {
+            Self::NotAMethod => false,
+            Self::Binds(names) => names.contains(name),
+            Self::Unknown => true,
+        }
+    }
 }
 
 /// The parameters annotated with a sized builtin collection, in declaration
@@ -630,12 +850,19 @@ fn annotation_is_collection(annotation: Option<&Expr>) -> bool {
 /// disqualifies every parameter, which costs coverage and never soundness.
 fn collection_parameters(function: Definition<'_>) -> Vec<String> {
     let arguments = function.args;
+    let class_bound = ClassBound::of(function);
     let rebound = target_bindings_of(function.body);
     arguments
         .posonlyargs
         .iter()
         .chain(arguments.args.iter())
-        .filter(|parameter| annotation_is_collection(parameter.def.annotation.as_deref()))
+        .filter(|parameter| {
+            annotation_is_collection(
+                parameter.def.annotation.as_deref(),
+                function.typing,
+                &class_bound,
+            )
+        })
         .map(|parameter| parameter.def.arg.to_string())
         .filter(|name| !rebound.as_ref().is_none_or(|names| names.contains(name)))
         .collect()
