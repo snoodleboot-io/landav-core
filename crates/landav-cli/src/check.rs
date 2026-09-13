@@ -338,6 +338,9 @@ fn analyse(
                 lowered: coverage.lowered(),
                 analysed,
                 coverage_percent: coverage.percent(),
+                // `inconclusive` is incremented in exactly one place - a file
+                // the frontend could not parse - so it is this count.
+                unreadable_files: inconclusive,
                 refusals: coverage.refusals(),
                 findings,
                 suppressed: waived.suppressed(),
@@ -1065,11 +1068,33 @@ fn summarise<W: std::io::Write>(
         waived.suppressed,
         plural(waived.stale, "stale waiver"),
         inconclusive,
-        coverage.summary(),
+        coverage_clause(coverage, inconclusive),
         engine_reach(analysed, coverage.units()),
         describe_resource(resource),
         config.source()
     ));
+}
+
+/// The coverage clause, naming the files whose functions it could not count.
+///
+/// `LAN-82`. A file the frontend cannot parse contributes no functions to the
+/// denominator, so `1 of 1 function(s) lowered (100%)` can be printed for a
+/// directory holding a second file nobody read. The run's verdict was already
+/// honest - `inconclusive`, and the file named on its own line - but the
+/// percentage sat beside it looking complete: coverage did not drop, it shrank
+/// its own base. So the clause says what it is over, whenever that is not the
+/// whole target.
+fn coverage_clause(coverage: &Coverage, unreadable: usize) -> String {
+    let clause = coverage.summary();
+    if unreadable == 0 {
+        return clause;
+    }
+    format!(
+        "{clause}, over the files that could be read ({} could not be read as \
+         Python, and {} functions are counted nowhere)",
+        plural(unreadable, "file"),
+        if unreadable == 1 { "its" } else { "their" }
+    )
 }
 
 /// The engine's reach, as a clause, next to the lowered count and never merged

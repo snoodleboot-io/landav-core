@@ -94,7 +94,24 @@ pub struct Summary {
     /// `lowered / functions`, as a percentage, or `null` when there were no
     /// functions - which is not the same as zero percent and must not be
     /// reported as it.
+    ///
+    /// **Over the files that could be read.** A file the frontend cannot parse
+    /// contributes no functions to either count, so where
+    /// [`Self::unreadable_files`] is non-zero this *overstates* coverage of the
+    /// target as a whole. It is not withheld, because one unreadable file in a
+    /// large tree would then erase the figure for every file that was read -
+    /// the Python 3.12 standard library has three - and the run's `outcome` is
+    /// already `inconclusive` whenever it happens, which is the signal a gate
+    /// acts on. A gate thresholding on this number should read it beside
+    /// `unreadable_files`. `LAN-82`.
     pub coverage_percent: Option<u32>,
+    /// Files the frontend could not read as Python.
+    ///
+    /// The functions in them are in no count in this summary, because they
+    /// cannot be counted without being parsed. Each one is also named, with
+    /// its position and the parser's reason, in the run's `problems`. Always
+    /// present, so a gate watching it can see it change. `LAN-82`.
+    pub unreadable_files: usize,
     /// Total refused constructs. Occurrences, not functions: one function
     /// refusing for several reasons contributes several.
     pub refusals: usize,
