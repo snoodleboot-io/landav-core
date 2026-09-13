@@ -48,39 +48,45 @@
 //! result is reported as `partial`, and no number is offered. A zero is the most
 //! dangerous answer available here, because every gate passes it.
 //!
-//! # What this number still does not see, stated rather than hidden
+//! # What the number now guarantees, and what it costs
 //!
-//! A call written inside another call's **arguments** used to vanish:
-//! `expression_children` gave a refused form no children, so `fetch(g(n))`
-//! built one `Unsupported` node and reported `1`. `LAN-96` closed that - the
-//! frontend now translates a refused call's arguments and the refusal points at
-//! them - and the count for that shape is right.
+//! **A confident count has descended into every refused container.** `exact`
+//! and `upper` are offered only where the frontend accounted for every call in
+//! the function; where one was left inside a refused node it did not translate,
+//! the result is `partial` and no number is offered. `LAN-97`.
 //!
-//! Three neighbouring containers are not closed, and each is a *different*
-//! widening with its own measurement rather than a residue of the same one:
+//! That is a change of *direction* rather than of precision. A call written in
+//! a refused container - a callee, a refused binary operator's operand, a
+//! subscript index - exists in no arena, so it is in no ledger and in no bound,
+//! and a projection reading coefficients cannot see that it is missing.
+//! `lookup(n).method()` is one `call` hole whose coefficient reads as `1`, for
+//! a statement issuing two. Measured over `/usr/lib/python3.12` and a typed
+//! corpus, both deduplicated by real path, 30.1% and 11.3% of confident results
+//! were below an `ast`-derived truth and labelled `exact`.
 //!
-//! * a call in the **callee**: `(a() / b()).read_bytes()` counts the
-//!   `read_bytes` and not the two calls that produced the object it is read
-//!   from;
-//! * a call among the operands of a refused **binary operator**:
-//!   `_create("%s.%s" % (host(), pid()))` counts the outer call alone;
-//! * a call inside a **subscript index** or an **attribute chain**, which is
-//!   the one place this is not a low number: those regions survive into the
-//!   query bound unfilled, so the run reports `partial` and offers no number at
-//!   all.
+//! Closing each container is an ordinary precision improvement - it moves
+//! functions from `partial` back to a number - and each carries its own blame
+//! cost, which is why `LAN-96` did one and stopped. What could not wait is the
+//! *label*: an unhelpful `partial` costs a reader nothing, and a confident 10
+//! for a function issuing 78 costs them an incident. So the count fails closed,
+//! and the containers are widened on their own schedule underneath it.
 //!
-//! Measured over `/usr/lib/python3.12` and the typed corpus, deduplicated by
-//! real path, the confident numbers that are below a `ast`-derived truth went
-//! from 229/570 (40.2%) to 174/570 (30.5%) and from 412/1795 (23.0%) to
-//! 200/1779 (11.2%). What remains is the list above, not the nested-call gap.
-//! **`queries` is still not a hard budget gate on code that hides a call in a
-//! callee, an operand or an index**; it is recorded here, next to the number,
-//! rather than in a ticket nobody reading the number will open.
+//! The trade is visible and was measured rather than assumed: the count of
+//! confident results falls, and that number is recorded beside the under-count
+//! rate in `LAN-97` so a reader can see what honesty cost.
+//!
+//! The frontend answers the question - see
+//! [`landav_its::SourceProgram::conceals_a_call`] - because whether a container
+//! was descended into is a fact about the translation, not about the bound.
+//! **Nothing here reads that flag for the cost bound**, and nothing should: the
+//! enclosing region dominates the concealed call, so the cost is as sound as it
+//! ever was, and only a projection that counts *individual* calls is defeated.
 
 use std::collections::BTreeSet;
 
 use landav_bound::{Bound, BoundKind, Nat, TotalValuation, VarId};
 use landav_engine::{Hole, TripCount};
+use landav_its::SourceProgram;
 
 /// What the run may report for the selected resource, for one function.
 ///
@@ -122,7 +128,7 @@ impl ResourceBound {
     /// reason that left no node in the arena has no cost here and therefore no
     /// query count either, rather than a plausible-looking one.
     #[must_use]
-    pub fn queries_of(cost: &TripCount) -> Self {
+    pub fn queries_of(cost: &TripCount, program: &SourceProgram) -> Self {
         let Some(bound) = cost.bound() else {
             return Self::undetermined();
         };
@@ -140,7 +146,11 @@ impl ResourceBound {
             // number obtained by guessing which factor was the trip count.
             return Self::undetermined();
         };
-        let unread = derived.vars().iter().any(Hole::is_hole);
+        // A call the frontend could not account for is a call no coefficient
+        // in this bound stands for, so no arithmetic here can notice it is
+        // missing. `LAN-97`: the claim fails closed rather than naming a number
+        // below the truth. See `SourceProgram::conceals_a_call`.
+        let unread = derived.vars().iter().any(Hole::is_hole) || program.conceals_a_call();
         Self {
             kind: Some(if unread {
                 // The count mentions a region nobody read, and an unfilled hole
@@ -155,7 +165,12 @@ impl ResourceBound {
             } else {
                 "upper"
             }),
-            value: closed_value(&derived),
+            // Withheld for a concealed call as well as for an unread region:
+            // this is the field a gate thresholds on, and it is the one place
+            // a low number does the damage.
+            value: (!program.conceals_a_call())
+                .then(|| closed_value(&derived))
+                .flatten(),
             bound: Some(derived.to_string()),
         }
     }
@@ -268,6 +283,7 @@ mod tests {
     use super::{ResourceBound, charge_calls};
     use landav_bound::{Bound, Origin, VarId};
     use landav_engine::{Hole, TripCount};
+    use landav_its::{SourceProgram, SourceProgramBuilder};
     use std::collections::BTreeSet;
 
     fn call_hole(index: usize) -> Hole {
@@ -313,6 +329,22 @@ mod tests {
 
     /// A branch takes the worse arm and not the sum, matching how the engine
     /// already joins branches.
+    /// A program with nothing in it, which therefore conceals no call.
+    ///
+    /// Every projection test below is about the *arithmetic*, so it is handed a
+    /// program that makes no claim of its own. The two tests at the end are
+    /// about the flag itself.
+    fn accounted() -> SourceProgram {
+        SourceProgramBuilder::new("f", Origin::new("q.py:1:1"), Vec::new()).build(Vec::new())
+    }
+
+    /// The same, having left a call inside something it did not translate.
+    fn concealing() -> SourceProgram {
+        let mut builder = SourceProgramBuilder::new("f", Origin::new("q.py:1:1"), Vec::new());
+        builder.mark_concealed_call();
+        builder.build(Vec::new())
+    }
+
     #[test]
     fn a_branch_takes_the_worse_arm() {
         let (left, right, only) = (call_hole(0), call_hole(1), call_hole(2));
@@ -340,11 +372,14 @@ mod tests {
     #[test]
     fn an_unread_region_is_partial_and_offers_no_number() {
         let opaque = while_hole(0);
-        let derived = ResourceBound::queries_of(&TripCount::Partial {
-            bound: Bound::sum([Bound::one(), opaque.as_bound()]),
-            holes: vec![opaque],
-            exact_elsewhere: true,
-        });
+        let derived = ResourceBound::queries_of(
+            &TripCount::Partial {
+                bound: Bound::sum([Bound::one(), opaque.as_bound()]),
+                holes: vec![opaque],
+                exact_elsewhere: true,
+            },
+            &accounted(),
+        );
         assert_eq!(derived.kind, Some("partial"));
         assert_eq!(
             derived.value, None,
@@ -358,7 +393,8 @@ mod tests {
     /// printed.
     #[test]
     fn a_fully_derived_function_with_no_call_reports_zero_exactly() {
-        let derived = ResourceBound::queries_of(&TripCount::Exact(Bound::constant(4)));
+        let derived =
+            ResourceBound::queries_of(&TripCount::Exact(Bound::constant(4)), &accounted());
         assert_eq!(derived.value, Some(0));
         assert_eq!(derived.kind, Some("exact"));
     }
@@ -368,19 +404,75 @@ mod tests {
     #[test]
     fn an_approximated_bound_yields_an_upper_count() {
         let hole = call_hole(0);
-        let derived = ResourceBound::queries_of(&TripCount::Partial {
-            bound: Bound::sum([Bound::one(), hole.as_bound()]),
-            holes: vec![hole],
-            exact_elsewhere: false,
-        });
+        let derived = ResourceBound::queries_of(
+            &TripCount::Partial {
+                bound: Bound::sum([Bound::one(), hole.as_bound()]),
+                holes: vec![hole],
+                exact_elsewhere: false,
+            },
+            &accounted(),
+        );
         assert_eq!(derived.kind, Some("upper"));
         assert_eq!(derived.value, Some(1));
+    }
+
+    /// **A concealed call withholds the number and the confident label.**
+    ///
+    /// The arithmetic is the same in both calls below - one call hole over a
+    /// fully derived cost, which reads as a confident `1`. What differs is
+    /// whether the frontend accounted for every call in the function. Where it
+    /// did not, there is a call this bound has no coefficient for, so no
+    /// arithmetic here could notice the `1` is low. `LAN-97`.
+    #[test]
+    fn a_concealed_call_is_partial_and_offers_no_number() {
+        let shape = || {
+            let hole = call_hole(0);
+            TripCount::Partial {
+                bound: Bound::sum([Bound::one(), hole.as_bound()]),
+                holes: vec![hole],
+                exact_elsewhere: true,
+            }
+        };
+        let accounted = ResourceBound::queries_of(&shape(), &accounted());
+        assert_eq!(accounted.kind, Some("exact"));
+        assert_eq!(accounted.value, Some(1));
+
+        let concealed = ResourceBound::queries_of(&shape(), &concealing());
+        assert_eq!(
+            concealed.kind,
+            Some("partial"),
+            "a count that cannot see one of the calls is not a complete claim"
+        );
+        assert_eq!(
+            concealed.value, None,
+            "this is the field a gate thresholds on, and a low number here is \
+             what waves a function past its budget"
+        );
+    }
+
+    /// **A concealed call does not withhold the count of a function with no
+    /// call in it at all.** It still reports `partial` - the flag says a call
+    /// was left unaccounted for, and this projection has no way to know the
+    /// hidden one is somewhere else - but the direction is checked: the number
+    /// is withheld, never invented.
+    #[test]
+    fn a_concealed_call_never_raises_a_count() {
+        let concealed =
+            ResourceBound::queries_of(&TripCount::Exact(Bound::constant(4)), &concealing());
+        assert_eq!(concealed.kind, Some("partial"));
+        assert_eq!(concealed.value, None);
+        assert_eq!(
+            concealed.bound.as_deref(),
+            Some("0"),
+            "the expression is still what the arithmetic found; it is the \
+             *label* that stops calling it complete"
+        );
     }
 
     /// Nothing derived is three absences, and never a zero.
     #[test]
     fn an_underived_function_reports_no_number() {
-        let derived = ResourceBound::queries_of(&TripCount::Unknown);
+        let derived = ResourceBound::queries_of(&TripCount::Unknown, &accounted());
         assert_eq!(derived.value, None);
         assert_eq!(derived.kind, None);
         assert_eq!(derived.bound, None);
@@ -392,11 +484,14 @@ mod tests {
     fn a_symbolic_count_is_reported_symbolically() {
         let hole = call_hole(0);
         let body = Bound::sum([Bound::constant(2), hole.as_bound()]);
-        let derived = ResourceBound::queries_of(&TripCount::Partial {
-            bound: Bound::prod([Bound::var("n"), body]),
-            holes: vec![hole],
-            exact_elsewhere: true,
-        });
+        let derived = ResourceBound::queries_of(
+            &TripCount::Partial {
+                bound: Bound::prod([Bound::var("n"), body]),
+                holes: vec![hole],
+                exact_elsewhere: true,
+            },
+            &accounted(),
+        );
         assert_eq!(derived.bound.as_deref(), Some("n"));
         assert_eq!(derived.value, None);
         assert_eq!(derived.kind, Some("exact"));

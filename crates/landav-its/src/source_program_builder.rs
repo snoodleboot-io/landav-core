@@ -41,6 +41,7 @@ pub struct SourceProgramBuilder {
     stmt_origins: Vec<Origin>,
     origin: Origin,
     overflowed: bool,
+    conceals_a_call: bool,
     volatile: BTreeSet<VarName>,
 }
 
@@ -60,6 +61,7 @@ impl SourceProgramBuilder {
             stmt_origins: Vec::new(),
             origin,
             overflowed: false,
+            conceals_a_call: false,
             volatile: BTreeSet::new(),
         }
     }
@@ -570,6 +572,18 @@ impl SourceProgramBuilder {
         self.overflowed = true;
     }
 
+    /// Records that a refused node in this program hides a call the frontend
+    /// did not translate.
+    ///
+    /// See [`crate::SourceProgram::conceals_a_call`], where the argument lives.
+    /// Like the overflow flag this only ever sets: a frontend that translates
+    /// into a scratch builder and hoists the refusals across has to carry it
+    /// over, and a flag that could be cleared would make that a place to get
+    /// it wrong.
+    pub const fn mark_concealed_call(&mut self) {
+        self.conceals_a_call = true;
+    }
+
     // -- finishing ----------------------------------------------------------
 
     /// The finished program, with `body` as the function's top-level
@@ -588,6 +602,7 @@ impl SourceProgramBuilder {
             body,
             origin: self.origin,
             overflowed: self.overflowed,
+            conceals_a_call: self.conceals_a_call,
             volatile: self.volatile,
         }
     }

@@ -46,6 +46,7 @@ pub struct SourceProgram {
     pub(crate) body: Vec<StmtId>,
     pub(crate) origin: Origin,
     pub(crate) overflowed: bool,
+    pub(crate) conceals_a_call: bool,
     pub(crate) volatile: BTreeSet<VarName>,
 }
 
@@ -147,6 +148,43 @@ impl SourceProgram {
     #[must_use]
     pub const fn overflowed(&self) -> bool {
         self.overflowed
+    }
+
+    /// Whether a refused node in this program hides a call the frontend did
+    /// not translate.
+    ///
+    /// # What it is for, and why it is not a refusal
+    ///
+    /// A refused node is normally its own account: it becomes a hole, and a
+    /// consumer reading the holes sees it. A refused node's **interior** is
+    /// not, because a refused form is one node whose children the frontend
+    /// need not translate - that is what keeps a refused comprehension from
+    /// producing a refusal per node inside it. A call in such an interior
+    /// exists in no arena, so it is in no ledger and no bound.
+    ///
+    /// For a **cost** that is harmless: the enclosing node denotes `omega` and
+    /// dominates whatever is inside it. For a **count of calls** it is not, and
+    /// that asymmetry is the whole of `LAN-97`. `lookup(n).method()` is one
+    /// `call` hole - the `.method()` - whose coefficient a projection reads as
+    /// `1`, and `lookup` is nowhere: a *confident* count of one for a statement
+    /// issuing two. Measured, a third of stdlib `queries` results were below
+    /// the truth and labelled `exact`.
+    ///
+    /// So the frontend says here that it left a call unaccounted for, and a
+    /// consumer counting calls **fails closed** on it - reports `partial` and
+    /// offers no number - rather than publishing a number a budget gate would
+    /// wave through. It is deliberately one flag for the whole program: a
+    /// count is a claim about the function, so one concealed call anywhere in
+    /// it disqualifies the claim, and there is nothing a finer answer would let
+    /// a consumer do.
+    ///
+    /// Nothing about the **cost** bound changes with this. A cost consumer must
+    /// not read it: the enclosing region already dominates the concealed call,
+    /// and a bound that is correct does not become less so because a different
+    /// projection cannot use it.
+    #[must_use]
+    pub const fn conceals_a_call(&self) -> bool {
+        self.conceals_a_call
     }
 
     /// Every `Unsupported` node in the program, in canonical arena order,
