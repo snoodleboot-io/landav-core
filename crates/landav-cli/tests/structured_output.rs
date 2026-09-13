@@ -301,6 +301,7 @@ fn the_summary_supports_gating() -> io::Result<()> {
         "findings",
         "suppressed",
         "stale_waivers",
+        "unreadable_files",
     ] {
         assert!(
             summary[field].is_u64(),
