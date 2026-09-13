@@ -185,6 +185,47 @@ fn a_path_and_stdin_together_are_refused() -> io::Result<()> {
     Ok(())
 }
 
+/// **A child that exits without reading stdin is not a harness error.** `LAN-107`.
+///
+/// `a_path_and_stdin_together_are_refused` failed intermittently under a loaded
+/// full run with `Error: Os { code: 32, kind: BrokenPipe }`, and never in
+/// isolation. The binary rejects `check <path> --stdin` and exits without
+/// reading its input, and if it exited before the harness wrote the snippet,
+/// the write failed and the error surfaced before the exit code was checked.
+/// The product was right; the harness raced it.
+///
+/// This forces the race rather than waiting for it. A payload larger than the
+/// pipe buffer - 64 KiB on Linux - cannot be written until the child reads, and
+/// a child rejecting its arguments never does, so the write *always* meets a
+/// closed pipe. Before the fix this returned `Err(BrokenPipe)` every time.
+#[test]
+fn a_child_that_rejects_its_arguments_before_reading_stdin_still_reports() -> io::Result<()> {
+    let project = Project::new()?;
+    let target = project.write("same.py", SNIPPET)?;
+    let oversized = "# padding so the write cannot fit in the pipe buffer\n".repeat(40_000);
+    assert!(
+        oversized.len() > 1 << 20,
+        "the payload must exceed the pipe buffer by a wide margin, or the write can \
+         complete before the child exits and the race is not forced"
+    );
+    let run = project
+        .run_with_stdin(&["check", &target.to_string_lossy(), "--stdin"], &oversized)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the harness returned an error instead of the child's result: {error}. \
+                 A child that exits without reading stdin is legitimate, and its exit \
+                 code is the answer"
+            )
+        });
+    assert_eq!(
+        run.code,
+        EXIT_TOOL_ERROR,
+        "supplying both is still a usage error: {}",
+        run.describe()
+    );
+    Ok(())
+}
+
 #[test]
 fn neither_a_path_nor_stdin_is_refused() -> io::Result<()> {
     let project = Project::new()?;

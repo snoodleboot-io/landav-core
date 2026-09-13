@@ -317,7 +317,19 @@ impl Project {
         // that do not all relax the panic lints, and a hang here would be much
         // harder to diagnose than a returned error.
         match child.stdin.take() {
-            Some(mut pipe) => pipe.write_all(source.as_bytes())?,
+            Some(mut pipe) => match pipe.write_all(source.as_bytes()) {
+                Ok(()) => {}
+                // The child exited without reading its input. That is a
+                // legitimate thing for it to do - rejecting its arguments before
+                // reaching stdin is exactly what a usage-error test checks for -
+                // and its exit code is the answer. Propagating the pipe error
+                // failed the test before the assertion on that code was ever
+                // reached, and only when the child happened to win the race,
+                // which is why it failed under a loaded full run and never in
+                // isolation. `LAN-107`.
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+                Err(error) => return Err(error),
+            },
             None => {
                 return Err(io::Error::other(
                     "stdin was requested as a pipe but the child did not provide one",
