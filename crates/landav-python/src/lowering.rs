@@ -273,7 +273,10 @@ fn lower_function(
     let location = position(path, index, &function);
     let origin = origin_of(path, index, &function);
 
-    let collections: BTreeSet<String> = collection_parameters(function).into_iter().collect();
+    let collections: BTreeSet<String> = collection_parameters(function)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
 
     // A collection parameter contributes its **length** rather than itself: the
     // fragment has no value for a list, and the length is the only thing about
@@ -284,7 +287,7 @@ fn lower_function(
         .chain(
             collection_parameters(function)
                 .iter()
-                .map(|it| length_var(it)),
+                .map(|(name, _)| length_var(name)),
         )
         .collect();
 
@@ -295,8 +298,15 @@ fn lower_function(
     // anything. An integer parameter cannot be moved that way. Core needs the
     // difference to decide what survives a read; see
     // `landav_its::SourceProgram::is_volatile`.
-    for collection in collection_parameters(function) {
-        builder.mark_volatile(length_var(&collection));
+    // A length admitted on a *protocol* is recorded besides, because the bound
+    // that mentions it is complete and rests on a premise nothing checked: a
+    // `Sequence`'s `__len__` and its `__iter__` are both user code. `LAN-106`.
+    for (collection, trust) in collection_parameters(function) {
+        let length = length_var(&collection);
+        builder.mark_volatile(length.clone());
+        if trust == Trust::Protocol {
+            builder.mark_protocol_length(length);
+        }
     }
 
     // Every name that is bound anywhere this call site can see it: the module's
@@ -393,8 +403,16 @@ enum Binding {
     /// `from typing import List`, or `... as L`: a `typing` spelling of one of
     /// [`SIZED_BUILTINS`]. See [`typing_sized_alias`].
     SizedTypingAlias,
+    /// `from typing import Sequence`, or from `collections.abc`: an abstract
+    /// type that guarantees `__len__`. See [`SIZED_PROTOCOLS`].
+    SizedProtocol,
     /// `import typing`, or `import typing as t`.
     TypingModule,
+    /// `import collections.abc as abc`: bound to `collections.abc` itself.
+    AbcModule,
+    /// `import collections`, or `import collections.abc`, which binds
+    /// `collections`. Reached as `collections.abc.Sequence`.
+    CollectionsModule,
     /// Anything else.
     Other,
 }
@@ -481,10 +499,14 @@ fn binding_sites(statements: &[Stmt], report: &mut dyn FnMut(String, Binding)) -
                         },
                         |name| name.to_string(),
                     );
-                    let how = if alias.name.as_str() == "typing" {
-                        Binding::TypingModule
-                    } else {
-                        Binding::Other
+                    let how = match alias.name.as_str() {
+                        "typing" => Binding::TypingModule,
+                        // `import collections.abc as abc` binds `abc` to the
+                        // module itself; without an alias it binds
+                        // `collections`, which is reached one attribute deeper.
+                        "collections.abc" if alias.asname.is_some() => Binding::AbcModule,
+                        "collections.abc" | "collections" => Binding::CollectionsModule,
+                        _ => Binding::Other,
                     };
                     report(bound, how);
                 }
@@ -493,11 +515,16 @@ fn binding_sites(statements: &[Stmt], report: &mut dyn FnMut(String, Binding)) -
                 // Only an absolute `from typing import ...`: a relative
                 // `from .typing import List` names a module of this package
                 // that happens to be called `typing`.
-                let from_typing = node
+                let absolute = node.level.is_none_or(|level| level.to_u32() == 0);
+                let module = node
                     .module
                     .as_ref()
-                    .is_some_and(|module| module.as_str() == "typing")
-                    && node.level.is_none_or(|level| level.to_u32() == 0);
+                    .map(rustpython_parser::ast::Identifier::as_str);
+                let from_typing = absolute && module == Some("typing");
+                // A sized protocol has two homes, and `collections.abc` is the
+                // one PEP 585 steers new code towards.
+                let from_protocol_home =
+                    absolute && matches!(module, Some("typing" | "collections.abc"));
                 for alias in &node.names {
                     // `from m import *` binds names this pass cannot enumerate.
                     // Recorded as the residual risk in `SignaturePack` rather
@@ -508,6 +535,8 @@ fn binding_sites(statements: &[Stmt], report: &mut dyn FnMut(String, Binding)) -
                         .map_or_else(|| alias.name.to_string(), |name| name.to_string());
                     let how = if from_typing && typing_sized_alias(alias.name.as_str()).is_some() {
                         Binding::SizedTypingAlias
+                    } else if from_protocol_home && SIZED_PROTOCOLS.contains(&alias.name.as_str()) {
+                        Binding::SizedProtocol
                     } else {
                         Binding::Other
                     };
@@ -680,6 +709,35 @@ const TYPING_SIZED_ALIASES: [(&str, &str); 6] = [
     ("Text", "str"),
 ];
 
+/// The abstract types that guarantee `__len__`, from `typing` or
+/// `collections.abc`.
+///
+/// `LAN-106` tier 2, and a **weaker trust** than [`TYPING_SIZED_ALIASES`],
+/// recorded rather than hidden - see
+/// [`landav_its::SourceProgram::rests_on_a_protocol`]. For a `list` CPython
+/// guarantees that iterating yields exactly `len` items. For a `Sequence` both
+/// sides are user code, and a class whose `__iter__` outruns its `__len__`
+/// makes a bound derived from the length exceedable. Admitted because violating
+/// it means contradicting the protocol the class itself declares, and because
+/// the premise is now reported and can be switched off.
+///
+/// Deliberately absent: `Iterable`, `Iterator`, `Generator` and `Reversible`,
+/// none of which promises `__len__` at all. 140 typed-corpus loops iterate an
+/// `Iterable` parameter and stay uncounted, correctly.
+const SIZED_PROTOCOLS: [&str; 11] = [
+    "Sequence",
+    "MutableSequence",
+    "Collection",
+    "Mapping",
+    "MutableMapping",
+    "AbstractSet",
+    "MutableSet",
+    "KeysView",
+    "ValuesView",
+    "ItemsView",
+    "Sized",
+];
+
 /// The builtin a `typing` name stands for, if it is one of [`SIZED_BUILTINS`].
 fn typing_sized_alias(name: &str) -> Option<&'static str> {
     TYPING_SIZED_ALIASES
@@ -703,8 +761,14 @@ fn typing_sized_alias(name: &str) -> Option<&'static str> {
 struct TypingNames {
     /// Bound only to a sized alias: `List`, or `L` for `from typing import List as L`.
     aliases: BTreeSet<String>,
+    /// Bound only to a sized protocol: `Sequence`, from either home.
+    protocols: BTreeSet<String>,
     /// Bound only to the `typing` module: `typing`, or `t` for `import typing as t`.
     modules: BTreeSet<String>,
+    /// Bound only to `collections.abc`: `abc` for `import collections.abc as abc`.
+    abc_modules: BTreeSet<String>,
+    /// Bound only to `collections`, reached as `collections.abc.Sequence`.
+    collections_modules: BTreeSet<String>,
 }
 
 impl TypingNames {
@@ -725,7 +789,10 @@ impl TypingNames {
         };
         Self {
             aliases: only(Binding::SizedTypingAlias),
+            protocols: only(Binding::SizedProtocol),
             modules: only(Binding::TypingModule),
+            abc_modules: only(Binding::AbcModule),
+            collections_modules: only(Binding::CollectionsModule),
         }
     }
 }
@@ -754,36 +821,84 @@ impl TypingNames {
 /// binds `List` for itself has changed what the annotation means. That is the
 /// opposite of what `LAN-104` found for a bare name in a method *body*, which
 /// skips the class scope; annotations are the one place it does not.
-fn annotation_is_collection(
+fn annotation_collection_trust(
     annotation: Option<&Expr>,
     typing: &TypingNames,
     class_bound: &ClassBound,
-) -> bool {
+) -> Option<Trust> {
     // `list[int]`, `dict[str, int]`, `List[int]`, `typing.List[int]` - the
     // value is what is subscripted, and the element type says nothing about how
     // many there are.
     let named = match annotation {
         Some(Expr::Subscript(subscript)) => subscript.value.as_ref(),
         Some(other) => other,
-        None => return false,
+        None => return None,
     };
     match named {
         Expr::Name(name) => {
             let name = name.id.as_str();
-            SIZED_BUILTINS.contains(&name)
-                || (typing.aliases.contains(name) && !class_bound.binds(name))
-        }
-        Expr::Attribute(attribute) => match attribute.value.as_ref() {
-            Expr::Name(module) => {
-                let module = module.id.as_str();
-                typing.modules.contains(module)
-                    && !class_bound.binds(module)
-                    && typing_sized_alias(attribute.attr.as_str()).is_some()
+            if SIZED_BUILTINS.contains(&name) {
+                return Some(Trust::ConcreteType);
             }
-            _ => false,
-        },
-        _ => false,
+            if class_bound.binds(name) {
+                return None;
+            }
+            if typing.aliases.contains(name) {
+                return Some(Trust::ConcreteType);
+            }
+            typing.protocols.contains(name).then_some(Trust::Protocol)
+        }
+        // `typing.List`, `abc.Sequence`, and `collections.abc.Sequence`.
+        Expr::Attribute(attribute) => {
+            let member = attribute.attr.as_str();
+            match attribute.value.as_ref() {
+                Expr::Name(module) => {
+                    let module = module.id.as_str();
+                    if class_bound.binds(module) {
+                        return None;
+                    }
+                    if typing.modules.contains(module) {
+                        if typing_sized_alias(member).is_some() {
+                            return Some(Trust::ConcreteType);
+                        }
+                        return SIZED_PROTOCOLS.contains(&member).then_some(Trust::Protocol);
+                    }
+                    (typing.abc_modules.contains(module) && SIZED_PROTOCOLS.contains(&member))
+                        .then_some(Trust::Protocol)
+                }
+                // `collections.abc.Sequence`: the module name is one attribute
+                // deeper, because `import collections.abc` binds `collections`.
+                Expr::Attribute(inner) => match inner.value.as_ref() {
+                    Expr::Name(root) => {
+                        let root = root.id.as_str();
+                        (inner.attr.as_str() == "abc"
+                            && typing.collections_modules.contains(root)
+                            && !class_bound.binds(root)
+                            && SIZED_PROTOCOLS.contains(&member))
+                        .then_some(Trust::Protocol)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
     }
+}
+
+/// What a collection parameter's length is taken on trust from.
+///
+/// See [`landav_its::SourceProgram::rests_on_a_protocol`] for why the two are
+/// not the same claim and why the weaker one is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trust {
+    /// A concrete builtin - `list`, or `typing.List`, which is the same type.
+    /// CPython guarantees iterating it yields exactly `len` items.
+    ConcreteType,
+    /// An abstract type that promises `__len__` - `Sequence`, `Mapping`. Both
+    /// the length and the iteration are user code, and a class that implements
+    /// them inconsistently makes a bound derived from the length exceedable.
+    Protocol,
 }
 
 /// The names a method's enclosing class body binds, for the annotation check.
@@ -848,7 +963,7 @@ impl ClassBound {
 /// The walk does not descend into a nested `def` - a binding there is that
 /// scope's, not this one's - and a body it cannot enumerate (`match`)
 /// disqualifies every parameter, which costs coverage and never soundness.
-fn collection_parameters(function: Definition<'_>) -> Vec<String> {
+fn collection_parameters(function: Definition<'_>) -> Vec<(String, Trust)> {
     let arguments = function.args;
     let class_bound = ClassBound::of(function);
     let rebound = target_bindings_of(function.body);
@@ -856,15 +971,15 @@ fn collection_parameters(function: Definition<'_>) -> Vec<String> {
         .posonlyargs
         .iter()
         .chain(arguments.args.iter())
-        .filter(|parameter| {
-            annotation_is_collection(
+        .filter_map(|parameter| {
+            let trust = annotation_collection_trust(
                 parameter.def.annotation.as_deref(),
                 function.typing,
                 &class_bound,
-            )
+            )?;
+            Some((parameter.def.arg.to_string(), trust))
         })
-        .map(|parameter| parameter.def.arg.to_string())
-        .filter(|name| !rebound.as_ref().is_none_or(|names| names.contains(name)))
+        .filter(|(name, _)| !rebound.as_ref().is_none_or(|names| names.contains(name)))
         .collect()
 }
 
@@ -961,7 +1076,10 @@ fn integer_names(function: Definition<'_>) -> BTreeSet<String> {
         .map(|parameter| parameter.def.arg.to_string())
         .collect();
 
-    let collections: BTreeSet<String> = collection_parameters(function).into_iter().collect();
+    let collections: BTreeSet<String> = collection_parameters(function)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
     let mut candidates: BTreeSet<String> = integer_parameters(function).into_iter().collect();
     for statement in crate::syntax::stmt_tree(function.body) {
         for name in assigned_names(statement) {
