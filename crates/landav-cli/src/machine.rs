@@ -170,6 +170,56 @@ pub struct FunctionResource {
 
 /// One function, and everything concluded about it.
 #[derive(Debug, Serialize)]
+pub struct Premise {
+    /// The bound variable the premise is about, as it appears in `bound`.
+    pub variable: String,
+    /// `"concrete-type"` or `"protocol"`.
+    pub trust: &'static str,
+    /// Why the number is believed, in one sentence.
+    pub because: &'static str,
+}
+
+/// What the bound this run reports for `program` is believed on.
+///
+/// Filtered to the variables `bound` actually mentions, so every premise listed
+/// is one the number depends on: a length the function never uses in its cost is
+/// not something the reader has to weigh. See [`Function::premises`].
+fn premises_of(program: &landav_its::SourceProgram, bound: Option<&str>) -> Vec<Premise> {
+    let Some(bound) = bound else {
+        return Vec::new();
+    };
+    program
+        .params()
+        .iter()
+        .filter(|name| {
+            let name = name.symbol().as_str();
+            name.starts_with("len(") && bound.contains(name)
+        })
+        .map(|name| {
+            if program.rests_on_a_protocol(name) {
+                Premise {
+                    variable: name.symbol().as_str().to_owned(),
+                    trust: "protocol",
+                    because: "the parameter is annotated with an abstract collection type, so its \
+                              length is a user `__len__` that is trusted to equal the number of \
+                              iterations; a class implementing the two inconsistently makes this \
+                              bound exceedable",
+                }
+            } else {
+                Premise {
+                    variable: name.symbol().as_str().to_owned(),
+                    trust: "concrete-type",
+                    because: "the parameter is annotated with a concrete builtin collection, and \
+                              iterating one yields exactly `len` items; the premise is that the \
+                              caller passes what the annotation says",
+                }
+            }
+        })
+        .collect()
+}
+
+/// One function's result.
+#[derive(Debug, Serialize)]
 pub struct Function {
     /// `Class.method` for a method, the bare name otherwise.
     pub name: String,
@@ -189,6 +239,28 @@ pub struct Function {
     /// `lowered: false` never carries an `"exact"` or `"upper"` bound; the
     /// reasons it did not lower are in `refused`.
     pub lowered: bool,
+    /// What this function's bound is **believed on**, for the variables it
+    /// actually mentions.
+    ///
+    /// # Not the same thing as a hole's assumption
+    ///
+    /// A hole names something this run could **not** derive, and makes the
+    /// result `partial`. A premise is the opposite: the result may be complete
+    /// and exact, and still rest on a fact nothing verified. Every `len(items)`
+    /// rests on the annotation being true, which the tool has always assumed
+    /// silently; `LAN-106` made a second, weaker premise possible, and
+    /// therefore made both worth publishing.
+    ///
+    /// `trust: "protocol"` is the weaker one: the length comes from a user
+    /// `__len__`, and a class whose iteration outruns it makes this bound
+    /// exceedable. A consumer that cannot accept that can filter on this field,
+    /// and a run can be repeated without those annotations to see which results
+    /// change.
+    ///
+    /// Only the variables the bound mentions appear, so a premise here is
+    /// always one the number in front of you depends on. Empty for a function
+    /// whose bound rests on nothing of the kind.
+    pub premises: Vec<Premise>,
     /// The derived cost, or `null`.
     ///
     /// `null` is not zero. A consumer that treats a missing bound as a cheap
@@ -406,6 +478,7 @@ impl Collector {
         self.functions.push(Function {
             name: function.name().to_owned(),
             class: function.class().map(str::to_owned),
+            premises: premises_of(function.program(), bound.as_deref()),
             file: at.file().display().to_string(),
             line: at.line(),
             column: at.column(),

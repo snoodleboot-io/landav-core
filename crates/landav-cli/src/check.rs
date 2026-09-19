@@ -856,7 +856,11 @@ fn describe_bound(
             function.name()
         );
     };
-    let line = describe_cost(&where_, function, derived, records);
+    let line = format!(
+        "{}{}",
+        describe_cost(&where_, function, derived, records),
+        protocol_premise(function, derived)
+    );
     match resource_clause(derived, function.program(), resource) {
         Some(clause) => format!("{line}; {clause}"),
         None => line,
@@ -891,6 +895,41 @@ fn resource_clause(
         descriptor.unit(),
         projected.kind.unwrap_or("not derived")
     ))
+}
+
+/// The clause naming a length this bound is believed on rather than derived.
+///
+/// `LAN-106`. Only the **protocol** premise is said here, and only when the
+/// bound mentions the length. A length from a concrete builtin rests on the
+/// annotation being true, which is the trust the whole tool is built on and is
+/// stated once in its documentation rather than on every line. A length from a
+/// `Sequence` rests on that *and* on a user `__len__` agreeing with a user
+/// `__iter__`, which is a thing about this function's callers that a reader may
+/// want to check. Both premises are in the JSON, where a consumer can filter on
+/// them; the text says the one that is not the baseline.
+fn protocol_premise(
+    function: &landav_python::LoweredFunction,
+    derived: &landav_engine::TripCount,
+) -> String {
+    let Some(bound) = derived.bound().map(ToString::to_string) else {
+        return String::new();
+    };
+    let program = function.program();
+    let resting: Vec<&str> = program
+        .params()
+        .iter()
+        .filter(|name| program.rests_on_a_protocol(name))
+        .map(|name| name.symbol().as_str())
+        .filter(|name| bound.contains(name))
+        .collect();
+    if resting.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; believed on {}: the parameter is annotated with an abstract collection type, so its \
+         length is a user `__len__` trusted to equal the number of iterations",
+        resting.join(", ")
+    )
 }
 
 /// The cost half of a bound line.

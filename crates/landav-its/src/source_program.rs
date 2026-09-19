@@ -48,6 +48,7 @@ pub struct SourceProgram {
     pub(crate) overflowed: bool,
     pub(crate) conceals_a_call: bool,
     pub(crate) volatile: BTreeSet<VarName>,
+    pub(crate) protocol_lengths: BTreeSet<VarName>,
 }
 
 impl SourceProgram {
@@ -135,6 +136,39 @@ impl SourceProgram {
     #[must_use]
     pub fn is_volatile(&self, name: &VarName) -> bool {
         self.volatile.contains(name)
+    }
+
+    /// Whether `name`'s value is taken on trust from a **protocol** rather than
+    /// a concrete type.
+    ///
+    /// # A premise, which is not an assumption
+    ///
+    /// [`crate::Unsupported::blame`] and `landav_bound::Assumption` answer
+    /// "what could this run **not** derive", and hang off a hole in a partial
+    /// result. This answers the opposite question: the bound is **complete**,
+    /// and it rests on something nothing verified.
+    ///
+    /// `len(rows)` for `rows: list` is trusted because the annotation is
+    /// trusted, and for a real `list` CPython guarantees that iterating it
+    /// yields exactly `len` items. `len(rows)` for `rows: Sequence` is trusted
+    /// one step further: both sides are user code - `__iter__` (or
+    /// `__getitem__` until `IndexError`) and `__len__` - and a class that
+    /// implements them inconsistently makes the bound exceedable. Nearly every
+    /// real implementation honours the protocol it declares, which is why
+    /// `LAN-106` admits it; that it *can* be violated is why the frontend
+    /// records which lengths rest on it, rather than letting the weaker trust
+    /// disappear into an identical-looking number.
+    ///
+    /// A consumer can then report the premise, and re-run without it.
+    #[must_use]
+    pub fn rests_on_a_protocol(&self, name: &VarName) -> bool {
+        self.protocol_lengths.contains(name)
+    }
+
+    /// Every length variable whose value rests on a protocol, in canonical
+    /// order. See [`Self::rests_on_a_protocol`].
+    pub fn protocol_lengths(&self) -> impl Iterator<Item = &VarName> {
+        self.protocol_lengths.iter()
     }
 
     /// Whether the builder that produced this program exceeded

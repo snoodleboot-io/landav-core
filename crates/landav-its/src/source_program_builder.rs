@@ -43,6 +43,7 @@ pub struct SourceProgramBuilder {
     overflowed: bool,
     conceals_a_call: bool,
     volatile: BTreeSet<VarName>,
+    protocol_lengths: BTreeSet<VarName>,
 }
 
 impl SourceProgramBuilder {
@@ -63,6 +64,7 @@ impl SourceProgramBuilder {
             overflowed: false,
             conceals_a_call: false,
             volatile: BTreeSet::new(),
+            protocol_lengths: BTreeSet::new(),
         }
     }
 
@@ -73,6 +75,14 @@ impl SourceProgramBuilder {
     /// spelling would be guessing.
     pub fn mark_volatile(&mut self, name: VarName) {
         self.volatile.insert(name);
+    }
+
+    /// Records that `name`'s value is taken on trust from a protocol.
+    ///
+    /// See [`SourceProgram::rests_on_a_protocol`], where the argument lives.
+    /// Only the frontend knows which of its variables are of that kind.
+    pub fn mark_protocol_length(&mut self, name: VarName) {
+        self.protocol_lengths.insert(name);
     }
 
     // -- expressions --------------------------------------------------------
@@ -604,6 +614,7 @@ impl SourceProgramBuilder {
             overflowed: self.overflowed,
             conceals_a_call: self.conceals_a_call,
             volatile: self.volatile,
+            protocol_lengths: self.protocol_lengths,
         }
     }
 

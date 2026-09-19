@@ -234,21 +234,34 @@ fn a_class_attribute_named_list_changes_a_method_annotation() {
 // 3 · what stays out, and what stays in
 // ---------------------------------------------------------------------------
 
-/// **The abstract types are not admitted.** `Sequence` is `LAN-106`'s second
-/// half: a user `__len__` can disagree with the iteration count, which is a
-/// weaker trust than the builtins carry, and it is a decision not taken here.
+/// **What promises no length is still not admitted.**
+///
+/// This test asserted that `Sequence`, `Collection` and `Mapping` were refused
+/// too, because when tier 1 shipped their admission was an open decision and a
+/// test was the right place to hold the line until it was taken.
+///
+/// It has since been taken: `LAN-106` tier 2 admits them, on a **weaker** trust
+/// that is recorded per function rather than assumed silently. Asserting the
+/// old behaviour here would now be asserting against a decision the project
+/// made deliberately, so the sized protocols moved to `protocol_trust.rs`,
+/// which checks both that they are admitted and that they are marked as resting
+/// on a protocol.
+///
+/// What survives unchanged is the half that was never a decision: `Iterable`,
+/// `Iterator` and `Generator` promise no `__len__` at all - a generator
+/// satisfies `Iterable` and has no length - so no trust, weak or otherwise,
+/// makes them sized.
 #[test]
-fn an_abstract_sequence_is_not_admitted() {
+fn an_iterable_is_still_not_a_collection() {
     for (import, annotation) in [
-        ("from typing import Sequence", "Sequence[str]"),
-        ("from collections.abc import Collection", "Collection[str]"),
-        ("from typing import Mapping", "Mapping[str, int]"),
         ("from typing import Iterable", "Iterable[str]"),
+        ("from collections.abc import Iterator", "Iterator[str]"),
+        ("from collections.abc import Generator", "Generator"),
     ] {
         assert_not_a_collection(
             &format!("{import}\n\n\ndef f(items: {annotation}) -> int:\n{LOOP}"),
             "f",
-            "an abstract collection type is not a builtin under another name",
+            "it promises no length at all",
         );
     }
 }
