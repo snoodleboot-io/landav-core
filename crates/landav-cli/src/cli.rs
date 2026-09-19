@@ -116,6 +116,32 @@ struct CheckArgs {
     )]
     resource: Option<ResourceKind>,
 
+    /// Which annotations a collection's length may be read from. LAN-106.
+    ///
+    /// The point of the flag is not configuration, it is **comparison**. A
+    /// bound derived from `len(rows)` where `rows: Sequence` rests on a user
+    /// `__len__` agreeing with a user `__iter__`, and every such bound says so
+    /// in its `premises`. This makes that premise something a reader can act
+    /// on: run again with `concrete`, and the results that moved are exactly
+    /// the ones the weaker trust bought.
+    #[arg(
+        long,
+        value_name = "TRUST",
+        default_value_t = landav_python::AnnotationTrust::default(),
+        long_help = "Which annotations a collection's length may be read from.\n\n\
+                     `protocol` (the default) reads a length from an abstract type \
+                     that promises `__len__`, such as `Sequence` or `Mapping`, as well \
+                     as from a concrete builtin. Both sides of that promise are user \
+                     code, so a class whose iteration outruns its length makes such a \
+                     bound exceedable; every bound resting on one is marked in its \
+                     `premises`.\n\n\
+                     `concrete` reads a length only from a builtin collection, where \
+                     CPython guarantees that iterating yields exactly `len` items.\n\n\
+                     Run both and compare: the results that differ are the ones the \
+                     weaker premise bought."
+    )]
+    trust: landav_python::AnnotationTrust,
+
     /// Report which constructs were out of scope, where, and what that leaves
     /// unanalysed. LAN-68.
     ///
@@ -199,7 +225,10 @@ pub fn dispatch() -> Outcome {
                 args.path.as_deref(),
                 args.stdin.then_some(args.stdin_name.as_str()),
                 args.config.as_deref(),
-                args.resource,
+                crate::check::Derivation {
+                    resource: args.resource,
+                    trust: args.trust,
+                },
                 args.coverage,
                 args.bounds,
                 args.json,

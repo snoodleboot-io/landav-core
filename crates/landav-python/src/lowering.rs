@@ -86,6 +86,33 @@ const MAX_EXPONENT: u32 = landav_its::MAX_DEGREE;
 /// deeply than the frontend will parse. Nothing else: a construct outside the
 /// fragment is not an error here, it is an `Unsupported` node in the program.
 pub fn lower_module(path: &Path, source: &str) -> Result<Vec<LoweredFunction>, PythonError> {
+    lower_module_with(path, source, AnnotationTrust::default())
+}
+
+/// [`lower_module`], choosing which annotations a collection's length may be
+/// read from.
+///
+/// # Why this is a run-level choice
+///
+/// `LAN-106` admits `Sequence` and the other abstract sized types, whose length
+/// is a user `__len__` trusted to equal the number of iterations. That is a
+/// weaker premise than a concrete builtin carries, and every bound resting on
+/// it says so - see [`landav_its::SourceProgram::rests_on_a_protocol`].
+///
+/// Saying so is not the same as being able to *act* on it. This makes the
+/// premise a switch: run once with [`AnnotationTrust::Protocols`] and once with
+/// [`AnnotationTrust::ConcreteOnly`], and the results that differ are exactly
+/// the ones the weaker trust bought. A reader who cannot accept it does not
+/// have to take the tool's word for which numbers it touched.
+///
+/// # Errors
+///
+/// As [`lower_module`].
+pub fn lower_module_with(
+    path: &Path,
+    source: &str,
+    trust: AnnotationTrust,
+) -> Result<Vec<LoweredFunction>, PythonError> {
     let (module, index) = parse_guarded(path, source)?;
     // Which names this module binds for itself, computed once. A signature pack
     // is keyed by *name*, and a module that writes `def isinstance(...)` is not
@@ -100,7 +127,7 @@ pub fn lower_module(path: &Path, source: &str) -> Result<Vec<LoweredFunction>, P
     // empty set.
     let mut lowered = Vec::new();
     for statement in &module {
-        for definition in Definition::all_of(statement, &typing) {
+        for definition in Definition::all_of(statement, &typing, trust) {
             lowered.push(lower_function(
                 path,
                 &index,
@@ -181,6 +208,9 @@ struct Definition<'a> {
     class_body: Option<&'a [Stmt]>,
     /// What the module binds only to `typing`. See [`TypingNames`].
     typing: &'a TypingNames,
+    /// Which annotations this run reads a length from. See
+    /// [`lower_module_with`].
+    trust: AnnotationTrust,
     /// The parameter list, which is where `int` and collection annotations are
     /// read from.
     args: &'a ast::Arguments,
@@ -199,13 +229,14 @@ impl<'a> Definition<'a> {
     /// place that decides what counts as a top-level function, so a node type
     /// missing from it is missing from the denominator and says nothing about
     /// itself anywhere in the output. That silence is the whole of `LAN-93`.
-    fn of(statement: &'a Stmt, typing: &'a TypingNames) -> Option<Self> {
+    fn of(statement: &'a Stmt, typing: &'a TypingNames, trust: AnnotationTrust) -> Option<Self> {
         match statement {
             Stmt::FunctionDef(function) => Some(Self {
                 name: function.name.as_str(),
                 class: None,
                 class_body: None,
                 typing,
+                trust,
                 args: function.args.as_ref(),
                 body: &function.body,
                 range: function.range,
@@ -215,6 +246,7 @@ impl<'a> Definition<'a> {
                 class: None,
                 class_body: None,
                 typing,
+                trust,
                 args: function.args.as_ref(),
                 body: &function.body,
                 range: function.range,
@@ -225,8 +257,8 @@ impl<'a> Definition<'a> {
 
     /// Every definition a module-level `statement` holds: the function it is,
     /// or the methods of the class it is. See the type's doc for `LAN-104`.
-    fn all_of(statement: &'a Stmt, typing: &'a TypingNames) -> Vec<Self> {
-        if let Some(function) = Self::of(statement, typing) {
+    fn all_of(statement: &'a Stmt, typing: &'a TypingNames, trust: AnnotationTrust) -> Vec<Self> {
+        if let Some(function) = Self::of(statement, typing, trust) {
             return vec![function];
         }
         let Stmt::ClassDef(class) = statement else {
@@ -235,7 +267,7 @@ impl<'a> Definition<'a> {
         class
             .body
             .iter()
-            .filter_map(|member| Self::of(member, typing))
+            .filter_map(|member| Self::of(member, typing, trust))
             .map(|method| Self {
                 class: Some(class.name.as_str()),
                 class_body: Some(&class.body),
@@ -331,6 +363,7 @@ fn lower_function(
         builder,
         integers,
         collections,
+        lengths_read: BTreeSet::new(),
         shadowed,
         rebound,
         pack: builtin_pack(),
@@ -340,6 +373,9 @@ fn lower_function(
         truth_test: false,
     };
     let body = translator.block(function.body);
+    for length in &translator.lengths_read {
+        translator.builder.mark_length_read(length.clone());
+    }
     let program = translator.builder.build(body);
 
     LoweredFunction::new(name, class, location, program)
@@ -886,6 +922,47 @@ fn annotation_collection_trust(
     }
 }
 
+/// Which annotations a run will read a collection's length from.
+///
+/// See [`lower_module_with`], where the argument lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnnotationTrust {
+    /// Concrete builtin collections only: `list`, `dict`, and `typing`'s names
+    /// for the same types. Iterating one yields exactly `len` items, and
+    /// CPython is what guarantees it.
+    ConcreteOnly,
+    /// Those, and the abstract types that promise `__len__` - `Sequence`,
+    /// `Mapping`. The default, and the weaker premise.
+    #[default]
+    Protocols,
+}
+
+impl core::str::FromStr for AnnotationTrust {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "concrete" => Ok(Self::ConcreteOnly),
+            "protocol" => Ok(Self::Protocols),
+            other => Err(format!(
+                "expected `concrete` or `protocol`, not `{other}`. `protocol` is the \
+                 default and reads a length from an abstract type such as `Sequence`; \
+                 `concrete` reads one only from a builtin, so a run can be repeated \
+                 without the weaker premise and the two compared"
+            )),
+        }
+    }
+}
+
+impl core::fmt::Display for AnnotationTrust {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::ConcreteOnly => "concrete",
+            Self::Protocols => "protocol",
+        })
+    }
+}
+
 /// What a collection parameter's length is taken on trust from.
 ///
 /// See [`landav_its::SourceProgram::rests_on_a_protocol`] for why the two are
@@ -977,6 +1054,12 @@ fn collection_parameters(function: Definition<'_>) -> Vec<(String, Trust)> {
                 function.typing,
                 &class_bound,
             )?;
+            // A run told to read only concrete types declines the weaker
+            // premise outright, so the length never exists and no bound can
+            // rest on it. `LAN-106`.
+            if trust == Trust::Protocol && function.trust == AnnotationTrust::ConcreteOnly {
+                return None;
+            }
             Some((parameter.def.arg.to_string(), trust))
         })
         .filter(|(name, _)| !rebound.as_ref().is_none_or(|names| names.contains(name)))
@@ -989,6 +1072,13 @@ fn collection_parameters(function: Definition<'_>) -> Vec<(String, Trust)> {
 /// it, and because no Python identifier contains a parenthesis - so this can
 /// never collide with a name the source could have bound. The same reasoning
 /// `Hole` uses for `#hole0`.
+/// The length variable for a walked collection, recorded as read.
+fn walk_length(read: &mut BTreeSet<VarName>, collection: &str) -> VarName {
+    let length = length_var(collection);
+    read.insert(length.clone());
+    length
+}
+
 fn length_var(name: &str) -> VarName {
     VarName::new(format!("len({name})"))
 }
@@ -1573,6 +1663,12 @@ struct Translator<'a> {
     /// Parameters only. A local holding a collection has no length the caller
     /// can supply, and one assigned from a region may have any length at all.
     collections: BTreeSet<String>,
+    /// Lengths this translation read, whichever builder the node landed in.
+    /// Kept on the translator rather than the builder because a value read
+    /// inside a discarded expression is read by the *function*, and its node
+    /// goes to a scratch program that is thrown away. See
+    /// [`landav_its::SourceProgram::reads_length`].
+    lengths_read: BTreeSet<VarName>,
     /// Every name the module and this function bind, or `None` when this pass
     /// could not enumerate them.
     ///
@@ -2230,7 +2326,9 @@ impl Translator<'_> {
     fn walk_collection(&mut self, loop_stmt: &ast::StmtFor, collection: &str) -> Vec<StmtId> {
         let origin = self.origin(loop_stmt);
         let start = self.builder.int(0, origin.clone());
-        let stop = self.builder.var(length_var(collection), origin.clone());
+        let length = length_var(collection);
+        self.lengths_read.insert(length.clone());
+        let stop = self.builder.var(length, origin.clone());
         let counter = self.walk_counter();
 
         let body = self.block(&loop_stmt.body);
@@ -2343,9 +2441,10 @@ impl Translator<'_> {
     fn walk_length(&mut self, loop_stmt: &ast::StmtFor, walk: &LengthWalk) -> Vec<StmtId> {
         let origin = self.origin(loop_stmt);
         let start = self.builder.int(0, origin.clone());
-        let length = self
-            .builder
-            .var(length_var(&walk.collection), origin.clone());
+        let length = self.builder.var(
+            walk_length(&mut self.lengths_read, &walk.collection),
+            origin.clone(),
+        );
         // An inexact relation - `set`, whose equal elements collapse - becomes a
         // refusal *bounded by* the argument's length, which the engine reads as
         // an upper bound and reports as `O` rather than `Theta`. The same
@@ -2396,9 +2495,10 @@ impl Translator<'_> {
             return self.expression(expr);
         };
         let origin = self.origin(expr);
-        let length = self
-            .builder
-            .var(length_var(&walk.collection), origin.clone());
+        let length = self.builder.var(
+            walk_length(&mut self.lengths_read, &walk.collection),
+            origin.clone(),
+        );
         let reading = if walk.exact {
             length
         } else {
@@ -3314,7 +3414,9 @@ impl Translator<'_> {
                 // this fragment can read, because its value is a natural number
                 // the caller already knows. Everything else is a region.
                 if let Some(name) = length_of_collection(call, &self.collections) {
-                    return self.builder.var(length_var(&name), origin);
+                    let length = length_var(&name);
+                    self.lengths_read.insert(length.clone());
+                    return self.builder.var(length, origin);
                 }
                 let detail = match call.func.as_ref() {
                     Expr::Name(name) => name.id.to_string(),

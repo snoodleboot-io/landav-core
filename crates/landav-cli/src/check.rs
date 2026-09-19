@@ -105,11 +105,25 @@ use crate::outcome::Outcome;
 use crate::sources::Target;
 
 /// Run `check` over `target`, reporting to stdout and stderr.
+/// What the run should derive, as opposed to where it should look.
+///
+/// The two travel together through every layer of this module and are the only
+/// arguments that say anything about the *analysis* rather than the input or
+/// the output format. Bundling them keeps each signature inside the argument
+/// limit without a suppression, which is the honest version of the same fix.
+#[derive(Debug, Clone, Copy)]
+pub struct Derivation {
+    /// The resource to bound, if one was named.
+    pub resource: Option<ResourceKind>,
+    /// Which annotations a collection's length may be read from. `LAN-106`.
+    pub trust: landav_python::AnnotationTrust,
+}
+
 pub fn run(
     target: Option<&Path>,
     stdin_name: Option<&str>,
     explicit_config: Option<&Path>,
-    resource: Option<ResourceKind>,
+    derivation: Derivation,
     coverage: bool,
     bounds: bool,
     json: bool,
@@ -118,7 +132,7 @@ pub fn run(
         target,
         stdin_name,
         explicit_config,
-        resource,
+        derivation,
         coverage,
         bounds,
         json,
@@ -136,7 +150,7 @@ fn analyse(
     target: Option<&Path>,
     stdin_name: Option<&str>,
     explicit_config: Option<&Path>,
-    resource: Option<ResourceKind>,
+    derivation: Derivation,
     detail: bool,
     bounds: bool,
     json: bool,
@@ -188,7 +202,7 @@ fn analyse(
     // so the two cannot disagree about what the run found. In JSON mode the
     // text is withheld at the point of writing, not skipped at the point of
     // computing - a second code path would be a second thing to keep correct.
-    let mut collected = json.then(|| machine::Collector::for_resource(resource));
+    let mut collected = json.then(|| machine::Collector::for_resource(derivation.resource));
     let mut report = Report::new_gated(std::io::stdout().lock(), !json);
 
     for path in &walk.sources {
@@ -221,9 +235,9 @@ fn analyse(
                 if let Err(problem) = accumulate(
                     path,
                     &text,
+                    derivation,
                     &mut coverage,
                     &mut analysed,
-                    resource,
                     bounds.then_some(&mut report),
                     collected.as_mut(),
                 ) {
@@ -269,8 +283,8 @@ fn analyse(
     // them, so the run has nothing to say about the question it was asked.
     // Reported before the summary, on its own line, so that it reads like the
     // other inconclusive results — which is what it is.
-    let unaccounted = resource_unaccounted(resource, statements);
-    if let Some(kind) = resource
+    let unaccounted = resource_unaccounted(derivation.resource, statements);
+    if let Some(kind) = derivation.resource
         && unaccounted
         && let Some(line) = crate::resource::unaccounted(kind)
     {
@@ -293,7 +307,7 @@ fn analyse(
         findings,
         &waived,
         inconclusive,
-        resource,
+        derivation,
         &coverage,
         analysed,
     );
@@ -338,6 +352,7 @@ fn analyse(
                 lowered: coverage.lowered(),
                 analysed,
                 coverage_percent: coverage.percent(),
+                trust: derivation.trust.to_string(),
                 // `inconclusive` is incremented in exactly one place - a file
                 // the frontend could not parse - so it is this count.
                 unreadable_files: inconclusive,
@@ -757,22 +772,23 @@ const fn classify(
 fn accumulate<W: std::io::Write>(
     path: &Path,
     text: &str,
+    derivation: Derivation,
     coverage: &mut Coverage,
     analysed: &mut usize,
-    resource: Option<ResourceKind>,
     mut bounds: Option<&mut Report<W>>,
     mut collected: Option<&mut machine::Collector>,
 ) -> Result<(), ToolError> {
-    let functions = landav_python::lower_module(path, text).map_err(|error| {
-        ToolError::at_path(
-            path,
-            format!(
-                "parsed for the rules but not for the lowering ({error}), so this file \
+    let functions =
+        landav_python::lower_module_with(path, text, derivation.trust).map_err(|error| {
+            ToolError::at_path(
+                path,
+                format!(
+                    "parsed for the rules but not for the lowering ({error}), so this file \
                  is missing from the coverage report and the report's denominator \
                  would understate what was skipped"
-            ),
-        )
-    })?;
+                ),
+            )
+        })?;
     for function in &functions {
         let lowered = landav_its::lower(function.program());
         // The frontend's own refusal records, joined against the hole ledger to
@@ -799,7 +815,7 @@ fn accumulate<W: std::io::Write>(
         if let Some(report) = bounds.as_deref_mut() {
             report.line(format_args!(
                 "{}",
-                describe_bound(function, derived.as_ref(), records, resource)
+                describe_bound(function, derived.as_ref(), records, derivation.resource)
             ));
         }
         if let Some(sink) = collected.as_deref_mut() {
@@ -911,16 +927,18 @@ fn protocol_premise(
     function: &landav_python::LoweredFunction,
     derived: &landav_engine::TripCount,
 ) -> String {
-    let Some(bound) = derived.bound().map(ToString::to_string) else {
+    if derived.bound().is_none() {
         return String::new();
-    };
+    }
+    // Whether the analysis *read* the length, not whether the rendered bound
+    // still names it: `Theta(1)` for `return len(element) <= size` rests
+    // entirely on the premise and mentions nothing. See `machine::premises_of`.
     let program = function.program();
     let resting: Vec<&str> = program
         .params()
         .iter()
-        .filter(|name| program.rests_on_a_protocol(name))
+        .filter(|name| program.rests_on_a_protocol(name) && program.reads_length(name))
         .map(|name| name.symbol().as_str())
-        .filter(|name| bound.contains(name))
         .collect();
     if resting.is_empty() {
         return String::new();
@@ -1094,12 +1112,12 @@ fn summarise<W: std::io::Write>(
     findings: usize,
     waived: &Tally,
     inconclusive: usize,
-    resource: Option<ResourceKind>,
+    derivation: Derivation,
     coverage: &Coverage,
     analysed: usize,
 ) {
     report.line(format_args!(
-        "landav: {} analysed under {} — {} finding(s), {} suppressed, {}, {} inconclusive; \
+        "landav: {} analysed under {} — {} finding(s), {} suppressed, {}, {} inconclusive;{} \
          {}; {}; resource: {}; configuration: {}",
         plural(sources.len(), "file"),
         target.display(),
@@ -1107,11 +1125,28 @@ fn summarise<W: std::io::Write>(
         waived.suppressed,
         plural(waived.stale, "stale waiver"),
         inconclusive,
+        trust_clause(derivation.trust),
         coverage_clause(coverage, inconclusive),
         engine_reach(analysed, coverage.units()),
-        describe_resource(resource),
+        describe_resource(derivation.resource),
         config.source()
     ));
+}
+
+/// The clause naming a non-default trust setting.
+///
+/// Silent on the default, so an ordinary run's summary reads as it always has.
+/// A run that *narrowed* the trust has changed what its numbers mean, and a
+/// reader comparing two runs must not have to reconstruct the command line to
+/// know which one they are holding. The JSON records it either way. `LAN-106`.
+fn trust_clause(trust: landav_python::AnnotationTrust) -> String {
+    match trust {
+        landav_python::AnnotationTrust::Protocols => String::new(),
+        landav_python::AnnotationTrust::ConcreteOnly => {
+            " trust: concrete annotations only, so no length was read from an abstract              collection type;"
+                .to_owned()
+        }
+    }
 }
 
 /// The coverage clause, naming the files whose functions it could not count.

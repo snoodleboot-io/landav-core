@@ -194,12 +194,12 @@ fn the_json_publishes_the_premise_and_its_tier() -> io::Result<()> {
     Ok(())
 }
 
-/// **A premise is listed only where the bound actually rests on it.**
+/// **A length the analysis never read is not a premise.**
 ///
-/// A length the function never uses in its cost is not something a reader has
-/// to weigh, and listing it would make the field noise instead of signal.
+/// Nothing about the result depends on it, and listing it would make the field
+/// noise instead of signal.
 #[test]
-fn an_unused_length_is_not_a_premise() -> io::Result<()> {
+fn an_unread_length_is_not_a_premise() -> io::Result<()> {
     let project = Project::new()?;
     let parsed = json_of(
         &project,
@@ -209,8 +209,42 @@ fn an_unused_length_is_not_a_premise() -> io::Result<()> {
     assert_eq!(
         function["premises"].as_array().unwrap().len(),
         0,
-        "the bound does not mention `len(rows)`, so nothing rests on it: {function}"
+        "the function never reads `len(rows)`: {function}"
     );
+    Ok(())
+}
+
+/// **A bound that rests on the premise while naming nothing still declares it.**
+///
+/// The case a rule keyed on the rendered bound gets wrong, and the one that
+/// matters most. Trusting the protocol makes `len(element)` a value this
+/// fragment can read, so the function is `Theta(1)` - complete, exact, and
+/// mentioning no length. Decline the trust and `len()` is an unknown call and
+/// the result is partial. The `1` therefore rests entirely on the premise, and
+/// if a `__len__` is expensive it is a constant-cost claim the program exceeds.
+///
+/// Found by running the typed corpus under both settings and asking which
+/// results moved: two did so without declaring a premise, and both claimed
+/// constant cost.
+#[test]
+fn a_constant_bound_that_only_a_read_length_made_complete_declares_it() -> io::Result<()> {
+    let project = Project::new()?;
+    let parsed = json_of(
+        &project,
+        "from collections.abc import Collection\n\n\ndef max_len(size: int, element: Collection[object]) -> bool:\n    return len(element) <= size\n",
+    )?;
+    let function = &parsed["functions"][0];
+    assert_eq!(
+        function["bound_kind"], "exact",
+        "the length is readable, so nothing here is a region: {function}"
+    );
+    let premises = function["premises"].as_array().unwrap();
+    assert_eq!(
+        premises.len(),
+        1,
+        "the bound names no length and rests entirely on one: {function}"
+    );
+    assert_eq!(premises[0]["trust"], "protocol", "{function}");
     Ok(())
 }
 
