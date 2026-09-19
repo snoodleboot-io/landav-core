@@ -105,6 +105,14 @@ pub struct Summary {
     /// acts on. A gate thresholding on this number should read it beside
     /// `unreadable_files`. `LAN-82`.
     pub coverage_percent: Option<u32>,
+    /// Which annotations this run read a collection's length from:
+    /// `"protocol"` or `"concrete"`.
+    ///
+    /// Recorded because the field exists to be *compared*. Two runs of the same
+    /// tree differ in their bounds exactly where the weaker premise was used,
+    /// and a reader diffing them has to be able to tell which is which without
+    /// reconstructing the command line. `LAN-106`.
+    pub trust: String,
     /// Files the frontend could not read as Python.
     ///
     /// The functions in them are in no count in this summary, because they
@@ -181,20 +189,32 @@ pub struct Premise {
 
 /// What the bound this run reports for `program` is believed on.
 ///
-/// Filtered to the variables `bound` actually mentions, so every premise listed
-/// is one the number depends on: a length the function never uses in its cost is
-/// not something the reader has to weigh. See [`Function::premises`].
-fn premises_of(program: &landav_its::SourceProgram, bound: Option<&str>) -> Vec<Premise> {
-    let Some(bound) = bound else {
-        return Vec::new();
-    };
+/// # Read, not mentioned
+///
+/// The filter is whether the program **read** the length, not whether the
+/// reported bound still mentions it. Those differ, and the difference hides the
+/// case that matters most:
+///
+/// ```python
+/// def max_len(size: int, element: Collection[object]) -> bool:
+///     return len(element) <= size
+/// ```
+///
+/// Trusting the protocol makes `len(element)` a variable this fragment can
+/// read, so the function is `Theta(1)` - complete, exact, and mentioning no
+/// length at all. Decline the trust and `len()` is an unknown call, and the
+/// result is partial. So that `1` rests entirely on the premise while naming
+/// nothing, and a rule keyed on the rendered bound would publish no premise for
+/// precisely the bound whose *completeness* the premise bought. Measured on the
+/// typed corpus, two functions turn on this and both claim constant cost.
+///
+/// A length the function never reads is still not listed: nothing about the
+/// result depends on it, and listing it would make the field noise.
+fn premises_of(program: &landav_its::SourceProgram) -> Vec<Premise> {
     program
         .params()
         .iter()
-        .filter(|name| {
-            let name = name.symbol().as_str();
-            name.starts_with("len(") && bound.contains(name)
-        })
+        .filter(|name| program.reads_length(name))
         .map(|name| {
             if program.rests_on_a_protocol(name) {
                 Premise {
@@ -478,7 +498,7 @@ impl Collector {
         self.functions.push(Function {
             name: function.name().to_owned(),
             class: function.class().map(str::to_owned),
-            premises: premises_of(function.program(), bound.as_deref()),
+            premises: premises_of(function.program()),
             file: at.file().display().to_string(),
             line: at.line(),
             column: at.column(),

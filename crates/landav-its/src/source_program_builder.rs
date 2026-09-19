@@ -44,6 +44,7 @@ pub struct SourceProgramBuilder {
     conceals_a_call: bool,
     volatile: BTreeSet<VarName>,
     protocol_lengths: BTreeSet<VarName>,
+    read_lengths: BTreeSet<VarName>,
 }
 
 impl SourceProgramBuilder {
@@ -65,6 +66,7 @@ impl SourceProgramBuilder {
             conceals_a_call: false,
             volatile: BTreeSet::new(),
             protocol_lengths: BTreeSet::new(),
+            read_lengths: BTreeSet::new(),
         }
     }
 
@@ -83,6 +85,14 @@ impl SourceProgramBuilder {
     /// Only the frontend knows which of its variables are of that kind.
     pub fn mark_protocol_length(&mut self, name: VarName) {
         self.protocol_lengths.insert(name);
+    }
+
+    /// Records that the analysis read the length `name`.
+    ///
+    /// See [`SourceProgram::reads_length`], where the argument lives - in
+    /// particular why a consumer cannot work this out from the arena.
+    pub fn mark_length_read(&mut self, name: VarName) {
+        self.read_lengths.insert(name);
     }
 
     // -- expressions --------------------------------------------------------
@@ -615,6 +625,7 @@ impl SourceProgramBuilder {
             conceals_a_call: self.conceals_a_call,
             volatile: self.volatile,
             protocol_lengths: self.protocol_lengths,
+            read_lengths: self.read_lengths,
         }
     }
 

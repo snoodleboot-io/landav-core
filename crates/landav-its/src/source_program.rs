@@ -49,6 +49,7 @@ pub struct SourceProgram {
     pub(crate) conceals_a_call: bool,
     pub(crate) volatile: BTreeSet<VarName>,
     pub(crate) protocol_lengths: BTreeSet<VarName>,
+    pub(crate) read_lengths: BTreeSet<VarName>,
 }
 
 impl SourceProgram {
@@ -163,6 +164,26 @@ impl SourceProgram {
     #[must_use]
     pub fn rests_on_a_protocol(&self, name: &VarName) -> bool {
         self.protocol_lengths.contains(name)
+    }
+
+    /// Whether the analysis **read** the length `name` while translating this
+    /// function.
+    ///
+    /// # Why the frontend has to say, rather than the arena being scanned
+    ///
+    /// Scanning for a [`SourceExpr::Var`] answers a narrower question and gets
+    /// the important case wrong. `return len(element) <= size` translates its
+    /// expression into a scratch program whose refusals are hoisted, so the
+    /// node that read the length never reaches this arena at all - and when the
+    /// length is *not* readable, what reaches it instead is a refusal. The read
+    /// is exactly what leaves no trace here, so only the frontend can report
+    /// it.
+    ///
+    /// Deliberately not [`Self::variables`] either, which counts every
+    /// parameter whether or not the body mentions one.
+    #[must_use]
+    pub fn reads_length(&self, name: &VarName) -> bool {
+        self.read_lengths.contains(name)
     }
 
     /// Every length variable whose value rests on a protocol, in canonical
