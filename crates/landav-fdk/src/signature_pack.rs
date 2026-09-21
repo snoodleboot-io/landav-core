@@ -26,6 +26,34 @@ use crate::{pack_error::PackError, result_length::ResultLength, signature::Signa
 /// `parse`; nothing about that path is different.
 const BUILTIN: &str = include_str!("builtin_signatures.toml");
 
+/// The newest pack format this build reads.
+///
+/// # Why a pack carries a version at all
+///
+/// [`PackFile`] and [`Signature`] are both `deny_unknown_fields`, and that is
+/// deliberate: a row that misspells `rebinds_locals` must not be accepted with
+/// the field defaulted, because the default is `false` and a row silently
+/// claiming it cannot rebind the caller's locals is the one lie this analysis
+/// cannot survive. Strictness there is a soundness property, not tidiness.
+///
+/// The cost of that strictness is that *any* field added later — this one
+/// included — makes a newer pack unreadable by an older binary. That is
+/// unavoidable. What is avoidable is the older binary saying `unknown field
+/// format`, which reads as "your pack is broken" and sends somebody to edit a
+/// file that is correct.
+///
+/// So the version is read in its own permissive pass before the strict one,
+/// and a pack from the future is refused by number. Note what this does *not*
+/// do: it cannot help a binary built before this change, which has no probe
+/// and will still report `unknown field`. It buys forward compatibility only
+/// from here on, which is why it lands while every crate is `0.0.0` and no
+/// pack exists that somebody else wrote. The same key added after a release
+/// would be worth much less.
+///
+/// A pack with no `format` key is format 1, so nothing already written needs
+/// editing.
+pub const PACK_FORMAT: u32 = 1;
+
 /// The rows of a pack, keyed by callee.
 ///
 /// # Matching is by name, and that is unsound in general
@@ -53,12 +81,28 @@ pub struct SignaturePack {
     rows: BTreeMap<String, Signature>,
 }
 
-/// The on-disk shape: `[[signature]]` tables and nothing else.
+/// The on-disk shape: a `format`, `[[signature]]` tables, and nothing else.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackFile {
     #[serde(default)]
     signature: Vec<Signature>,
+    /// Ignored here — [`FormatProbe`] has already checked it. Declared so the
+    /// strict pass accepts the key rather than refusing the pack that carries
+    /// it.
+    #[serde(default, rename = "format")]
+    _format: Option<u32>,
+}
+
+/// The first pass: the pack's `format` and nothing else.
+///
+/// Permissive on purpose, and the only place in this module that is. It must
+/// read the version out of a pack whose *other* fields this build has never
+/// heard of, which is precisely the pack the strict pass cannot get through.
+#[derive(Debug, Deserialize)]
+struct FormatProbe {
+    #[serde(default)]
+    format: Option<u32>,
 }
 
 impl SignaturePack {
@@ -78,10 +122,25 @@ impl SignaturePack {
     ///
     /// # Errors
     ///
-    /// [`PackError::Malformed`] if the text is not a pack,
-    /// [`PackError::Duplicate`] if two rows claim one callee, and
+    /// [`PackError::UnsupportedFormat`] if the pack declares a format newer
+    /// than [`PACK_FORMAT`] — checked first, so a pack from a newer landav is
+    /// refused by version rather than by whichever unknown field serde reached
+    /// on the way past. Then [`PackError::Malformed`] if the text is not a
+    /// pack, [`PackError::Duplicate`] if two rows claim one callee, and
     /// [`PackError::UnexplainedRow`] if a row's `why` is empty.
     pub fn parse(text: &str) -> Result<Self, PackError> {
+        // Version first. A probe that cannot read the text is not reported
+        // here: the text is not TOML at all, and the strict pass below says so
+        // in the terms it already used.
+        if let Ok(probe) = toml::from_str::<FormatProbe>(text) {
+            let found = probe.format.unwrap_or(PACK_FORMAT);
+            if found > PACK_FORMAT {
+                return Err(PackError::UnsupportedFormat {
+                    found,
+                    supported: PACK_FORMAT,
+                });
+            }
+        }
         let file: PackFile = toml::from_str(text).map_err(|error| PackError::Malformed {
             reason: error.to_string(),
         })?;
@@ -331,5 +390,78 @@ blocks_forever = false
             SignaturePack::parse(text),
             Err(PackError::Malformed { .. })
         ));
+    }
+
+    /// One row, valid, used by the format tests below.
+    fn one_row() -> String {
+        "\
+[[signature]]
+callee = \"isinstance\"
+cost = \"constant\"
+rebinds_locals = false
+mutates_arguments = true
+why = \"a class hierarchy walk, fixed at import time\"
+"
+        .to_owned()
+    }
+
+    #[test]
+    fn a_pack_with_no_format_key_is_the_current_format() {
+        assert!(SignaturePack::parse(&one_row()).is_ok());
+    }
+
+    #[test]
+    fn a_pack_declaring_the_current_format_parses() {
+        let text = format!("format = {PACK_FORMAT}\n{}", one_row());
+        assert!(SignaturePack::parse(&text).is_ok());
+    }
+
+    #[test]
+    fn a_pack_from_a_newer_landav_is_refused_by_number() {
+        let text = format!("format = {}\n{}", PACK_FORMAT + 1, one_row());
+        assert_eq!(
+            SignaturePack::parse(&text),
+            Err(PackError::UnsupportedFormat {
+                found: PACK_FORMAT + 1,
+                supported: PACK_FORMAT,
+            })
+        );
+    }
+
+    /// **The reason the version is read in its own pass.**
+    ///
+    /// A pack from a newer landav does not merely carry a bigger number — it
+    /// carries the fields that number was raised for. Deserialising it
+    /// strictly fails on one of those fields, and `unknown field
+    /// blocks_forever` tells the reader their pack is broken when what is
+    /// actually true is that their landav is old. This asserts the version
+    /// wins, which only holds while the probe runs first.
+    #[test]
+    fn a_future_pack_is_refused_by_version_and_not_by_its_unknown_fields() {
+        let text = format!(
+            "format = {}\n{}blocks_forever = false\n",
+            PACK_FORMAT + 1,
+            one_row()
+        );
+        assert_eq!(
+            SignaturePack::parse(&text),
+            Err(PackError::UnsupportedFormat {
+                found: PACK_FORMAT + 1,
+                supported: PACK_FORMAT,
+            }),
+            "the unknown field was reported instead of the version, so the \
+             operator is told to edit a pack that is correct"
+        );
+    }
+
+    /// The shipped pack states its format rather than relying on the default.
+    ///
+    /// The builtin is the worked example every other pack is written from, and
+    /// a key that the one pack in the repository never uses is a key nobody
+    /// copies.
+    #[test]
+    fn the_builtin_pack_declares_its_format() {
+        let probe: FormatProbe = toml::from_str(BUILTIN).expect("the builtin pack is TOML");
+        assert_eq!(probe.format, Some(PACK_FORMAT));
     }
 }
