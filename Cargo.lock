@@ -450,6 +450,7 @@ dependencies = [
  "landav-bound",
  "landav-calibrate",
  "landav-engine",
+ "landav-fdk",
  "landav-its",
  "landav-python",
  "landav-solvers",

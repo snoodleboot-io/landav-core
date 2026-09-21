@@ -24,7 +24,11 @@
 //! transcript is read by a human, and a name survives that reading where a
 //! code does not.
 
+use std::collections::BTreeSet;
+
 use landav_bound::ResourceKind;
+use landav_fdk::SignaturePack;
+use landav_its::Construct;
 use serde::Serialize;
 
 /// The version of this schema.
@@ -32,7 +36,7 @@ use serde::Serialize;
 /// Bumped when a field changes meaning or disappears. Adding a field is not a
 /// bump: a consumer that ignores unknown fields keeps working, and one that
 /// does not was already fragile.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// A whole run.
 #[derive(Debug, Serialize)]
@@ -113,6 +117,16 @@ pub struct Summary {
     /// and a reader diffing them has to be able to tell which is which without
     /// reconstructing the command line. `LAN-106`.
     pub trust: String,
+    /// Rows a supplied pack replaced, in the order the overlays happened.
+    ///
+    /// Empty unless `--signatures` was given and a pack disagreed with a row
+    /// already in force. Reported rather than merely performed for the reason
+    /// a suppression that suppressed nothing is reported: a claim nobody can
+    /// see is a claim nobody can review — and an override that loosens a row
+    /// can make a bound the program exceeds. Added by `LAN-13`; a new field,
+    /// which on its own would not need a bump. The bump is `Premise::subject`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub signature_overrides: Vec<SignatureOverride>,
     /// Files the frontend could not read as Python.
     ///
     /// The functions in them are in no count in this summary, because they
@@ -179,12 +193,21 @@ pub struct FunctionResource {
 /// One function, and everything concluded about it.
 #[derive(Debug, Serialize)]
 pub struct Premise {
-    /// The bound variable the premise is about, as it appears in `bound`.
-    pub variable: String,
-    /// `"concrete-type"` or `"protocol"`.
+    /// What the premise is about: a bound variable, or a callee.
+    ///
+    /// Renamed from `variable` by `LAN-13`, which is why [`SCHEMA_VERSION`] is
+    /// 2. A premise resting on a supplied signature is about a *call*, and
+    /// calling that a variable would have been the field meaning something
+    /// different depending on the value of another field.
+    pub subject: String,
+    /// `"concrete-type"`, `"protocol"`, or `"supplied-signature"`.
     pub trust: &'static str,
     /// Why the number is believed, in one sentence.
-    pub because: &'static str,
+    ///
+    /// Owned rather than `&'static str` because a supplied-signature premise
+    /// has to name the file the row came from: told only that a bound rests on
+    /// a pack, the first thing a reader needs is which pack.
+    pub because: String,
 }
 
 /// What the bound this run reports for `program` is believed on.
@@ -210,32 +233,123 @@ pub struct Premise {
 ///
 /// A length the function never reads is still not listed: nothing about the
 /// result depends on it, and listing it would make the field noise.
-fn premises_of(program: &landav_its::SourceProgram) -> Vec<Premise> {
-    program
+fn premises_of(program: &landav_its::SourceProgram, pack: Option<&SignaturePack>) -> Vec<Premise> {
+    let mut premises: Vec<Premise> = program
         .params()
         .iter()
         .filter(|name| program.reads_length(name))
         .map(|name| {
             if program.rests_on_a_protocol(name) {
                 Premise {
-                    variable: name.symbol().as_str().to_owned(),
+                    subject: name.symbol().as_str().to_owned(),
                     trust: "protocol",
                     because: "the parameter is annotated with an abstract collection type, so its \
                               length is a user `__len__` that is trusted to equal the number of \
                               iterations; a class implementing the two inconsistently makes this \
-                              bound exceedable",
+                              bound exceedable"
+                        .to_owned(),
                 }
             } else {
                 Premise {
-                    variable: name.symbol().as_str().to_owned(),
+                    subject: name.symbol().as_str().to_owned(),
                     trust: "concrete-type",
                     because: "the parameter is annotated with a concrete builtin collection, and \
                               iterating one yields exactly `len` items; the premise is that the \
-                              caller passes what the annotation says",
+                              caller passes what the annotation says"
+                        .to_owned(),
                 }
             }
         })
+        .collect();
+    premises.extend(supplied_premises(program, pack));
+    premises
+}
+
+/// One premise per callee this program resolved against a row nobody shipped.
+///
+/// # Why this is read back off the program rather than recorded during lowering
+///
+/// A resolved call is still a node in the arena — it stops being a *hole*, not
+/// a node — and it carries the callee in `detail`. So the program already says
+/// which callees a row accounted for, and the pack already says where each row
+/// came from. Recording a third copy during lowering would be a fact that could
+/// disagree with the two that produced it.
+///
+/// Only non-builtin rows earn a premise. A bound resting on the shipped pack
+/// rests on a table this build was released with, which is the tool's own claim
+/// and not an external one; a bound resting on a supplied row rests on
+/// something the operator asserted, and that is exactly what a premise is for.
+fn supplied_premises(
+    program: &landav_its::SourceProgram,
+    pack: Option<&SignaturePack>,
+) -> Vec<Premise> {
+    let Some(pack) = pack else {
+        return Vec::new();
+    };
+    // Owned: `unsupported_nodes` yields records built on the fly, so a `&str`
+    // into one would not outlive the loop.
+    let mut callees: BTreeSet<String> = BTreeSet::new();
+    for node in program.unsupported_nodes() {
+        if node.construct() != Construct::Call || node.declared().is_none() {
+            continue;
+        }
+        if let Some(detail) = node.detail() {
+            callees.insert(detail.as_str().to_owned());
+        }
+    }
+    callees
+        .into_iter()
+        .filter_map(|callee| {
+            let origin = pack.origin_of(&callee)?;
+            if origin.is_builtin() {
+                return None;
+            }
+            Some(Premise {
+                subject: callee.clone(),
+                trust: "supplied-signature",
+                because: format!(
+                    "the cost of `{callee}` was not derived - it was declared by a row in \
+                     {origin}, and this bound closes over that call because the row says it \
+                     is bounded and cannot rebind a local; the premise is that the row is true \
+                     of the code actually called"
+                ),
+            })
+        })
         .collect()
+}
+
+/// One row a supplied pack replaced.
+///
+/// The losing row's `why` is carried because it is the half a reader cannot
+/// reconstruct: the shipped pack argued a case for the row in writing, and an
+/// override that contradicts it should be read next to what it contradicts.
+#[derive(Debug, Serialize)]
+pub struct SignatureOverride {
+    /// The callee both rows claim.
+    pub callee: String,
+    /// Where the row that lost came from.
+    pub overridden: String,
+    /// Where the row that won came from.
+    pub overridden_by: String,
+    /// The argument the losing row made for itself.
+    pub replaced_why: String,
+}
+
+/// Every override a supplied pack performed, for [`Summary::signature_overrides`].
+#[must_use]
+pub fn overrides_of(pack: Option<&SignaturePack>) -> Vec<SignatureOverride> {
+    pack.map(|pack| {
+        pack.shadowed()
+            .iter()
+            .map(|record| SignatureOverride {
+                callee: record.callee.clone(),
+                overridden: record.overridden.to_string(),
+                overridden_by: record.overridden_by.to_string(),
+                replaced_why: record.replaced.why.clone(),
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// One function's result.
@@ -410,6 +524,7 @@ impl Collector {
         &mut self,
         function: &landav_python::LoweredFunction,
         lowered: Result<(), &landav_its::LoweringError>,
+        pack: Option<&SignaturePack>,
     ) {
         let at = function.location();
         // Kept as the frontend's own records for as long as possible: the hole
@@ -498,7 +613,7 @@ impl Collector {
         self.functions.push(Function {
             name: function.name().to_owned(),
             class: function.class().map(str::to_owned),
-            premises: premises_of(function.program()),
+            premises: premises_of(function.program(), pack),
             file: at.file().display().to_string(),
             line: at.line(),
             column: at.column(),

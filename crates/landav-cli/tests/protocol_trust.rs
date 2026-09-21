@@ -178,7 +178,7 @@ fn the_json_publishes_the_premise_and_its_tier() -> io::Result<()> {
             1,
             "the bound mentions one trusted length: {function}"
         );
-        assert_eq!(premises[0]["variable"], "len(rows)", "{function}");
+        assert_eq!(premises[0]["subject"], "len(rows)", "{function}");
         assert_eq!(
             premises[0]["trust"], tier,
             "the two tiers must stay distinguishable, or filtering on them is \
