@@ -62,17 +62,24 @@
 //!
 //! Not a string in a README. The level is whatever set of constructs the
 //! assertions below agree reads, and a form that is deliberately *not* read is
-//! pinned as such with a reason. Adding a version constant somewhere in `src/`
-//! is welcome, but it is a restatement of these tests and not a substitute for
-//! them: a constant cannot be exceeded by the parser, and a claim that cannot
-//! be wrong is not a contract.
+//! pinned as such with a reason.
+//!
+//! [`landav_python::SUPPORTED_PYTHON`] and its exception list state that level
+//! in one place, because a build that reads less Python than its release notes
+//! claim is a wrong build and not merely a red suite. A constant alone would
+//! be worthless — it cannot be exceeded by the parser, and a claim that cannot
+//! be wrong is not a contract — so the *stated level* section at the end of
+//! this file pins it from both sides: a sample per release that must read, so
+//! the number cannot be raised on paper, and a sample per published exception
+//! that must still refuse, so it cannot be left overstating the gap. The
+//! constant is the statement; those two tests are what make it falsifiable.
 
 // See `common/mod.rs` for why the panic lints are relaxed in test code.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::Path;
 
-use landav_python::PythonError;
+use landav_python::{PythonError, SUPPORTED_PYTHON, UNREAD_AT_SUPPORTED_LEVEL};
 
 // ---------------------------------------------------------------------------
 // harness
@@ -393,7 +400,7 @@ def join(rows: list) -> int:
 /// **Deferred: PEP 758, `except A, B:` without parentheses (3.14).**
 ///
 /// Not a gap — a limit, and the difference is that this one is chosen. The
-/// declared level is 3.13, this is 3.14-only syntax, and it appears zero times
+/// stated level is 3.12, this is 3.14-only syntax, and it appears zero times
 /// across both corpora (momentum runs *on* 3.14 and has not written one). It
 /// is also cost-free to omit: the parenthesised spelling means the same thing,
 /// is still valid, and is what every existing file contains.
@@ -413,7 +420,7 @@ def run(n: int) -> int:
 ";
     assert_refuses(
         source,
-        "it is 3.14-only syntax, the declared level is 3.13, and the \
+        "it is 3.14-only syntax, the stated level is 3.12, and the \
          parenthesised spelling it replaces is unaffected",
     );
 }
@@ -487,4 +494,210 @@ async def drain(source, n: int) -> int:
          outside the coverage denominator rather than inside it as a \
          refusal:\n{source}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// the stated level
+// ---------------------------------------------------------------------------
+//
+// `LAN-82` asks for the supported version to be stated in one place and
+// asserted by a test. The statement is [`landav_python::SUPPORTED_PYTHON`] and
+// its exception list, and this section is the assertion — the half that stops
+// the statement from being decoration.
+//
+// A version constant read on its own is unfalsifiable: nothing about `"3.12"`
+// can be contradicted by a parser. What the two tests below do is pin it from
+// both sides. The samples say the frontend reads *at least* the stated
+// version, so the number cannot be raised without teaching the frontend the
+// syntax first; the exception list says the frontend reads no more than it
+// admits to, so a form that quietly starts parsing forces the list to shrink.
+// Between them the claim can be wrong, which is the only reason to publish it.
+
+/// One version-defining construct per release, and the release that added it.
+///
+/// Each source must lower a function called `label`, so that a sample proves
+/// the construct reached the bound engine rather than merely parsed — the
+/// distinction the whole file is built on.
+const AT_LEVEL: &[(&str, &str, &str)] = &[
+    (
+        "3.10",
+        "a `match` statement",
+        "\
+def label(value) -> int:
+    match value:
+        case 1:
+            return 1
+        case _:
+            return 0
+",
+    ),
+    (
+        "3.11",
+        "an `except*` handler",
+        "\
+def label(value) -> int:
+    try:
+        go(value)
+    except* ValueError:
+        return 0
+    return 1
+",
+    ),
+    (
+        "3.12",
+        "a PEP 695 type parameter list",
+        "\
+def label[T](value: T) -> int:
+    return 1
+",
+    ),
+    (
+        "3.12",
+        "a PEP 695 `type` alias",
+        "\
+type Row = tuple[int, int]
+
+
+def label(row) -> int:
+    return 1
+",
+    ),
+];
+
+/// One sample per entry of [`UNREAD_AT_SUPPORTED_LEVEL`], keyed by its name.
+///
+/// The names are compared for equality with the published list, so an entry
+/// added there without a sample here — or a sample here naming nothing — is a
+/// failure rather than a silently untested claim.
+const UNREAD: &[(&str, &str)] = &[
+    (
+        "a replacement field reusing the enclosing quote",
+        r#"
+def label(row) -> int:
+    text = f"{row["name"]}"
+    return len(text)
+"#,
+    ),
+    (
+        "an f-string nested in an f-string in the same quotes",
+        r#"
+def label(row) -> int:
+    text = f"{f"{row}"}"
+    return len(text)
+"#,
+    ),
+    (
+        "a replacement field spanning lines",
+        r#"
+def label(row) -> int:
+    text = f"{
+        row.name
+    }"
+    return len(text)
+"#,
+    ),
+    (
+        "a comment inside a multi-line replacement field",
+        r#"
+def label(row) -> int:
+    text = f"{
+        row.name  # the display name
+    }"
+    return len(text)
+"#,
+    ),
+    (
+        "a format spec reusing the enclosing quote",
+        r#"
+def label(row) -> int:
+    text = f"{row:{row["width"]}}"
+    return len(text)
+"#,
+    ),
+];
+
+/// `"3.12"` as `(3, 12)`, so releases order by number and not by string.
+///
+/// `"3.9"` sorts after `"3.12"` as text, which would let the claim be lowered
+/// by a sample that looks like an addition.
+fn release(text: &str) -> (u32, u32) {
+    let (major, minor) = text
+        .split_once('.')
+        .unwrap_or_else(|| panic!("a release is `major.minor`, got {text:?}"));
+    let parsed = |part: &str| {
+        part.parse::<u32>()
+            .unwrap_or_else(|_| panic!("a release part is a number, got {part:?} in {text:?}"))
+    };
+    (parsed(major), parsed(minor))
+}
+
+/// **The stated version is the highest one the frontend actually reads.**
+///
+/// Both directions are the assertion. Every sample must read, so the claim
+/// cannot be above the frontend; and the highest sample must equal the claim,
+/// so the claim cannot be below it either — a construct that starts reading
+/// is only worth having if the published number moves with it.
+#[test]
+fn the_stated_level_is_the_highest_release_that_reads() {
+    for (added, construct, source) in AT_LEVEL {
+        assert!(
+            release(added) <= release(SUPPORTED_PYTHON),
+            "{construct} arrived in {added}, above the stated \
+             {SUPPORTED_PYTHON}. Either the sample belongs in the deferred \
+             section or `SUPPORTED_PYTHON` is out of date"
+        );
+        assert_reads(source, "label");
+    }
+
+    let highest = AT_LEVEL
+        .iter()
+        .map(|(added, ..)| release(added))
+        .max()
+        .expect("the table is not empty");
+
+    assert_eq!(
+        highest,
+        release(SUPPORTED_PYTHON),
+        "`SUPPORTED_PYTHON` is {SUPPORTED_PYTHON}, but the newest construct \
+         proved to read here is from {highest:?}. A version claim is only \
+         worth publishing while a sample stands behind it: add the construct \
+         that defines the newer release, or lower the constant"
+    );
+}
+
+/// **Every published exception is still unread, and every one is sampled.**
+///
+/// This is the test a parser swap is meant to break. The five forms are the
+/// whole measured loss, so the day one of them parses, the published list
+/// overstates the gap and has to shrink — and the matching `#[ignore]` above
+/// comes off. Names are compared as a set so neither side can drift alone.
+#[test]
+fn every_unread_form_is_sampled_and_still_unread() {
+    let mut published: Vec<&str> = UNREAD_AT_SUPPORTED_LEVEL.to_vec();
+    let mut sampled: Vec<&str> = UNREAD.iter().map(|(name, _)| *name).collect();
+    published.sort_unstable();
+    sampled.sort_unstable();
+    assert_eq!(
+        published, sampled,
+        "`UNREAD_AT_SUPPORTED_LEVEL` and the samples here name different \
+         forms. An entry with no sample is an untested claim about the gap"
+    );
+
+    for (name, source) in UNREAD {
+        match lowered_names(source) {
+            Ok(names) => panic!(
+                "{name} now parses (functions {names:?}), so the frontend \
+                 reads more than `UNREAD_AT_SUPPORTED_LEVEL` admits. Drop the \
+                 entry, un-`#[ignore]` the test above that asserts it reads, \
+                 and re-measure the stdlib file count in this file's \
+                 header:\n{source}"
+            ),
+            Err(PythonError::Parse { line, column, .. }) => assert!(
+                line >= 1 && column >= 1,
+                "{name} is refused without a usable position ({line}:{column}), \
+                 so an operator cannot find the file's first bad line"
+            ),
+            Err(other) => panic!("expected a parse refusal for {name}, got {other}"),
+        }
+    }
 }

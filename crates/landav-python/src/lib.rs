@@ -130,6 +130,37 @@ pub use crate::{
 /// not merely a build with a failing test.
 pub const MINIMUM_RULE_COUNT: usize = 8;
 
+/// The Python version this frontend reads, bar the forms in
+/// [`UNREAD_AT_SUPPORTED_LEVEL`].
+///
+/// Acceptance criterion of `LAN-82`, and published here for
+/// [`MINIMUM_RULE_COUNT`]'s reason: a build that reads less Python than its
+/// release notes claim is a wrong build, not merely a red suite.
+///
+/// A version string on its own would be worth nothing — it cannot be exceeded
+/// by a parser, and a claim that cannot be wrong is not a contract. What makes
+/// this one falsifiable is `python_syntax_level.rs`, which holds a sample per
+/// version and asserts that the highest one the frontend actually reads is
+/// this number. Raising it without teaching the frontend the syntax fails.
+pub const SUPPORTED_PYTHON: &str = "3.12";
+
+/// The forms at or below [`SUPPORTED_PYTHON`] the frontend nonetheless refuses.
+///
+/// All five are PEP 701, all five cost a whole *file* rather than a function,
+/// and together they are the entire measured loss: three files of the 3.12
+/// standard library, 51 top-level functions, zero on momentum's backend. The
+/// pinned `rustpython-parser 0.4.0` predates PEP 701 and is already the newest
+/// published release, so this list is a priced deferral — see
+/// `python_syntax_level.rs`, which samples each entry and fails if one is
+/// missing, unused, or quietly starts parsing.
+pub const UNREAD_AT_SUPPORTED_LEVEL: &[&str] = &[
+    "a replacement field reusing the enclosing quote",
+    "an f-string nested in an f-string in the same quotes",
+    "a replacement field spanning lines",
+    "a comment inside a multi-line replacement field",
+    "a format spec reusing the enclosing quote",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
