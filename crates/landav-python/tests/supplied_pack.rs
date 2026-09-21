@@ -64,9 +64,10 @@ fn frobnicate_is_declared(pack: Option<&SignaturePack>) -> bool {
         .next()
         .expect("one function")
         .into_program();
-    let mut nodes = program
-        .unsupported_nodes()
-        .filter(|node| node.detail().is_some_and(|name| name.as_str() == "frobnicate"));
+    let mut nodes = program.unsupported_nodes().filter(|node| {
+        node.detail()
+            .is_some_and(|name| name.as_str() == "frobnicate")
+    });
     let node = nodes
         .next()
         .expect("the call to `frobnicate` is a node either way");
