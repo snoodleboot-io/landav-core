@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::{pack_error::PackError, result_length::ResultLength, signature::Signature};
+use crate::{
+    pack_error::PackError, pack_origin::PackOrigin, result_length::ResultLength,
+    shadowed::Shadowed, signature::Signature,
+};
 
 /// The OSS builtin pack, as data.
 ///
@@ -78,7 +81,19 @@ pub const PACK_FORMAT: u32 = 1;
 /// parameter, both of which a module can lie about in exactly the same way.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SignaturePack {
-    rows: BTreeMap<String, Signature>,
+    rows: BTreeMap<String, Row>,
+    shadowed: Vec<Shadowed>,
+}
+
+/// One row and where it came from.
+///
+/// Origin is kept beside the row rather than inside [`Signature`] because a
+/// pack author does not declare it — see [`PackOrigin`] for why a pack that
+/// could name its own origin is a pack that could name someone else's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Row {
+    signature: Signature,
+    origin: PackOrigin,
 }
 
 /// The on-disk shape: a `format`, `[[signature]]` tables, and nothing else.
@@ -115,10 +130,10 @@ impl SignaturePack {
     /// panic: this is library code, and the workspace forbids a library that
     /// aborts the process over its own data.
     pub fn builtin() -> Result<Self, PackError> {
-        Self::parse(BUILTIN)
+        Self::parse(&PackOrigin::Builtin, BUILTIN)
     }
 
-    /// Reads a pack from TOML.
+    /// Reads a pack from TOML, attributing every row to `origin`.
     ///
     /// # Errors
     ///
@@ -128,7 +143,7 @@ impl SignaturePack {
     /// on the way past. Then [`PackError::Malformed`] if the text is not a
     /// pack, [`PackError::Duplicate`] if two rows claim one callee, and
     /// [`PackError::UnexplainedRow`] if a row's `why` is empty.
-    pub fn parse(text: &str) -> Result<Self, PackError> {
+    pub fn parse(origin: &PackOrigin, text: &str) -> Result<Self, PackError> {
         // Version first. A probe that cannot read the text is not reported
         // here: the text is not TOML at all, and the strict pass below says so
         // in the terms it already used.
@@ -144,7 +159,7 @@ impl SignaturePack {
         let file: PackFile = toml::from_str(text).map_err(|error| PackError::Malformed {
             reason: error.to_string(),
         })?;
-        let mut rows: BTreeMap<String, Signature> = BTreeMap::new();
+        let mut rows: BTreeMap<String, Row> = BTreeMap::new();
         for row in file.signature {
             if row.why.trim().is_empty() {
                 return Err(PackError::UnexplainedRow { callee: row.callee });
@@ -152,9 +167,69 @@ impl SignaturePack {
             if rows.contains_key(&row.callee) {
                 return Err(PackError::Duplicate { callee: row.callee });
             }
-            rows.insert(row.callee.clone(), row);
+            rows.insert(
+                row.callee.clone(),
+                Row {
+                    signature: row,
+                    origin: origin.clone(),
+                },
+            );
         }
-        Ok(Self { rows })
+        Ok(Self {
+            rows,
+            shadowed: Vec::new(),
+        })
+    }
+
+    /// Lays `other`'s rows over this pack's, recording what they replaced.
+    ///
+    /// # Overriding is allowed; overriding invisibly is not
+    ///
+    /// [`PackError::Duplicate`] refuses two rows for one callee *within* a
+    /// pack. This is the other case and it answers differently, because
+    /// overriding the builtin is the reason to supply a pack at all — see
+    /// [`Shadowed`], which is where the argument and the losing row are kept.
+    ///
+    /// Overlaying is last-wins by row and not by pack: a pack that speaks about
+    /// one callee replaces that one row and leaves the rest of the builtin
+    /// standing. Replacing the pack wholesale would mean a deployment
+    /// correcting a single row had to restate every row it agreed with, and the
+    /// rows it forgot would become holes rather than errors.
+    ///
+    /// `other`'s own shadow records come along, so overlaying three packs in
+    /// sequence reports every override rather than only the last one.
+    pub fn overlay(&mut self, other: Self) {
+        self.shadowed.extend(other.shadowed);
+        for (callee, row) in other.rows {
+            if let Some(previous) = self.rows.insert(callee.clone(), row.clone()) {
+                self.shadowed.push(Shadowed {
+                    callee,
+                    overridden: previous.origin,
+                    overridden_by: row.origin,
+                    replaced: previous.signature,
+                });
+            }
+        }
+    }
+
+    /// Every row an overlay replaced, in the order the overlays happened.
+    ///
+    /// Empty for a pack that was never overlaid. A driver reports these for
+    /// the reason it reports a suppression that suppressed nothing: an
+    /// override nobody can see is an override nobody can review.
+    #[must_use]
+    pub fn shadowed(&self) -> &[Shadowed] {
+        &self.shadowed
+    }
+
+    /// Where this pack's row for `callee` came from, if it has one.
+    ///
+    /// Answers for any row the pack holds, resolvable or not — the question
+    /// "who said this" is as worth asking about a refusal as about an
+    /// admission.
+    #[must_use]
+    pub fn origin_of(&self, callee: &str) -> Option<&PackOrigin> {
+        self.rows.get(callee).map(|row| &row.origin)
     }
 
     /// The signature for `callee`, if this pack has one a frontend may resolve
@@ -174,7 +249,7 @@ impl SignaturePack {
     where
         F: FnOnce(&str) -> bool,
     {
-        let row = self.rows.get(callee)?;
+        let row = &self.rows.get(callee)?.signature;
         if !row.is_resolvable() || bound_names(callee) {
             return None;
         }
@@ -204,7 +279,7 @@ impl SignaturePack {
     where
         F: FnOnce(&str) -> bool,
     {
-        let row = self.rows.get(callee)?;
+        let row = &self.rows.get(callee)?.signature;
         if !row.result_length.is_declared() || bound_names(callee) {
             return None;
         }
@@ -217,18 +292,20 @@ impl SignaturePack {
     /// frontend deciding what to do with a call site.
     #[must_use]
     pub fn row(&self, callee: &str) -> Option<&Signature> {
-        self.rows.get(callee)
+        self.rows.get(callee).map(|row| &row.signature)
     }
 
     /// Every row, in callee order.
     pub fn rows(&self) -> impl Iterator<Item = &Signature> {
-        self.rows.values()
+        self.rows.values().map(|row| &row.signature)
     }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::path::PathBuf;
 
     use super::*;
     use crate::cost_class::CostClass;
@@ -343,7 +420,7 @@ mutates_arguments = true
 why = \"\"
 ";
         assert_eq!(
-            SignaturePack::parse(text),
+            SignaturePack::parse(&PackOrigin::Builtin, text),
             Err(PackError::UnexplainedRow {
                 callee: "isinstance".to_owned()
             })
@@ -368,7 +445,7 @@ mutates_arguments = true
 why = \"appended rather than argued with\"
 ";
         assert_eq!(
-            SignaturePack::parse(text),
+            SignaturePack::parse(&PackOrigin::Builtin, text),
             Err(PackError::Duplicate {
                 callee: "isinstance".to_owned()
             })
@@ -387,7 +464,7 @@ why = \"a class hierarchy walk, fixed at import time\"
 blocks_forever = false
 ";
         assert!(matches!(
-            SignaturePack::parse(text),
+            SignaturePack::parse(&PackOrigin::Builtin, text),
             Err(PackError::Malformed { .. })
         ));
     }
@@ -407,20 +484,20 @@ why = \"a class hierarchy walk, fixed at import time\"
 
     #[test]
     fn a_pack_with_no_format_key_is_the_current_format() {
-        assert!(SignaturePack::parse(&one_row()).is_ok());
+        assert!(SignaturePack::parse(&PackOrigin::Builtin, &one_row()).is_ok());
     }
 
     #[test]
     fn a_pack_declaring_the_current_format_parses() {
         let text = format!("format = {PACK_FORMAT}\n{}", one_row());
-        assert!(SignaturePack::parse(&text).is_ok());
+        assert!(SignaturePack::parse(&PackOrigin::Builtin, &text).is_ok());
     }
 
     #[test]
     fn a_pack_from_a_newer_landav_is_refused_by_number() {
         let text = format!("format = {}\n{}", PACK_FORMAT + 1, one_row());
         assert_eq!(
-            SignaturePack::parse(&text),
+            SignaturePack::parse(&PackOrigin::Builtin, &text),
             Err(PackError::UnsupportedFormat {
                 found: PACK_FORMAT + 1,
                 supported: PACK_FORMAT,
@@ -444,7 +521,7 @@ why = \"a class hierarchy walk, fixed at import time\"
             one_row()
         );
         assert_eq!(
-            SignaturePack::parse(&text),
+            SignaturePack::parse(&PackOrigin::Builtin, &text),
             Err(PackError::UnsupportedFormat {
                 found: PACK_FORMAT + 1,
                 supported: PACK_FORMAT,
@@ -463,5 +540,133 @@ why = \"a class hierarchy walk, fixed at import time\"
     fn the_builtin_pack_declares_its_format() {
         let probe: FormatProbe = toml::from_str(BUILTIN).expect("the builtin pack is TOML");
         assert_eq!(probe.format, Some(PACK_FORMAT));
+    }
+
+    // -----------------------------------------------------------------------
+    // provenance and overlay
+    // -----------------------------------------------------------------------
+
+    /// A pack read from `name`, with one row for `callee` at `cost`.
+    fn pack_from(name: &str, callee: &str, cost: &str, why: &str) -> SignaturePack {
+        let text = format!(
+            "[[signature]]\ncallee = \"{callee}\"\ncost = \"{cost}\"\n\
+             rebinds_locals = false\nmutates_arguments = true\nwhy = \"{why}\"\n"
+        );
+        SignaturePack::parse(&PackOrigin::File(PathBuf::from(name)), &text)
+            .expect("the test pack parses")
+    }
+
+    #[test]
+    fn a_row_knows_which_pack_it_came_from() {
+        let pack = pack_from("team.toml", "frobnicate", "constant", "measured here");
+        assert_eq!(
+            pack.origin_of("frobnicate"),
+            Some(&PackOrigin::File(PathBuf::from("team.toml")))
+        );
+        assert_eq!(pack.origin_of("never_declared"), None);
+        assert!(
+            !pack
+                .origin_of("frobnicate")
+                .expect("the row is present")
+                .is_builtin(),
+            "a row somebody supplied must not read as a row landav shipped"
+        );
+    }
+
+    #[test]
+    fn a_pack_that_conflicts_with_nothing_shadows_nothing() {
+        let mut pack = SignaturePack::builtin().expect("the builtin pack parses");
+        pack.overlay(pack_from("team.toml", "frobnicate", "constant", "ours"));
+        assert!(pack.shadowed().is_empty());
+        assert!(pack.row("frobnicate").is_some(), "the new row is usable");
+        assert!(
+            pack.row("isinstance").is_some(),
+            "an overlay is by row, not by pack: the builtin rows are still here"
+        );
+    }
+
+    /// **An override is allowed, and the row it replaced is kept whole.**
+    ///
+    /// The loosening direction on purpose, because it is the dangerous one:
+    /// `sorted` is `loglinear` and unresolvable in the builtin, and a
+    /// deployment declaring it constant would make every sort inside a loop
+    /// report a bound the program exceeds. That is permitted — overriding is
+    /// the reason to supply a pack — and it is permitted *because* it cannot
+    /// be done quietly. The losing row survives with the argument it made.
+    #[test]
+    fn an_overridden_row_is_recorded_with_the_argument_it_lost() {
+        let mut pack = SignaturePack::builtin().expect("the builtin pack parses");
+        let before = pack
+            .row("sorted")
+            .expect("the builtin declares sorted")
+            .clone();
+
+        pack.overlay(pack_from(
+            "team.toml",
+            "sorted",
+            "constant",
+            "we sort small lists",
+        ));
+
+        assert_eq!(
+            pack.row("sorted").map(|row| row.cost),
+            Some(CostClass::Constant),
+            "the later row is the one in force"
+        );
+        assert_eq!(
+            pack.origin_of("sorted"),
+            Some(&PackOrigin::File(PathBuf::from("team.toml"))),
+            "and the pack knows it is no longer answering for the builtin"
+        );
+
+        let records = pack.shadowed();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].callee, "sorted");
+        assert!(records[0].overrode_the_builtin());
+        assert_eq!(
+            records[0].replaced, before,
+            "the row that lost is kept entire, `why` included, or the \
+             disagreement the duplicate rule exists to preserve is gone"
+        );
+    }
+
+    #[test]
+    fn every_override_in_a_chain_is_reported_and_not_only_the_last() {
+        let mut pack = SignaturePack::builtin().expect("the builtin pack parses");
+        pack.overlay(pack_from("team.toml", "sorted", "constant", "first word"));
+        pack.overlay(pack_from("local.toml", "sorted", "unbounded", "last word"));
+
+        let callees: Vec<&str> = pack
+            .shadowed()
+            .iter()
+            .map(|record| record.callee.as_str())
+            .collect();
+        assert_eq!(
+            callees,
+            vec!["sorted", "sorted"],
+            "the middle override vanished, so a reader sees the final row \
+             disagreeing with the builtin and not the pack that came between"
+        );
+        assert!(pack.shadowed()[0].overrode_the_builtin());
+        assert!(!pack.shadowed()[1].overrode_the_builtin());
+    }
+
+    /// An overlaid pack's own records come along with it.
+    ///
+    /// Otherwise a driver that composes packs before handing one over reports
+    /// only the overrides it performed itself.
+    #[test]
+    fn an_overlays_own_records_survive_being_overlaid() {
+        let mut supplied = SignaturePack::builtin().expect("the builtin pack parses");
+        supplied.overlay(pack_from("team.toml", "sorted", "constant", "first"));
+        assert_eq!(supplied.shadowed().len(), 1);
+
+        let mut pack = SignaturePack::default();
+        pack.overlay(supplied);
+        assert_eq!(
+            pack.shadowed().len(),
+            1,
+            "the record made before the merge was dropped by the merge"
+        );
     }
 }

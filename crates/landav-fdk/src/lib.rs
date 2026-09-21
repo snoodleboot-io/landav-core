@@ -71,14 +71,18 @@
 
 pub mod cost_class;
 pub mod pack_error;
+pub mod pack_origin;
 pub mod result_length;
+pub mod shadowed;
 pub mod signature;
 pub mod signature_pack;
 
 pub use crate::{
     cost_class::CostClass,
     pack_error::PackError,
+    pack_origin::PackOrigin,
     result_length::ResultLength,
+    shadowed::Shadowed,
     signature::Signature,
     signature_pack::{PACK_FORMAT, SignaturePack},
 };
