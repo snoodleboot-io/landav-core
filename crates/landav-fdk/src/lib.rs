@@ -76,7 +76,9 @@ pub mod signature;
 pub mod signature_pack;
 
 pub use crate::{
-    cost_class::CostClass, pack_error::PackError, result_length::ResultLength,
+    cost_class::CostClass,
+    pack_error::PackError,
+    result_length::ResultLength,
     signature::Signature,
     signature_pack::{PACK_FORMAT, SignaturePack},
 };
