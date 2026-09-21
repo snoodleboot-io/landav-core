@@ -596,9 +596,17 @@ why = \"a class hierarchy walk, fixed at import time\"
     #[test]
     fn an_overridden_row_is_recorded_with_the_argument_it_lost() {
         let mut pack = SignaturePack::builtin().expect("the builtin pack parses");
-        let before = pack.row("sorted").expect("the builtin declares sorted").clone();
+        let before = pack
+            .row("sorted")
+            .expect("the builtin declares sorted")
+            .clone();
 
-        pack.overlay(pack_from("team.toml", "sorted", "constant", "we sort small lists"));
+        pack.overlay(pack_from(
+            "team.toml",
+            "sorted",
+            "constant",
+            "we sort small lists",
+        ));
 
         assert_eq!(
             pack.row("sorted").map(|row| row.cost),
