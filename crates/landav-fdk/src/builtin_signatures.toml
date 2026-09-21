@@ -1,5 +1,11 @@
 # The OSS builtin signature pack — LAN-94.
 #
+# `format` is the pack format, not the pack's own version. It exists so that a
+# pack written against a newer landav is refused by number ("needs a newer
+# landav") instead of by whichever field the reader had never heard of. Omit it
+# and the pack is format 1, which is what every pack written so far is.
+format = 1
+#
 # This file is DATA. Nothing in this workspace has a Rust arm per callee; adding
 # a callee is adding a table here, and a reviewer reads the diff as a table.
 #

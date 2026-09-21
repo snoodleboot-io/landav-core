@@ -26,6 +26,26 @@ pub enum PackError {
         /// The callee named twice.
         callee: String,
     },
+    /// The pack declares a format this build does not read.
+    ///
+    /// The one refusal that is not a complaint about the pack. Every other
+    /// variant says the author got something wrong; this one says the author
+    /// is ahead and the *binary* is what needs changing, so it names both
+    /// numbers rather than saying "invalid".
+    ///
+    /// Without it the same pack fails as [`Self::Malformed`] with serde's
+    /// `unknown field` text, which sends a reader to edit a file that is
+    /// correct.
+    #[error(
+        "signature pack declares format {found}, but this build of landav reads \
+         up to format {supported}: use a newer landav to read this pack"
+    )]
+    UnsupportedFormat {
+        /// The format the pack declares.
+        found: u32,
+        /// The newest format this build reads.
+        supported: u32,
+    },
     /// A row's `why` is empty.
     ///
     /// The one field validated beyond its type. `why = ""` satisfies the
