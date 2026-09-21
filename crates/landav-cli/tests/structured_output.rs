@@ -103,8 +103,13 @@ fn stdout_carries_json_and_nothing_else() -> io::Result<()> {
 fn the_schema_declares_its_version() -> io::Result<()> {
     let project = Project::new()?;
     let run = run_json(&project, SHAPES_PY)?;
+    // 2 since `LAN-13`: `Premise.variable` became `Premise.subject`, because a
+    // premise may now rest on a supplied signature and be about a *callee*. A
+    // field that means a different thing depending on another field's value is
+    // the drift a schema version exists to announce, so this is a bump and not
+    // an addition.
     assert_eq!(
-        run["schema_version"], 1,
+        run["schema_version"], 2,
         "the schema version changed; that is a decision, not an accident, and \
          consumers need to be told"
     );

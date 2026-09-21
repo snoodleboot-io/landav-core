@@ -91,10 +91,12 @@
 //! not govern, and it contains no entitlement logic of any kind.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use landav_bound::ResourceKind;
+use landav_fdk::{PackOrigin, SignaturePack};
 use landav_its::Coverage;
 use landav_python::{ModuleAnalysis, PythonError, Suppression, SuppressionStatus};
 
@@ -111,12 +113,56 @@ use crate::sources::Target;
 /// arguments that say anything about the *analysis* rather than the input or
 /// the output format. Bundling them keeps each signature inside the argument
 /// limit without a suppression, which is the honest version of the same fix.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Derivation {
     /// The resource to bound, if one was named.
     pub resource: Option<ResourceKind>,
     /// Which annotations a collection's length may be read from. `LAN-106`.
     pub trust: landav_python::AnnotationTrust,
+    /// Signature packs to lay over the builtin, in the order given. `LAN-13`.
+    pub signatures: Vec<PathBuf>,
+}
+
+/// What a run is allowed to believe: the flags, and the table they resolved to.
+///
+/// One value rather than two parameters because they are one idea. `trust` says
+/// which annotations a length may be read from and the pack says which callees
+/// have a declared cost; both are things this run takes on faith rather than
+/// derives, and both are what a premise is reported against. Passing them
+/// separately also put `accumulate` one argument over clippy's limit, which is
+/// the lint noticing the same thing.
+struct Believed<'a> {
+    derivation: &'a Derivation,
+    pack: Option<&'a SignaturePack>,
+}
+
+/// The builtin pack with each supplied pack laid over it, or `None` for none.
+///
+/// # A pack that cannot be read stops the run
+///
+/// Deliberately unlike the builtin, which [`landav_python`] resolves to an
+/// empty pack rather than panicking: a broken builtin costs coverage and never
+/// soundness, and a library may not abort. A *supplied* pack is a different
+/// case, because somebody asked for it. Carrying on without it would answer a
+/// different question than the one the caller asked, report bounds derived from
+/// a table they did not choose, and say nothing about it — and the bounds would
+/// look exactly like bounds that had used the pack.
+///
+/// `None` when no pack was named, which leaves the default path byte-for-byte
+/// as it was: the lowering reaches its own builtin and this never runs.
+fn signature_pack(paths: &[PathBuf]) -> Result<Option<SignaturePack>, ToolError> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let mut pack = SignaturePack::builtin()
+        .map_err(|error| ToolError::new("the builtin signature pack", error))?;
+    for path in paths {
+        let text = fs::read_to_string(path).map_err(|error| ToolError::at_path(path, error))?;
+        let supplied = SignaturePack::parse(&PackOrigin::File(path.clone()), &text)
+            .map_err(|error| ToolError::at_path(path, error))?;
+        pack.overlay(supplied);
+    }
+    Ok(Some(pack))
 }
 
 pub fn run(
@@ -132,7 +178,7 @@ pub fn run(
         target,
         stdin_name,
         explicit_config,
-        derivation,
+        &derivation,
         coverage,
         bounds,
         json,
@@ -150,7 +196,7 @@ fn analyse(
     target: Option<&Path>,
     stdin_name: Option<&str>,
     explicit_config: Option<&Path>,
-    derivation: Derivation,
+    derivation: &Derivation,
     detail: bool,
     bounds: bool,
     json: bool,
@@ -163,6 +209,16 @@ fn analyse(
     // `.` when it read one buffer would be a claim about a whole tree.
     let anchor = target.unwrap_or_else(|| Path::new("."));
     let config = config::load(anchor, explicit_config)?;
+
+    // Loaded before the walk, like the configuration and for the same reason: a
+    // pack that cannot be read is a fact about the run's setup, and finding out
+    // halfway through a tree would mean some files were analysed against a
+    // different table than the rest.
+    let pack = signature_pack(&derivation.signatures)?;
+    let believed = Believed {
+        derivation,
+        pack: pack.as_ref(),
+    };
 
     // Source read once, before the walk, so a failure to read it is a tool
     // error rather than a file that mysteriously vanished mid-run.
@@ -235,7 +291,7 @@ fn analyse(
                 if let Err(problem) = accumulate(
                     path,
                     &text,
-                    derivation,
+                    &believed,
                     &mut coverage,
                     &mut analysed,
                     bounds.then_some(&mut report),
@@ -299,6 +355,21 @@ fn analyse(
         }
     }
 
+    // Before the summary, one line each, like the findings. An override that a
+    // reader has to ask for in JSON is an override most readers never see, and
+    // one that loosens a row can make a bound the program exceeds.
+    if let Some(pack) = pack.as_ref() {
+        for record in pack.shadowed() {
+            report.line(format_args!(
+                "signatures: {} overrides the row for `{}` from {} — the row it replaced said: {}",
+                record.overridden_by,
+                record.callee,
+                record.overridden,
+                one_line(&record.replaced.why)
+            ));
+        }
+    }
+
     summarise(
         &mut report,
         reported_as,
@@ -353,6 +424,7 @@ fn analyse(
                 analysed,
                 coverage_percent: coverage.percent(),
                 trust: derivation.trust.to_string(),
+                signature_overrides: machine::overrides_of(pack.as_ref()),
                 // `inconclusive` is incremented in exactly one place - a file
                 // the frontend could not parse - so it is this count.
                 unreadable_files: inconclusive,
@@ -772,23 +844,24 @@ const fn classify(
 fn accumulate<W: std::io::Write>(
     path: &Path,
     text: &str,
-    derivation: Derivation,
+    believed: &Believed<'_>,
     coverage: &mut Coverage,
     analysed: &mut usize,
     mut bounds: Option<&mut Report<W>>,
     mut collected: Option<&mut machine::Collector>,
 ) -> Result<(), ToolError> {
     let functions =
-        landav_python::lower_module_with(path, text, derivation.trust, None).map_err(|error| {
-            ToolError::at_path(
-                path,
-                format!(
-                    "parsed for the rules but not for the lowering ({error}), so this file \
+        landav_python::lower_module_with(path, text, believed.derivation.trust, believed.pack)
+            .map_err(|error| {
+                ToolError::at_path(
+                    path,
+                    format!(
+                        "parsed for the rules but not for the lowering ({error}), so this file \
                  is missing from the coverage report and the report's denominator \
                  would understate what was skipped"
-                ),
-            )
-        })?;
+                    ),
+                )
+            })?;
     for function in &functions {
         let lowered = landav_its::lower(function.program());
         // The frontend's own refusal records, joined against the hole ledger to
@@ -815,11 +888,17 @@ fn accumulate<W: std::io::Write>(
         if let Some(report) = bounds.as_deref_mut() {
             report.line(format_args!(
                 "{}",
-                describe_bound(function, derived.as_ref(), records, derivation.resource)
+                describe_bound(
+                    function,
+                    derived.as_ref(),
+                    records,
+                    believed.derivation.resource,
+                    believed.pack,
+                )
             ));
         }
         if let Some(sink) = collected.as_deref_mut() {
-            sink.absorb_function(function, lowered.as_ref().map(|_| ()));
+            sink.absorb_function(function, lowered.as_ref().map(|_| ()), believed.pack);
         }
         coverage.record(lowered.as_ref());
     }
@@ -862,6 +941,7 @@ fn describe_bound(
     derived: Option<&landav_engine::TripCount>,
     records: &[landav_its::Unsupported],
     resource: Option<ResourceKind>,
+    pack: Option<&SignaturePack>,
 ) -> String {
     let at = function.location();
     let where_ = format!("{}:{}:{}", at.file().display(), at.line(), at.column());
@@ -873,9 +953,10 @@ fn describe_bound(
         );
     };
     let line = format!(
-        "{}{}",
+        "{}{}{}",
         describe_cost(&where_, function, derived, records),
-        protocol_premise(function, derived)
+        protocol_premise(function, derived),
+        supplied_premise(function, derived, pack)
     );
     match resource_clause(derived, function.program(), resource) {
         Some(clause) => format!("{line}; {clause}"),
@@ -947,6 +1028,63 @@ fn protocol_premise(
         "; believed on {}: the parameter is annotated with an abstract collection type, so its \
          length is a user `__len__` trusted to equal the number of iterations",
         resting.join(", ")
+    )
+}
+
+/// `text` with every run of whitespace collapsed to one space.
+///
+/// A row's `why` is written as a paragraph, and this report is read a line at a
+/// time - a `grep` for the callee that returns the first third of the argument
+/// is worse than no argument.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The clause naming the supplied rows this bound closed over.
+///
+/// Said in the text for the same reason [`protocol_premise`] is and the
+/// concrete-type premise is not: it is the premise that is *not* the baseline.
+/// A bound resting on the shipped pack rests on a table this build was released
+/// with — the tool's own claim, stated once in its documentation. A bound
+/// resting on a row the operator supplied rests on something only they can
+/// check, and the number in front of them is complete and exact precisely
+/// because that row was believed.
+fn supplied_premise(
+    function: &landav_python::LoweredFunction,
+    derived: &landav_engine::TripCount,
+    pack: Option<&SignaturePack>,
+) -> String {
+    let Some(pack) = pack else {
+        return String::new();
+    };
+    if derived.bound().is_none() {
+        return String::new();
+    }
+    let program = function.program();
+    let mut resting: BTreeMap<String, String> = BTreeMap::new();
+    for node in program.unsupported_nodes() {
+        if node.construct() != landav_its::Construct::Call || node.declared().is_none() {
+            continue;
+        }
+        let Some(callee) = node.detail() else {
+            continue;
+        };
+        if let Some(origin) = pack.origin_of(callee.as_str())
+            && !origin.is_builtin()
+        {
+            resting.insert(callee.as_str().to_owned(), origin.to_string());
+        }
+    }
+    if resting.is_empty() {
+        return String::new();
+    }
+    let said: Vec<String> = resting
+        .into_iter()
+        .map(|(callee, origin)| format!("`{callee}` from {origin}"))
+        .collect();
+    format!(
+        "; believed on {}: the cost was declared by a supplied row rather than derived",
+        said.join(", ")
     )
 }
 
@@ -1112,7 +1250,7 @@ fn summarise<W: std::io::Write>(
     findings: usize,
     waived: &Tally,
     inconclusive: usize,
-    derivation: Derivation,
+    derivation: &Derivation,
     coverage: &Coverage,
     analysed: usize,
 ) {

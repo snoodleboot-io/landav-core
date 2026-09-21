@@ -142,6 +142,36 @@ struct CheckArgs {
     )]
     trust: landav_python::AnnotationTrust,
 
+    /// Lay a signature pack over the builtin. `LAN-13`. Repeatable.
+    ///
+    /// # Why this is a flag and not a search path
+    ///
+    /// The builtin pack is embedded precisely so that landav's defaults do not
+    /// depend on where the binary was installed — see
+    /// [`landav_fdk::SignaturePack`], which makes that argument. A discovered
+    /// pack would reintroduce exactly what that avoids: a run whose answers
+    /// differ between a developer's checkout and a container, with nothing on
+    /// the command line to say so. Naming the file means the run says what it
+    /// read.
+    #[arg(
+        long = "signatures",
+        value_name = "FILE",
+        long_help = "Lay a signature pack over the builtin one. May be given more than \
+                     once, and packs are applied in the order written.\n\n\
+                     A pack is a TOML table of what callees cost. Overlaying is by ROW: \
+                     a pack that speaks about one callee replaces that one row and \
+                     leaves the rest of the builtin standing, so correcting a single \
+                     row does not mean restating every row you agree with.\n\n\
+                     Overriding a builtin row is allowed, because that is what a pack \
+                     is for. It is never silent: every replaced row is reported with \
+                     the argument it made, and every bound that rests on a supplied row \
+                     carries a premise naming the file it came from.\n\n\
+                     A pack that cannot be read is an error and the run stops. You \
+                     asked for the pack; analysing without it would answer a different \
+                     question than the one you asked."
+    )]
+    signatures: Vec<PathBuf>,
+
     /// Report which constructs were out of scope, where, and what that leaves
     /// unanalysed. LAN-68.
     ///
@@ -228,6 +258,7 @@ pub fn dispatch() -> Outcome {
                 crate::check::Derivation {
                     resource: args.resource,
                     trust: args.trust,
+                    signatures: args.signatures,
                 },
                 args.coverage,
                 args.bounds,

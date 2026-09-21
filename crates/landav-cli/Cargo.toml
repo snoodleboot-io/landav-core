@@ -20,6 +20,9 @@ landav-calibrate = { workspace = true }
 # translation into it, and this crate learns no Python fact from either.
 landav-its = { workspace = true }
 landav-python = { workspace = true }
+# `--signatures`: the pack type, its origins, and the override records. The
+# table is data this crate loads and reports; it learns no Python fact from it.
+landav-fdk = { workspace = true }
 # The native bound engine, for `--bounds`. Reads the structured program rather
 # than the lowered system, so this needs no solver on PATH - which is why the
 # flag can be answered offline.
