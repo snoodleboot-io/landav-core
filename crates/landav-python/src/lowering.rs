@@ -86,7 +86,7 @@ const MAX_EXPONENT: u32 = landav_its::MAX_DEGREE;
 /// deeply than the frontend will parse. Nothing else: a construct outside the
 /// fragment is not an error here, it is an `Unsupported` node in the program.
 pub fn lower_module(path: &Path, source: &str) -> Result<Vec<LoweredFunction>, PythonError> {
-    lower_module_with(path, source, AnnotationTrust::default())
+    lower_module_with(path, source, AnnotationTrust::default(), None)
 }
 
 /// [`lower_module`], choosing which annotations a collection's length may be
@@ -112,7 +112,16 @@ pub fn lower_module_with(
     path: &Path,
     source: &str,
     trust: AnnotationTrust,
+    pack: Option<&SignaturePack>,
 ) -> Result<Vec<LoweredFunction>, PythonError> {
+    // `None` is the builtin, which is what every caller wanted until a pack
+    // could be supplied. Spelling the default in the type rather than in a
+    // second entry point keeps one lowering path: a supplied pack is not a
+    // different mode, it is a different table.
+    let pack = match pack {
+        Some(supplied) => supplied,
+        None => builtin_pack(),
+    };
     let (module, index) = parse_guarded(path, source)?;
     // Which names this module binds for itself, computed once. A signature pack
     // is keyed by *name*, and a module that writes `def isinstance(...)` is not
@@ -133,6 +142,7 @@ pub fn lower_module_with(
                 &index,
                 definition,
                 module_bound.as_ref(),
+                pack,
             ));
         }
     }
@@ -298,6 +308,7 @@ fn lower_function(
     index: &LineIndex,
     function: Definition<'_>,
     module_bound: Option<&BTreeSet<String>>,
+    pack: &SignaturePack,
 ) -> LoweredFunction {
     let integers = integer_names(function);
     let name = function.qualified_name();
@@ -366,7 +377,7 @@ fn lower_function(
         lengths_read: BTreeSet::new(),
         shadowed,
         rebound,
-        pack: builtin_pack(),
+        pack,
         walks: 0,
         discarding: false,
         value_discarded: false,
@@ -1682,7 +1693,7 @@ struct Translator<'a> {
     /// `None` refuses every receiver: see [`bindings_of`].
     rebound: Option<BTreeSet<String>>,
     /// The signatures a call may be resolved against.
-    pack: &'static SignaturePack,
+    pack: &'a SignaturePack,
     /// How many collection walks have been lowered, to keep their synthetic
     /// counters apart.
     walks: u32,
@@ -3018,7 +3029,7 @@ impl Translator<'_> {
     /// the part `LAN-99` did not need, because a rebound receiver has no known
     /// length either way - never rebound here, so it still holds what the
     /// caller passed. `obj.copy()` on an unannotated `obj` matches nothing.
-    fn row_for(&self, call: &ast::ExprCall) -> Option<&'static Signature> {
+    fn row_for(&self, call: &ast::ExprCall) -> Option<&Signature> {
         match call.func.as_ref() {
             Expr::Name(callee) => {
                 let callee = callee.id.as_str();

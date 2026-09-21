@@ -779,7 +779,7 @@ fn accumulate<W: std::io::Write>(
     mut collected: Option<&mut machine::Collector>,
 ) -> Result<(), ToolError> {
     let functions =
-        landav_python::lower_module_with(path, text, derivation.trust).map_err(|error| {
+        landav_python::lower_module_with(path, text, derivation.trust, None).map_err(|error| {
             ToolError::at_path(
                 path,
                 format!(
