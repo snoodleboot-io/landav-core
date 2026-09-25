@@ -42,6 +42,9 @@ const SECTION: &str = "tool.landav";
 /// The only key `[tool.landav]` understands: `LAN-66` criterion 2.
 const SUPPRESS: &str = "suppress";
 
+/// The key holding directory exclusions. `LAN-111`.
+const EXCLUDE: &str = "exclude";
+
 /// The keys one `[[tool.landav.suppress]]` entry understands.
 ///
 /// `E-001` adds `expires` and `approved-by` on the paid side. When it does,
@@ -84,6 +87,8 @@ pub struct Config {
     source: Source,
     /// Per-path waivers, in the order they were written.
     waivers: Vec<PathWaiver>,
+    /// Directory patterns the walk must not enter, in the order written.
+    exclude: Vec<String>,
 }
 
 impl Config {
@@ -99,6 +104,15 @@ impl Config {
     /// report diff disagree.
     pub fn waivers(&self) -> &[PathWaiver] {
         &self.waivers
+    }
+
+    /// Directory patterns the walk must not enter. `LAN-111`.
+    ///
+    /// The same glob dialect as a waiver's `path`, so a user learns one
+    /// spelling: `legacy` matches a directory of that name anywhere, and
+    /// `src/generated` matches that path under the target.
+    pub fn exclude(&self) -> &[String] {
+        &self.exclude
     }
 }
 
@@ -117,6 +131,7 @@ pub fn load(target: &Path, explicit: Option<&Path>) -> Result<Config, ToolError>
             None => Ok(Config {
                 source: Source::Defaults,
                 waivers: Vec::new(),
+                exclude: Vec::new(),
             }),
         },
     }
@@ -148,6 +163,7 @@ fn load_explicit(path: &Path) -> Result<Config, ToolError> {
     Ok(Config {
         source: Source::Explicit(path.to_path_buf()),
         waivers: waivers_of(path, &section)?,
+        exclude: exclude_of(path, &section)?,
     })
 }
 
@@ -178,6 +194,7 @@ fn load_pyproject(path: &Path) -> Result<Config, ToolError> {
     Ok(Config {
         source: Source::PyProject(path.to_path_buf()),
         waivers: waivers_of(path, &section)?,
+        exclude: exclude_of(path, &section)?,
     })
 }
 
@@ -261,17 +278,60 @@ fn section_of(path: &Path, document: &Table) -> Result<Table, ToolError> {
 /// `[tool.landav] fail-on-partial = true`, watch the run report clean, and
 /// believe the flag was honoured.
 fn reject_unknown_keys(path: &Path, section: &Table) -> Result<(), ToolError> {
-    match section.keys().find(|key| key.as_str() != SUPPRESS) {
+    match section
+        .keys()
+        .find(|key| key.as_str() != SUPPRESS && key.as_str() != EXCLUDE)
+    {
         None => Ok(()),
         Some(key) => Err(ToolError::at_path(
             path,
             format!(
-                "[{SECTION}] sets `{key}`, which landav does not understand; the only \
-                 setting is `{SUPPRESS}`, and a setting that is accepted and ignored is \
-                 worse than one that is refused"
+                "[{SECTION}] sets `{key}`, which landav does not understand; the settings \
+                 are `{SUPPRESS}` and `{EXCLUDE}`, and a setting that is accepted and \
+                 ignored is worse than one that is refused"
             ),
         )),
     }
+}
+
+/// The `exclude` list, or empty when absent.
+///
+/// A list of strings and nothing else. `exclude = ".venv"` is refused rather
+/// than read as a one-element list, for the reason every other key here is
+/// strict: a value that was accepted under a reading its author did not intend
+/// is in effect without their knowledge.
+fn exclude_of(path: &Path, section: &Table) -> Result<Vec<String>, ToolError> {
+    let Some(value) = section.get(EXCLUDE) else {
+        return Ok(Vec::new());
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(ToolError::at_path(
+            path,
+            format!(
+                "[{SECTION}] `{EXCLUDE}` must be a list of directory patterns, got {}",
+                type_name(value)
+            ),
+        ));
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| match entry.as_str() {
+            Some(pattern) if !pattern.trim().is_empty() => Ok(pattern.to_owned()),
+            Some(_) => Err(ToolError::at_path(
+                path,
+                format!("[{SECTION}] `{EXCLUDE}` entry {} is empty", index + 1),
+            )),
+            None => Err(ToolError::at_path(
+                path,
+                format!(
+                    "[{SECTION}] `{EXCLUDE}` entry {} must be a string pattern, got {}",
+                    index + 1,
+                    type_name(entry)
+                ),
+            )),
+        })
+        .collect()
 }
 
 /// Reads `[[tool.landav.suppress]]` — `LAN-66` criterion 2.

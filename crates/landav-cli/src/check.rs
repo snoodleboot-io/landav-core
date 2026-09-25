@@ -165,24 +165,32 @@ fn signature_pack(paths: &[PathBuf]) -> Result<Option<SignaturePack>, ToolError>
     Ok(Some(pack))
 }
 
+/// What a run looks at: a path or a buffer, and how far into the tree.
+///
+/// One value because the three are one question - *what is the subject of
+/// this run* - and because they arrive together from the command line. The
+/// walk policy belongs here rather than in [`Derivation`]: skipping a venv is
+/// not something the run believes, it is something the run declines to look
+/// at. `LAN-111`.
+#[derive(Debug, Clone, Copy)]
+pub struct Scope<'a> {
+    /// File or directory to analyse; `None` when reading from stdin.
+    pub target: Option<&'a Path>,
+    /// The name to report stdin under, when reading from it.
+    pub stdin_name: Option<&'a str>,
+    /// Enter virtualenvs and vendored directories.
+    pub include_vendored: bool,
+}
+
 pub fn run(
-    target: Option<&Path>,
-    stdin_name: Option<&str>,
+    scope: Scope<'_>,
     explicit_config: Option<&Path>,
     derivation: Derivation,
     coverage: bool,
     bounds: bool,
     json: bool,
 ) -> Outcome {
-    match analyse(
-        target,
-        stdin_name,
-        explicit_config,
-        &derivation,
-        coverage,
-        bounds,
-        json,
-    ) {
+    match analyse(scope, explicit_config, &derivation, coverage, bounds, json) {
         Ok(outcome) => outcome,
         Err(error) => {
             report_failure(&error);
@@ -193,8 +201,7 @@ pub fn run(
 
 /// The run proper. Every failure is a [`ToolError`] carrying blame.
 fn analyse(
-    target: Option<&Path>,
-    stdin_name: Option<&str>,
+    scope: Scope<'_>,
     explicit_config: Option<&Path>,
     derivation: &Derivation,
     detail: bool,
@@ -207,8 +214,17 @@ fn analyse(
     // get that project's rules. What the run *reports* itself as having
     // analysed is the snippet's name, because telling a user the run covered
     // `.` when it read one buffer would be a claim about a whole tree.
+    let Scope {
+        target,
+        stdin_name,
+        include_vendored,
+    } = scope;
     let anchor = target.unwrap_or_else(|| Path::new("."));
     let config = config::load(anchor, explicit_config)?;
+    let policy = crate::sources::Policy {
+        include_vendored,
+        exclude: config.exclude().to_vec(),
+    };
 
     // Loaded before the walk, like the configuration and for the same reason: a
     // pack that cannot be read is a fact about the run's setup, and finding out
@@ -239,9 +255,10 @@ fn analyse(
             crate::sources::Walk {
                 sources: vec![std::path::PathBuf::from(name)],
                 problems: Vec::new(),
+                skipped: Vec::new(),
             },
         ),
-        None => crate::sources::collect(anchor)?,
+        None => crate::sources::collect(anchor, &policy)?,
     };
 
     let mut findings = 0usize;
@@ -370,6 +387,23 @@ fn analyse(
         }
     }
 
+    // A skipped directory a reader may have wanted: its own line, before the
+    // summary, with the way to get it back. Caches are counted in the summary
+    // and not named; forty `__pycache__` lines would bury the one venv line.
+    for skipped in &walk.skipped {
+        if skipped.reason.is_reported_by_name() {
+            report.line(format_args!(
+                "skipped: {} — {}{}",
+                skipped.path.display(),
+                skipped.reason,
+                match skipped.reason {
+                    crate::sources::SkipReason::Configured(_) => String::new(),
+                    _ => "; pass --include-vendored to analyse it".to_owned(),
+                }
+            ));
+        }
+    }
+
     summarise(
         &mut report,
         reported_as,
@@ -381,6 +415,7 @@ fn analyse(
         derivation,
         &coverage,
         analysed,
+        &walk.skipped,
     );
     // Printed *after* the summary rather than before it, so that the summary
     // remains the first `landav:` line of the run — a contract the suppression
@@ -425,6 +460,14 @@ fn analyse(
                 coverage_percent: coverage.percent(),
                 trust: derivation.trust.to_string(),
                 signature_overrides: machine::overrides_of(pack.as_ref()),
+                skipped_directories: walk
+                    .skipped
+                    .iter()
+                    .map(|skipped| machine::SkippedDirectory {
+                        path: skipped.path.display().to_string(),
+                        reason: skipped.reason.to_string(),
+                    })
+                    .collect(),
                 // `inconclusive` is incremented in exactly one place - a file
                 // the frontend could not parse - so it is this count.
                 unreadable_files: inconclusive,
@@ -1253,10 +1296,11 @@ fn summarise<W: std::io::Write>(
     derivation: &Derivation,
     coverage: &Coverage,
     analysed: usize,
+    skipped: &[crate::sources::Skipped],
 ) {
     report.line(format_args!(
         "landav: {} analysed under {} — {} finding(s), {} suppressed, {}, {} inconclusive;{} \
-         {}; {}; resource: {}; configuration: {}",
+         {}; {}; resource: {}; configuration: {}{}",
         plural(sources.len(), "file"),
         target.display(),
         findings,
@@ -1267,8 +1311,44 @@ fn summarise<W: std::io::Write>(
         coverage_clause(coverage, inconclusive),
         engine_reach(analysed, coverage.units()),
         describe_resource(derivation.resource),
-        config.source()
+        config.source(),
+        skipped_clause(skipped)
     ));
+}
+
+/// The clause counting what the walk declined to enter, by kind.
+///
+/// `LAN-111`. Silent when nothing was skipped, so an ordinary run's summary
+/// reads as it always has. Otherwise the count is on the summary line - the
+/// line a CI job watches - because a denominator that quietly excludes a
+/// directory is the same failure as one that quietly includes one, from the
+/// other side.
+fn skipped_clause(skipped: &[crate::sources::Skipped]) -> String {
+    use crate::sources::SkipReason;
+    if skipped.is_empty() {
+        return String::new();
+    }
+    let count = |pick: fn(&SkipReason) -> bool| skipped.iter().filter(|s| pick(&s.reason)).count();
+    let mut parts = Vec::new();
+    let venvs = count(|r| matches!(r, SkipReason::Virtualenv));
+    let vendored = count(|r| matches!(r, SkipReason::Vendored));
+    let caches = count(|r| matches!(r, SkipReason::Cache));
+    let configured = count(|r| matches!(r, SkipReason::Configured(_)));
+    // `plural` appends an `s`, which "directory" does not take.
+    let directories = |n: usize| format!("{n} director{}", if n == 1 { "y" } else { "ies" });
+    if venvs > 0 {
+        parts.push(plural(venvs, "virtual environment"));
+    }
+    if vendored > 0 {
+        parts.push(format!("{} vendored", directories(vendored)));
+    }
+    if caches > 0 {
+        parts.push(format!("{} of caches", directories(caches)));
+    }
+    if configured > 0 {
+        parts.push(format!("{} by `exclude`", directories(configured)));
+    }
+    format!("; skipped: {}", parts.join(", "))
 }
 
 /// The clause naming a non-default trust setting.
