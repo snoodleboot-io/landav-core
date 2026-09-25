@@ -139,6 +139,9 @@ pub struct NormalForm {
     stop: NormaliserStop,
     iterations: usize,
     egraph_nodes: usize,
+    rounds: usize,
+    converged: bool,
+    round_stops: Vec<NormaliserStop>,
 }
 
 impl NormalForm {
@@ -154,10 +157,27 @@ impl NormalForm {
         self.bound
     }
 
-    /// Why the run stopped. Always one of [`NormaliserStop::ALL`].
+    /// Why the **last round** stopped. Always one of [`NormaliserStop::ALL`].
+    ///
+    /// [`NormaliserStop::Saturated`] here, together with
+    /// [`Self::converged`], means the returned term is a fixed point of this
+    /// normalisation at this budget: its own e-graph closes, and the cheapest
+    /// term in it is itself. It does not mean an earlier round did not hit a
+    /// limit on the way - [`Self::round_stops`] says that.
     #[must_use]
     pub fn stop(&self) -> NormaliserStop {
         self.stop
+    }
+
+    /// Why each round stopped, first to last.
+    ///
+    /// The first entry is what a single-round normaliser would have reported,
+    /// and is how a test pins that a term *does* exhaust a budget - the
+    /// pathology the fixed-point loop exists to recover from, which must stay
+    /// observable or the loop's reason disappears with the symptom.
+    #[must_use]
+    pub fn round_stops(&self) -> &[NormaliserStop] {
+        &self.round_stops
     }
 
     /// How many equality-saturation iterations ran.
@@ -166,12 +186,59 @@ impl NormalForm {
         self.iterations
     }
 
-    /// How many e-nodes the e-graph held when the run stopped.
+    /// How many e-nodes the largest round's e-graph held when it stopped.
     #[must_use]
     pub fn egraph_nodes(&self) -> usize {
         self.egraph_nodes
     }
+
+    /// How many rewrite-and-extract rounds ran. See [`FIXED_POINT_ROUNDS`].
+    #[must_use]
+    pub fn rounds(&self) -> usize {
+        self.rounds
+    }
+
+    /// Whether the last round handed back the term it was given.
+    ///
+    /// `true` is the claim that matters for a cache key: normalising this
+    /// bound again returns it unchanged, because the round that would run is
+    /// the round that just ran. `false` means [`FIXED_POINT_ROUNDS`] rounds
+    /// each moved the term and the result is not known to be a fixed point -
+    /// which can only happen when every round stopped on a count, so
+    /// [`Self::stop`] is never [`NormaliserStop::Saturated`] here.
+    #[must_use]
+    pub fn converged(&self) -> bool {
+        self.converged
+    }
 }
+
+/// The most rewrite-and-extract rounds one normalisation runs. `LAN-112`.
+///
+/// # Why a normalisation is a loop
+///
+/// One round is equality saturation under a budget, then extraction of the
+/// cheapest term. When the round stops on a count - the node limit, usually -
+/// the e-graph was cut off and the extracted term is *not* a normal form: it
+/// is the best of what was explored. Normalising it again starts from a
+/// smaller term, explores further within the same budget, and can extract
+/// something cheaper. Proptest found exactly that: `(0 * x0 * x2 * (1 + x1))`
+/// stopped on the node limit at `(0 * x0 * (x2 + (x1 * x2)))`, and a second
+/// run took it to `(0 * x0 * x1 * x2)`.
+///
+/// That is a second cache key for one program, which is the one thing a
+/// normal form must not produce - and it was reachable at
+/// [`NormaliserBudget::FROZEN`] too: a four-variable product hits ten
+/// thousand e-nodes, because associativity and commutativity over a product
+/// with a sum inside it are exactly what an e-graph is bad at.
+///
+/// So a normalisation runs rounds until a round returns its own input. Then
+/// normalising the result runs that same round again and gets the same
+/// answer, which is idempotence by construction rather than by hope. The
+/// budget applies per round, so the guarantee costs at most this many rounds;
+/// in practice a second round converges, because it starts from the term the
+/// first one found. A run that uses every round without converging says so
+/// through [`NormalForm::converged`], and can only have stopped on a count.
+pub const FIXED_POINT_ROUNDS: usize = 4;
 
 /// Normalises `bound` at [`NormaliserBudget::FROZEN`].
 ///
@@ -208,6 +275,55 @@ pub fn normalise_with(bound: &Bound, budget: NormaliserBudget) -> Result<NormalF
         });
     }
 
+    // Rounds until a fixed point - see `FIXED_POINT_ROUNDS` for why one is
+    // not enough. Compared by canonical bytes, which is what a cache key is.
+    let mut current = bound.clone();
+    let mut iterations = 0;
+    let mut egraph_nodes = 0;
+    let mut rounds = 0;
+    let mut stop = NormaliserStop::Saturated;
+    let mut converged = false;
+    let mut round_stops = Vec::with_capacity(2);
+    while rounds < FIXED_POINT_ROUNDS {
+        let round = one_round(&current, budget, rules)?;
+        rounds += 1;
+        iterations += round.iterations;
+        egraph_nodes = egraph_nodes.max(round.egraph_nodes);
+        stop = round.stop;
+        round_stops.push(round.stop);
+        let unchanged =
+            round.bound.canonical_bytes().as_bytes() == current.canonical_bytes().as_bytes();
+        current = round.bound;
+        if unchanged {
+            converged = true;
+            break;
+        }
+    }
+
+    Ok(NormalForm {
+        bound: current,
+        stop,
+        iterations,
+        egraph_nodes,
+        rounds,
+        converged,
+        round_stops,
+    })
+}
+
+/// One equality-saturation run and one extraction.
+struct Round {
+    bound: Bound,
+    stop: NormaliserStop,
+    iterations: usize,
+    egraph_nodes: usize,
+}
+
+fn one_round(
+    bound: &Bound,
+    budget: NormaliserBudget,
+    rules: &[Rewrite<BoundNode, ()>],
+) -> Result<Round, BoundError> {
     let (expr, _) = to_recexpr(bound);
     let mut runner: Runner<BoundNode, ()> = Runner::default()
         // Rules are applied in declaration order, every iteration. The
@@ -234,7 +350,7 @@ pub fn normalise_with(bound: &Bound, budget: NormaliserBudget) -> Result<NormalF
     let (_, best) = extractor.find_best(root);
     let normalised = from_recexpr(&best)?;
 
-    Ok(NormalForm {
+    Ok(Round {
         bound: normalised,
         stop,
         iterations: runner.iterations.len(),

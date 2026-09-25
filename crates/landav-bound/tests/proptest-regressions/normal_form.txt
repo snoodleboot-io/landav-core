@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0bb1b09442c6b9f09a48c596996e786fde04534874076188219ba86aa0725356 # shrinks to spec = Prod([Prod([Const(Some(0)), Max([Const(Some(0)), Const(Some(0))])]), Sum([Var(1), Const(Some(1))]), Prod([Var(2), Var(0)])])

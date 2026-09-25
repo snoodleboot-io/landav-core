@@ -116,7 +116,10 @@ pub use crate::{
     max_plus::MaxPlus,
     max_terms::MaxTerms,
     nat::Nat,
-    normalise::{NormalForm, NormaliserStop, normalise, normalise_with, rewrite_rule_names},
+    normalise::{
+        FIXED_POINT_ROUNDS, NormalForm, NormaliserStop, normalise, normalise_with,
+        rewrite_rule_names,
+    },
     normaliser_budget::NormaliserBudget,
     origin::Origin,
     partial_bound::PartialBound,

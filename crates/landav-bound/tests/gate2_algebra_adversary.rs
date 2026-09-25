@@ -736,9 +736,15 @@ fn normalisation_moves_the_denotation_in_both_directions() {
 /// Two things follow. The node limit is checked *between* iterations, so one
 /// iteration overshoots it and the memory high-water mark is set by the
 /// overshoot rather than by the limit - `egraph_nodes` finishes *above*
-/// `node_limit`. And a three-factor product with two sums never reaches
-/// `Saturated`, so `NORMAL_FORM_VERSION` pins "the normal form for this rule
-/// set **and this budget**", not "the normal form".
+/// `node_limit`. And a three-factor product with two sums never saturates
+/// **in one round**, so `NORMAL_FORM_VERSION` pins "the normal form for this
+/// rule set **and this budget**", not "the normal form".
+///
+/// Since `LAN-112` a normalisation is rounds to a fixed point: the first
+/// round here still exhausts the e-graph and hands back the best of what it
+/// explored, and the second round, starting from that smaller term, closes.
+/// Both halves are asserted - the pathology must stay visible, or the loop's
+/// reason disappears with its symptom.
 ///
 /// Pinned at `(20, 10 000)` rather than at the frozen budget so that the
 /// regression costs a third of a second instead of twenty-two.
@@ -754,9 +760,17 @@ fn a_six_node_bound_does_not_saturate_inside_a_ten_thousand_node_egraph() {
     let run = normalise_with(&saturating, NormaliserBudget::new(20, 10_000))
         .expect("normalise must succeed");
     assert_eq!(
-        run.stop(),
-        NormaliserStop::NodeLimit,
-        "a six-node term was expected to exhaust a ten-thousand-node e-graph"
+        run.round_stops().first(),
+        Some(&NormaliserStop::NodeLimit),
+        "a six-node term was expected to exhaust a ten-thousand-node e-graph \
+         in its first round"
+    );
+    assert!(
+        run.converged() && run.stop() == NormaliserStop::Saturated,
+        "the round after an exhausted one starts from a smaller term and must \
+         close on a fixed point; got {:?} over {} rounds",
+        run.round_stops(),
+        run.rounds()
     );
     assert!(
         run.egraph_nodes() > 10_000,
