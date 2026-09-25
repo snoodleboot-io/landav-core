@@ -2004,15 +2004,18 @@ impl Translator<'_> {
             } else {
                 Extent::Fragment
             };
+            // Spelled as methods, because they are: the protocol calls a
+            // `with` makes on its context manager, never a bare name a row
+            // could stand for. See the call arm for the convention.
             body.push(self.builder.unsupported_stmt_with(
                 Construct::Call,
-                Some(Symbol::from("__enter__")),
+                Some(Symbol::from(".__enter__")),
                 extent,
                 origin.clone(),
             ));
             cleanup.push(self.builder.unsupported_stmt_with(
                 Construct::Call,
-                Some(Symbol::from("__exit__")),
+                Some(Symbol::from(".__exit__")),
                 Extent::Fragment,
                 closing.clone(),
             ));
@@ -3429,9 +3432,19 @@ impl Translator<'_> {
                     self.lengths_read.insert(length.clone());
                     return self.builder.var(length, origin);
                 }
+                // The callee as the source spelled it, and the spelling is
+                // the point. A bare `append(v)` may be matched against a
+                // signature row; `x.append(v)` on a receiver whose class this
+                // analysis has never seen is not the builtin and never
+                // resolves (`declaration_for`, condition 2). One is actionable
+                // by adding a row and the other is not, so a reader of the
+                // report - or a tally over the JSON - has to be able to tell
+                // them apart. Python's own documentation writes a method as
+                // `.append`, and the leading dot is that distinction without a
+                // second field. `LAN-108`.
                 let detail = match call.func.as_ref() {
                     Expr::Name(name) => name.id.to_string(),
-                    Expr::Attribute(attribute) => attribute.attr.to_string(),
+                    Expr::Attribute(attribute) => format!(".{}", attribute.attr),
                     _ => "call".to_owned(),
                 };
                 // The arguments are evaluated whether or not the callee can be

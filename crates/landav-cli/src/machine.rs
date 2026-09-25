@@ -33,10 +33,16 @@ use serde::Serialize;
 
 /// The version of this schema.
 ///
+/// 3 since `LAN-108`: a method callee's `detail` and `assumption_subject` carry
+/// a leading dot (`.append`) where they used to carry the bare name. Same
+/// field, same meaning, different spelling for one class of value - which is
+/// exactly the kind of change a consumer comparing strings has to be told
+/// about. 2 was `LAN-13` (`Premise.variable` became `Premise.subject`).
+///
 /// Bumped when a field changes meaning or disappears. Adding a field is not a
 /// bump: a consumer that ignores unknown fields keeps working, and one that
 /// does not was already fragile.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// A whole run.
 #[derive(Debug, Serialize)]
@@ -447,6 +453,9 @@ pub struct Hole {
     /// What the assumption is about: the callee whose cost is unknown, the
     /// variable with no size bound, the construct with no rule. `null` where the
     /// obligation has no subject beyond the region itself.
+    ///
+    /// A callee is spelled as [`Refusal::detail`] spells it: `.append` for a
+    /// method, `fetch` for a bare name.
     pub assumption_subject: Option<String>,
     pub origin: String,
 }
@@ -460,6 +469,13 @@ pub struct Refusal {
     pub describes: String,
     pub origin: String,
     /// Frontend specifics, where it had any.
+    ///
+    /// For a `call`, the callee **as the source spelled it**: a bare name
+    /// (`fetch`) or a method with a leading dot (`.append`). The dot is not
+    /// decoration. A bare name is a callee a signature row could resolve; a
+    /// method on a receiver the analysis has never seen is not the builtin and
+    /// never resolves, so one is actionable by adding a row and the other is
+    /// not. Since `LAN-108`, which is why [`SCHEMA_VERSION`] is 3.
     pub detail: Option<String>,
 }
 

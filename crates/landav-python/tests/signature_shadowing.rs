@@ -274,11 +274,19 @@ fn getattr_is_the_two_argument_form_only() {
 fn a_method_call_is_never_matched_against_a_row() {
     let source = "def g(x) -> int:\n    x.isinstance(1)\n    return 0\n";
     assert!(
-        refuses_call_to(source, "isinstance"),
+        refuses_call_to(source, ".isinstance"),
         "`x.isinstance` is a method on an object whose class this analysis has \
          never seen. Matching any object's attribute against a row keyed by a \
          builtin's name is a far weaker claim than matching a module-level name, \
          and the pack's method rows are refusals that stay documentary. \
          For:\n{source}"
+    );
+    // And the record says so. A reader tallying `call` refusals has to be able
+    // to see that this one is a method and no row would ever reach it, which
+    // is why the spelling carries the dot (`LAN-108`).
+    assert!(
+        !refuses_call_to(source, "isinstance"),
+        "the refusal was recorded as a bare `isinstance`, indistinguishable from \
+         a call a row could resolve. For:\n{source}"
     );
 }
