@@ -133,6 +133,14 @@ pub struct Summary {
     /// which on its own would not need a bump. The bump is `Premise::subject`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub signature_overrides: Vec<SignatureOverride>,
+    /// Directories the walk declined to enter, every one, with the rule that
+    /// matched. `LAN-111`; a new field, no bump.
+    ///
+    /// All of them, caches included - the text names only the ones a reader
+    /// may have wanted, but a machine reconciling the denominator against the
+    /// tree needs the whole list.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_directories: Vec<SkippedDirectory>,
     /// Files the frontend could not read as Python.
     ///
     /// The functions in them are in no count in this summary, because they
@@ -322,6 +330,15 @@ fn supplied_premises(
             })
         })
         .collect()
+}
+
+/// One directory the walk did not enter.
+#[derive(Debug, Serialize)]
+pub struct SkippedDirectory {
+    pub path: String,
+    /// Why, in the operator's terms: a virtual environment, a dependency or
+    /// build directory, a cache, or the `exclude` pattern that matched.
+    pub reason: String,
 }
 
 /// One row a supplied pack replaced.

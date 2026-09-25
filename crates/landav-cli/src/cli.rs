@@ -142,6 +142,27 @@ struct CheckArgs {
     )]
     trust: landav_python::AnnotationTrust,
 
+    /// Enter virtual environments and vendored directories. `LAN-111`.
+    ///
+    /// Off by default, like every other Python tool, because a user asking
+    /// about their project is never asking about their dependencies - and on
+    /// the one application tree landav was measured against, 42,831 of the
+    /// 43,203 functions in its coverage denominator were `site-packages`.
+    #[arg(
+        long,
+        long_help = "Analyse virtual environments and vendored directories too.\n\n\
+                     By default the walk does not enter a virtual environment (any \
+                     directory holding a `pyvenv.cfg`, whatever its name), nor \
+                     `.venv`, `venv`, `site-packages`, `node_modules`, `build` or \
+                     `dist`. Every skipped directory is named in the report, so an \
+                     exclusion is never silent.\n\n\
+                     This flag enters them. Caches (`__pycache__`, `.git`, `.tox` and \
+                     the like) stay skipped: nothing in them was written by anyone.\n\n\
+                     Naming a directory as the target always analyses it, flag or no \
+                     flag: `landav check .venv` is a request for the venv."
+    )]
+    include_vendored: bool,
+
     /// Lay a signature pack over the builtin. `LAN-13`. Repeatable.
     ///
     /// # Why this is a flag and not a search path
@@ -252,8 +273,11 @@ pub fn dispatch() -> Outcome {
     match Cli::try_parse() {
         Ok(cli) => match cli.command {
             Command::Check(args) => crate::check::run(
-                args.path.as_deref(),
-                args.stdin.then_some(args.stdin_name.as_str()),
+                crate::check::Scope {
+                    target: args.path.as_deref(),
+                    stdin_name: args.stdin.then_some(args.stdin_name.as_str()),
+                    include_vendored: args.include_vendored,
+                },
                 args.config.as_deref(),
                 crate::check::Derivation {
                     resource: args.resource,

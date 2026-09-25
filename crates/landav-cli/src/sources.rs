@@ -52,13 +52,158 @@ pub enum Target {
     Directory,
 }
 
-/// What the walk found, and what it could not look at.
+/// What the walk found, what it could not look at, and what it chose not to.
 #[derive(Debug, Default)]
 pub struct Walk {
     /// Python files to analyse, sorted.
     pub sources: Vec<PathBuf>,
     /// Paths the walk could not resolve, sorted by their diagnostic.
     pub problems: Vec<ToolError>,
+    /// Directories the walk declined to enter, sorted by path. `LAN-111`.
+    ///
+    /// Recorded rather than dropped for the reason a waiver that suppressed
+    /// nothing is recorded: a skip nobody can see is a skip nobody can
+    /// question, and the one this exists for hid 42,831 of 43,203 functions.
+    pub skipped: Vec<Skipped>,
+}
+
+/// A directory the walk declined to enter, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    /// The directory, as the walk reached it.
+    pub path: PathBuf,
+    /// The rule that matched.
+    pub reason: SkipReason,
+}
+
+/// Why a directory was not entered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// It holds a `pyvenv.cfg`, so it is a virtual environment whatever it is
+    /// called.
+    Virtualenv,
+    /// Its name is one every Python tool skips: a dependency directory or a
+    /// build product, never the project's own source.
+    Vendored,
+    /// Its name is a cache or version-control directory, which cannot hold
+    /// source anyone wrote.
+    Cache,
+    /// It matched an `exclude` pattern in the configuration.
+    Configured(String),
+}
+
+impl SkipReason {
+    /// Whether the report should name the directory on its own line.
+    ///
+    /// A virtualenv, a `node_modules`, a `dist`, an `exclude` match: each is a
+    /// place a reader may have *wanted* analysed, so it is named. A
+    /// `__pycache__` in every package directory is not, and naming forty of
+    /// them would bury the one line that matters.
+    #[must_use]
+    pub const fn is_reported_by_name(&self) -> bool {
+        !matches!(self, Self::Cache)
+    }
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Virtualenv => f.write_str("a virtual environment"),
+            Self::Vendored => f.write_str("a dependency or build directory"),
+            Self::Cache => f.write_str("a cache or version-control directory"),
+            Self::Configured(pattern) => write!(f, "excluded by `{pattern}` in the configuration"),
+        }
+    }
+}
+
+/// Which directories the walk enters. `LAN-111`.
+///
+/// # The default is what every other Python tool does
+///
+/// `ruff`, `black`, `mypy` and `pytest` all decline to enter a virtualenv,
+/// `node_modules`, `build`, `dist` and the caches, because a user asking about
+/// their project is never asking about their dependencies. landav did not,
+/// and on the one application tree it was measured against, 42,831 of the
+/// 43,203 functions in the coverage denominator were `site-packages`. The
+/// project's own 372 were invisible in the summary.
+///
+/// # What the rules never apply to
+///
+/// The target itself. `landav check .venv` is a request to analyse the venv,
+/// and the walk honours it; the rules run on directories *beneath* the target
+/// only. Naming a thing is asking for it.
+#[derive(Debug, Clone, Default)]
+pub struct Policy {
+    /// Enter virtualenvs and vendored directories anyway.
+    ///
+    /// The caches are still skipped: there is nothing in a `__pycache__` that
+    /// anybody wrote, whatever the flag says.
+    pub include_vendored: bool,
+    /// Patterns from the configuration's `exclude`, in the waiver glob
+    /// dialect ([`landav_python::path_matches`]), applied whatever
+    /// `include_vendored` says: an exclusion the user wrote is not vendoring.
+    pub exclude: Vec<String>,
+}
+
+/// Directory names that are dependencies or build products, never source.
+const VENDORED: [&str; 8] = [
+    ".venv",
+    "venv",
+    "site-packages",
+    "node_modules",
+    "__pypackages__",
+    ".eggs",
+    "build",
+    "dist",
+];
+
+/// Directory names that hold caches or version control.
+const CACHE: [&str; 9] = [
+    "__pycache__",
+    ".git",
+    ".hg",
+    ".svn",
+    ".tox",
+    ".nox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+];
+
+/// The file CPython writes at the root of every virtual environment.
+const PYVENV: &str = "pyvenv.cfg";
+
+impl Policy {
+    /// Why `dir` should not be entered, or `None` to enter it.
+    ///
+    /// Configured exclusions are checked first and unconditionally. The
+    /// `pyvenv.cfg` test comes before the name list because a venv called
+    /// `tooling` is still a venv, and the name list exists for the trees where
+    /// nothing so reliable is there to read.
+    #[must_use]
+    pub fn skip(&self, dir: &Path) -> Option<SkipReason> {
+        if let Some(pattern) = self
+            .exclude
+            .iter()
+            .find(|pattern| landav_python::path_matches(pattern, dir))
+        {
+            return Some(SkipReason::Configured(pattern.clone()));
+        }
+        let name = dir.file_name()?.to_string_lossy();
+        if CACHE.contains(&name.as_ref()) {
+            return Some(SkipReason::Cache);
+        }
+        if self.include_vendored {
+            return None;
+        }
+        if dir.join(PYVENV).is_file() {
+            return Some(SkipReason::Virtualenv);
+        }
+        if VENDORED.contains(&name.as_ref()) {
+            return Some(SkipReason::Vendored);
+        }
+        None
+    }
 }
 
 /// A directory's identity on the filesystem.
@@ -176,7 +321,7 @@ struct Frame {
 /// [`ToolError`] if the target itself cannot be resolved, or is neither a
 /// directory nor a Python file. Failures *beneath* the target are collected
 /// rather than returned.
-pub fn collect(target: &Path) -> Result<(Target, Walk), ToolError> {
+pub fn collect(target: &Path, policy: &Policy) -> Result<(Target, Walk), ToolError> {
     // `metadata` follows symlinks, which is what makes a symlink loop show up
     // here as `ELOOP` rather than as a walk that never returns.
     let meta = std::fs::metadata(target)
@@ -197,6 +342,7 @@ pub fn collect(target: &Path) -> Result<(Target, Walk), ToolError> {
             Walk {
                 sources: vec![target.to_path_buf()],
                 problems: Vec::new(),
+                skipped: Vec::new(),
             },
         ));
     }
@@ -208,14 +354,31 @@ pub fn collect(target: &Path) -> Result<(Target, Walk), ToolError> {
         ));
     }
 
+    // Naming a thing is asking for it. `landav check .venv` names a venv, and
+    // a walk that entered it only to skip the `site-packages` inside would
+    // analyse nothing and call that honouring the request. So a target that
+    // is itself a venv or a vendored directory lifts those rules for the whole
+    // walk beneath it; the caches stay out, and a configured `exclude` still
+    // applies, because the user wrote that one.
+    let asked_for_vendored = matches!(
+        policy.skip(target),
+        Some(SkipReason::Virtualenv | SkipReason::Vendored)
+    );
+    let effective = Policy {
+        include_vendored: policy.include_vendored || asked_for_vendored,
+        exclude: policy.exclude.clone(),
+    };
+    let policy = &effective;
+
     let mut walk = Walk::default();
     match dir_id(target, &meta) {
-        Ok(id) => descend(target, id, &mut walk),
+        Ok(id) => descend(target, id, &mut walk, policy),
         Err(problem) => walk.problems.push(problem),
     }
     walk.sources.sort();
     deduplicate(&mut walk.sources);
     walk.problems.sort_by_key(ToolError::to_string);
+    walk.skipped.sort_by(|a, b| a.path.cmp(&b.path));
     Ok((Target::Directory, walk))
 }
 
@@ -225,9 +388,9 @@ pub fn collect(target: &Path) -> Result<(Target, Walk), ToolError> {
 /// a stack overflow is a signal death with no exit code. Each directory's
 /// entries are read into memory and the handle dropped before descending, so
 /// the walk holds one open directory at a time rather than one per level.
-fn descend(root: &Path, root_id: DirId, walk: &mut Walk) {
+fn descend(root: &Path, root_id: DirId, walk: &mut Walk, policy: &Policy) {
     let mut frames: Vec<Frame> = Vec::new();
-    if let Some(pending) = read_level(root, walk) {
+    if let Some(pending) = read_level(root, walk, policy) {
         frames.push(Frame {
             id: root_id,
             pending: pending.into_iter(),
@@ -251,7 +414,7 @@ fn descend(root: &Path, root_id: DirId, walk: &mut Walk) {
             continue;
         }
 
-        if let Some(pending) = read_level(&path, walk) {
+        if let Some(pending) = read_level(&path, walk, policy) {
             frames.push(Frame {
                 id,
                 pending: pending.into_iter(),
@@ -266,7 +429,7 @@ fn descend(root: &Path, root_id: DirId, walk: &mut Walk) {
 /// Returns `None` if the directory could not be listed at all, having recorded
 /// that as a problem — the files under it were never enumerated, so the run
 /// covers less than the target it names.
-fn read_level(dir: &Path, walk: &mut Walk) -> Option<Vec<(PathBuf, DirId)>> {
+fn read_level(dir: &Path, walk: &mut Walk, policy: &Policy) -> Option<Vec<(PathBuf, DirId)>> {
     let listing = match std::fs::read_dir(dir) {
         Ok(listing) => listing,
         Err(err) => {
@@ -336,6 +499,12 @@ fn read_level(dir: &Path, walk: &mut Walk) -> Option<Vec<(PathBuf, DirId)>> {
             if is_link(&path) {
                 continue;
             }
+            // A directory the policy declines: recorded, never entered. The
+            // target itself never reaches here, so naming a venv analyses it.
+            if let Some(reason) = policy.skip(&path) {
+                walk.skipped.push(Skipped { path, reason });
+                continue;
+            }
             match dir_id(&path, &meta) {
                 Ok(id) => subdirectories.push((path, id)),
                 Err(problem) => walk.problems.push(problem),
@@ -368,8 +537,55 @@ fn is_python(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Target, collect, is_python};
+    use super::{Policy, SkipReason, Target, collect, is_python};
     use std::path::Path;
+
+    #[test]
+    fn a_directory_holding_pyvenv_cfg_is_a_virtualenv_whatever_its_name() {
+        let dir = std::env::temp_dir().join(format!("landav-policy-{}", std::process::id()));
+        let odd = dir.join("tooling");
+        // Asserted rather than unwrapped: the crate forbids the panic lints in
+        // library code and this module follows suit, and a failed write would
+        // fail the assertion below on its own anyway.
+        assert!(std::fs::create_dir_all(&odd).is_ok());
+        assert!(std::fs::write(odd.join("pyvenv.cfg"), "home = /usr/bin\n").is_ok());
+        let policy = Policy::default();
+        assert_eq!(policy.skip(&odd), Some(SkipReason::Virtualenv));
+        assert_eq!(policy.skip(&dir.join("src")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn include_vendored_keeps_the_caches_out() {
+        let policy = Policy {
+            include_vendored: true,
+            exclude: Vec::new(),
+        };
+        assert_eq!(policy.skip(Path::new("/p/.venv")), None);
+        assert_eq!(policy.skip(Path::new("/p/node_modules")), None);
+        assert_eq!(
+            policy.skip(Path::new("/p/__pycache__")),
+            Some(SkipReason::Cache)
+        );
+        assert_eq!(policy.skip(Path::new("/p/.git")), Some(SkipReason::Cache));
+    }
+
+    #[test]
+    fn a_configured_exclusion_applies_whatever_the_flag_says() {
+        let policy = Policy {
+            include_vendored: true,
+            exclude: vec!["legacy".to_owned(), "src/generated".to_owned()],
+        };
+        assert_eq!(
+            policy.skip(Path::new("/p/legacy")),
+            Some(SkipReason::Configured("legacy".to_owned()))
+        );
+        assert_eq!(
+            policy.skip(Path::new("/p/src/generated")),
+            Some(SkipReason::Configured("src/generated".to_owned()))
+        );
+        assert_eq!(policy.skip(Path::new("/p/src")), None);
+    }
 
     #[test]
     fn python_files_are_recognised_by_extension() {
@@ -382,16 +598,21 @@ mod tests {
 
     #[test]
     fn a_target_that_does_not_exist_is_blamed_by_name() {
-        let err = collect(Path::new("definitely/absent/no_such_file.py"))
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+        let err = collect(
+            Path::new("definitely/absent/no_such_file.py"),
+            &Policy::default(),
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
         assert!(err.contains("no_such_file.py"), "{err}");
     }
 
     #[test]
     fn a_directory_target_is_distinguished_from_a_file_target() {
-        let kind = collect(Path::new(".")).ok().map(|(kind, _)| kind);
+        let kind = collect(Path::new("."), &Policy::default())
+            .ok()
+            .map(|(kind, _)| kind);
         assert_eq!(kind, Some(Target::Directory));
     }
 }
