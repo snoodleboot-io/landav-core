@@ -602,13 +602,16 @@ fn an_exception_constructor_does_not_swallow_a_call_in_its_argument() {
 /// A bounded-cost claim about any of them would be a bound the program exceeds.
 #[test]
 fn a_callee_whose_cost_depends_on_its_argument_stays_a_hole() {
+    // A method is spelled with its dot (`LAN-108`): `.join` on a string,
+    // `.append` on the list. The bare names are callees a row could resolve
+    // and are deliberately not in the pack; the methods never resolve at all.
     for (callee, statement) in [
-        ("join", "\",\".join(items)"),
+        (".join", "\",\".join(items)"),
         ("sorted", "sorted(items)"),
         ("list", "list(items)"),
         ("print", "print(items)"),
-        ("append", "items.append(1)"),
-        ("decode", "items.decode(\"utf-8\")"),
+        (".append", "items.append(1)"),
+        (".decode", "items.decode(\"utf-8\")"),
     ] {
         let source = format!("def g(items: list) -> int:\n    {statement}\n    return 0\n");
         let function = only_function(&source);
@@ -657,7 +660,8 @@ def g(lock, n: int) -> int:
     let result = cost(function.program());
     let shown = describe(&result);
 
-    for callee in ["__enter__", "__exit__"] {
+    // Spelled as the methods they are, on the context manager (`LAN-108`).
+    for callee in [".__enter__", ".__exit__"] {
         assert!(
             refuses_call_to(&function, callee),
             "`{callee}` runs arbitrary user code - a lock's `__enter__` can block \
