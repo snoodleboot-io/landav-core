@@ -115,10 +115,18 @@ impl NormaliserBudget {
     /// normal form is defined at; a bound normalised at any other budget may
     /// be less normalised, so it must never reach a golden, a report or an
     /// F-008 cache entry. It exists because a budget type with exactly one
-    /// inhabitant cannot be tested: the iteration-limit and node-limit stop
-    /// paths are unreachable at [`Self::FROZEN`] for any term small enough to
-    /// put in a test, and an untestable stop path is where a silently
-    /// non-deterministic bound would hide.
+    /// inhabitant cannot be tested: an untestable stop path is where a
+    /// silently non-deterministic bound would hide.
+    ///
+    /// The node-limit stop is **not** unreachable at [`Self::FROZEN`], and
+    /// this doc used to say it was. `LAN-112`: a four-variable product with
+    /// one sum in it - `0 * x0 * x2 * (1 + x1)` - exhausts ten thousand
+    /// e-nodes in its first round, because associativity and commutativity
+    /// over a product are what an e-graph is worst at. That is why a
+    /// normalisation is rounds to a fixed point rather than one round (see
+    /// [`crate::FIXED_POINT_ROUNDS`]): the first round may be cut off, and
+    /// the term it hands back is only a normal form once a further round
+    /// returns it unchanged.
     #[must_use]
     pub const fn new(iter_limit: usize, node_limit: usize) -> Self {
         Self {
