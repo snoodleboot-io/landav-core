@@ -3103,6 +3103,13 @@ impl Translator<'_> {
                     self.discarding,
                     self.value_discarded,
                 )
+                // `LAN-114`: an attribute or subscript argument is accounted
+                // too, because descending into it (see `expression_children`)
+                // leaves its cost named as one region in the arena.
+                // `isinstance(x, self.klass)` declares, with `self.klass` an
+                // `attribute` region, so the loop below keeps its count
+                // (`LAN-103`).
+                || placeable_without_value_read(argument, &self.collections)
         })
     }
 
@@ -3720,7 +3727,8 @@ fn expression_children<'e>(
                     collections,
                     discarding,
                     value_discarded,
-                )
+                ) || (!costs_nothing(argument)
+                    && placeable_without_value_read(argument, collections))
             })
             .collect();
     }
@@ -3953,6 +3961,53 @@ fn conceals_a_call(root: &Expr, translated: &[&Expr]) -> bool {
 /// of Python expressions that genuinely cost nothing is small, and guessing
 /// wrong in the other direction publishes a bound the program exceeds. See
 /// [`Translator::arguments_are_accounted`], its only caller.
+/// Whether `argument` is an attribute or a subscript built over names,
+/// constants, `len()` reads and further attributes or subscripts - a construct
+/// the fragment places as its own region, referencing nothing, so building it
+/// charges exactly one node and no more.
+///
+/// The widening [`expression_children`] names and defers: `LAN-114`, the 148
+/// attribute and 31 subscript functions it records. A declared call may close
+/// over such an argument because `self.klass` becomes one `attribute` region
+/// and `types[i]` one `subscript` region - each a hole denoting the property or
+/// `__getitem__` the call's own region denoted `omega` over before - so naming
+/// it is never an under-approximation, and the call stops erasing the frame
+/// (`LAN-103`) while that cost stays named where it stands.
+///
+/// Scope is attribute and subscript on purpose. A display or a format string
+/// descends into its *elements* (see [`translated_children`]), so declaring a
+/// call over `(int, self.kind)` or `f"{t}"` would value-read the bare names
+/// among them and refuse each as a `non-integer-value` nobody asked about - the
+/// same noise `expression_children` records at 440 functions. Those shapes are
+/// a separate change to how a display charges its interior, measured on their
+/// own. A bare *call* is likewise not here: it is the obstacle
+/// [`reaches_a_call`] already makes a region, and routing it through this
+/// predicate would reference it twice. A `len()` over a collection parameter is
+/// the one call the fragment reads as a variable, so it is a leaf.
+fn placeable_without_value_read(argument: &Expr, collections: &BTreeSet<String>) -> bool {
+    // Only an attribute or a subscript roots a placeable argument; a bare name,
+    // a constant or a `len()` already costs nothing and must not be descended
+    // into, because building a name reads its value.
+    if !matches!(argument, Expr::Attribute(_) | Expr::Subscript(_)) {
+        return false;
+    }
+    let mut work = vec![argument];
+    while let Some(node) = work.pop() {
+        match node {
+            Expr::Name(_) | Expr::Constant(_) => {}
+            Expr::Attribute(attribute) => work.push(attribute.value.as_ref()),
+            Expr::Subscript(subscript) => {
+                work.push(subscript.value.as_ref());
+                work.push(subscript.slice.as_ref());
+            }
+            // The one call that is a variable read, not a region.
+            Expr::Call(call) if length_of_collection(call, collections).is_some() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn costs_nothing(expr: &Expr) -> bool {
     let mut work = vec![expr];
     while let Some(node) = work.pop() {
