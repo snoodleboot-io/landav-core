@@ -263,6 +263,386 @@ rebinds_locals = false
 mutates_arguments = true
 why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
 
+# `LAN-109`: the rest of the builtin exception (and warning) hierarchy. The
+# section note above says "only the builtin hierarchy", and the hierarchy is
+# every one of these - each is O(1) construction, exactly like the admitted
+# ones. A corpus reaches a handful (UnicodeError, FileNotFoundError, ...); the
+# set is completed rather than curated, because which builtin exception a
+# program raises is not a thing to guess at, and a user exception still gets
+# no row (its `__init__` is user code). A Warning is an Exception subclass and
+# constructs the same way, so it belongs here too.
+
+[[signature]]
+callee = "BaseExceptionGroup"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "BlockingIOError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "BrokenPipeError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "BufferError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "BytesWarning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ChildProcessError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ConnectionAbortedError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ConnectionError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ConnectionRefusedError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ConnectionResetError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "DeprecationWarning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "EOFError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "EncodingWarning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "EnvironmentError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ExceptionGroup"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "FileExistsError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "FileNotFoundError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "FloatingPointError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "FutureWarning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "GeneratorExit"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "IOError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ImportError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ImportWarning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "IndentationError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "InterruptedError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "IsADirectoryError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "KeyboardInterrupt"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "MemoryError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ModuleNotFoundError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "NameError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "NotADirectoryError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "PendingDeprecationWarning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "PermissionError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ProcessLookupError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "RecursionError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ReferenceError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "ResourceWarning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "RuntimeWarning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "StopAsyncIteration"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "SyntaxError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "SyntaxWarning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "SystemError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "SystemExit"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "TabError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "TimeoutError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "UnboundLocalError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "UnicodeDecodeError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "UnicodeEncodeError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "UnicodeError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "UnicodeTranslateError"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "UnicodeWarning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "UserWarning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
+[[signature]]
+callee = "Warning"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = true
+why = "Builtin exception construction: stores the already-evaluated arguments on the instance and returns."
+
 # ---------------------------------------------------------------------------
 # refused — written down so a later contributor argues rather than appends
 # ---------------------------------------------------------------------------
