@@ -44,6 +44,25 @@ fn refuses_call_to(source: &str, callee: &str) -> bool {
     }
 }
 
+/// Whether the lowering refuses `construct` anywhere in the function `g`.
+fn refuses_construct(source: &str, construct: Construct) -> bool {
+    let functions = landav_python::lower_module(Path::new("shadow.py"), source)
+        .unwrap_or_else(|error| panic!("failed to translate:\n{source}\n{error}"));
+    let function = functions
+        .iter()
+        .find(|it| it.name() == "g")
+        .unwrap_or_else(|| panic!("expected a function `g` in:\n{source}"));
+    match landav_its::lower(function.program()) {
+        Ok(_) => false,
+        Err(error) => error.refusals().is_some_and(|ledger| {
+            ledger
+                .as_slice()
+                .iter()
+                .any(|record| record.construct() == construct)
+        }),
+    }
+}
+
 /// The baseline every case below is measured against.
 const PLAIN: &str = "\
 def g(x) -> int:
@@ -212,27 +231,60 @@ def g(x, value) -> int:
 }
 
 #[test]
-fn an_argument_that_hides_a_cost_keeps_the_call_a_hole() {
-    for (what, source) in [
+fn an_attribute_or_subscript_argument_declares_the_call_but_keeps_the_cost() {
+    // `LAN-114`: resolving the call does not drop the argument's cost, it moves
+    // it from the call's own `omega` region onto the argument's own region. So
+    // the call is declared - the loop below it keeps its count (`LAN-103`) - and
+    // the `property` or `__getitem__` is still charged, now named where it is.
+    for (what, source, construct) in [
         (
             "an attribute, which runs a `property`",
             "def g(x, node) -> int:\n    isinstance(x, node.kind)\n    return 0\n",
+            Construct::Attribute,
         ),
         (
             "a subscript, which runs a `__getitem__`",
             "def g(x, table) -> int:\n    isinstance(x, table[0])\n    return 0\n",
+            Construct::Subscript,
         ),
+    ] {
+        assert!(
+            !refuses_call_to(source, "isinstance"),
+            "{what}: the argument is now charged as its own region, so the call \
+             is declared rather than holed. For:\n{source}"
+        );
+        assert!(
+            refuses_construct(source, construct),
+            "{what}: declaring the call must not drop the argument's cost - it \
+             has to reappear as its own region, or the bound is complete with a \
+             cost missing. For:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn an_argument_that_hides_a_cost_this_fragment_cannot_place_keeps_the_call_a_hole() {
+    // The other side of `LAN-114`: a construct the fragment does not place as a
+    // faithful region - a comprehension runs a loop, a boolean reads its
+    // operands as values - is not made placeable, so the call stays a hole and
+    // its `omega` keeps covering the cost inside it. (A *call* argument is
+    // different: it declares the call and names itself as a region - see
+    // `a_call_in_an_argument_is_still_named_where_it_stands`.)
+    for (what, source) in [
         (
             "a comprehension, which runs a loop",
             "def g(x, items) -> int:\n    isinstance(x, [k for k in items])\n    return 0\n",
         ),
+        (
+            "a boolean, whose operands this fragment reads as values",
+            "def g(x, a, b) -> int:\n    isinstance(x, a and b)\n    return 0\n",
+        ),
     ] {
         assert!(
             refuses_call_to(source, "isinstance"),
-            "{what}: an unresolved call denotes `omega` and covers for whatever \
-             is written inside it, and resolving the call takes that cover away. \
-             The argument is not translated here, so resolving would publish a \
-             complete bound with its cost missing. For:\n{source}"
+            "{what}: an unresolved cost inside the argument denotes `omega`, and \
+             resolving the call would take that cover away with nothing to \
+             replace it. For:\n{source}"
         );
     }
 }
