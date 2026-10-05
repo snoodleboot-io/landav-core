@@ -3110,6 +3110,12 @@ impl Translator<'_> {
                 // `attribute` region, so the loop below keeps its count
                 // (`LAN-103`).
                 || placeable_without_value_read(argument, &self.collections)
+                // `LAN-115`: a format string over names and constants -
+                // `f"expected {t}"`, `"bad %s" % name` - is constant work, as
+                // free as the string literal `ValueError("bad")` already is. It
+                // is accounted and, like a `costs_nothing` argument, never
+                // descended into, so its interpolations are not value-read.
+                || format_is_constant(argument)
         })
     }
 
@@ -4006,6 +4012,58 @@ fn placeable_without_value_read(argument: &Expr, collections: &BTreeSet<String>)
         }
     }
     true
+}
+
+/// Whether `expr` is a format string whose cost is constant: an f-string or a
+/// `%` format over names, constants and `len()` reads.
+///
+/// `LAN-115`. Building such a string is bounded by the format's own length,
+/// which is a constant of the program, so it costs exactly what the string
+/// literal `ValueError("bad")` costs - nothing this fragment's variables can
+/// see. Treated as [`costs_nothing`] is at the call sites that consult it: the
+/// enclosing constructor declares over it, and because it is never descended
+/// into (it is not `costs_nothing` by type, but it is accounted the same way),
+/// its interpolations are never value-read.
+///
+/// An interpolation must itself cost nothing - a name, a constant, a `len()`,
+/// or a display of those. A call (`f"{g()}"`) or any value-read construct
+/// (`f"{a + b}"`, `f"{self.x}"`) makes the whole format *not* constant, so the
+/// enclosing call keeps its hole and the `omega` that cover charges stays over
+/// the interpolation's real cost. Treating a bare name read as free is the
+/// trust the fragment already extends everywhere; an attribute or a call is
+/// not, so it is excluded rather than silently freed.
+fn format_is_constant(expr: &Expr) -> bool {
+    match expr {
+        // The pieces of an f-string: literal `Constant` runs and
+        // `FormattedValue` holes. Every one must be constant.
+        Expr::JoinedStr(joined) => joined.values.iter().all(format_is_constant),
+        Expr::FormattedValue(formatted) => {
+            costs_nothing(&formatted.value)
+                && formatted
+                    .format_spec
+                    .as_deref()
+                    .is_none_or(format_is_constant)
+        }
+        // A string or bytes literal - the literal part of an f-string, or a
+        // plain `"..."`. Not an integer, so not something whose value is read.
+        Expr::Constant(constant) => {
+            matches!(constant.value, Constant::Str(_) | Constant::Bytes(_))
+        }
+        // `"fmt" % args` - `%` formatting, distinguished from integer modulo by
+        // a string literal on the left. The right is the interpolated values,
+        // which must cost nothing; a tuple of names (`"%s %s" % (a, b)`) is
+        // `costs_nothing`. Integer `a % b` has a `Name` left and is untouched.
+        Expr::BinOp(binary)
+            if matches!(binary.op, ast::Operator::Mod)
+                && matches!(
+                    binary.left.as_ref(),
+                    Expr::Constant(c) if matches!(c.value, Constant::Str(_) | Constant::Bytes(_))
+                ) =>
+        {
+            costs_nothing(&binary.right)
+        }
+        _ => false,
+    }
 }
 
 fn costs_nothing(expr: &Expr) -> bool {
