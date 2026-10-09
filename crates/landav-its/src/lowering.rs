@@ -224,7 +224,11 @@ impl<'a> Lowering<'a> {
             // that - everything else about the scan is unchanged, and a node
             // *without* a declaration refuses exactly as it always did, which is
             // what keeps an unknown callee an unknown callee.
-            if node.declared().is_some() {
+            // A *composed* declaration (`LAN-116`) is the exception: its cost
+            // is a bound this transition system cannot express, so here it
+            // refuses exactly as an undeclared call does. The native engine
+            // charges it; this lowering's reach does not grow.
+            if node.declared().is_some_and(|effect| !effect.is_composed()) {
                 continue;
             }
             self.refuse(
@@ -395,11 +399,16 @@ impl<'a> Lowering<'a> {
                 let Some(effect) = *declared else {
                     return;
                 };
+                // A composed cost never reaches here: the refusal scan above
+                // refused the program. Stated rather than assumed.
+                let Some(steps) = effect.steps() else {
+                    return;
+                };
                 let own: u32 = match extent {
                     Extent::Statement => 1,
                     Extent::Fragment => 0,
                 };
-                let cost = Cost::constant(own.saturating_add(effect.steps()));
+                let cost = Cost::constant(own.saturating_add(steps));
                 self.emit(from, to, Guard::always(), Update::identity(), cost, origin);
             }
         }

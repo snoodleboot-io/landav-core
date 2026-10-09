@@ -917,11 +917,20 @@ where
     let mut siblings = landav_python::Siblings::default();
     let mut functions = lower(None)?;
     for _ in 0..SIBLING_ROUNDS {
-        let before = siblings.len();
+        // Compared whole, not by length: a key is only ever inserted once its
+        // bound is exact, and an exact bound does not change in later rounds,
+        // so equality is the fixed point and length would be too.
+        let before = siblings.clone();
         for function in &functions {
             // Module-level functions are not siblings of anything; only a
             // method, keyed by the `Class.method` name LAN-104 lowers it under.
             if function.class().is_none() {
+                continue;
+            }
+            // `LAN-116`: a method a subclass in this module redefines is never
+            // composed - the call may reach the override, and a composed bound
+            // would then be the wrong shape.
+            if function.overridden_in_module() {
                 continue;
             }
             let landav_engine::TripCount::Exact(bound) = landav_engine::cost(function.program())
@@ -929,6 +938,11 @@ where
                 continue;
             };
             if !bound.vars().is_empty() {
+                // `LAN-116`: an exact, non-constant bound composes at the call
+                // site by substitution. The sibling's parameters, receiver
+                // excluded, are what positional arguments are mapped onto.
+                let params: Vec<String> = function.parameters().iter().skip(1).cloned().collect();
+                siblings.insert_bound(function.name().to_owned(), bound.clone(), params);
                 continue;
             }
             // A var-free bound evaluates the same under any valuation.
@@ -950,7 +964,7 @@ where
                 landav_its::DeclaredEffect::new(steps, false, true),
             );
         }
-        if siblings.len() == before {
+        if siblings == before {
             break;
         }
         functions = lower(Some(&siblings))?;
@@ -1198,7 +1212,7 @@ fn sibling_premise(
             continue;
         };
         let qualified = format!("{class}.{method}");
-        if siblings.effect_of(&qualified).is_some() {
+        if siblings.cost_of(&qualified).is_some() {
             resting.insert(qualified);
         }
     }

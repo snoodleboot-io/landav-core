@@ -43,6 +43,8 @@ pub struct SourceProgramBuilder {
     overflowed: bool,
     conceals_a_call: bool,
     volatile: BTreeSet<VarName>,
+    /// See [`SourceProgram::composed`]. `LAN-116`.
+    composed: Vec<landav_bound::Bound>,
     protocol_lengths: BTreeSet<VarName>,
     read_lengths: BTreeSet<VarName>,
 }
@@ -65,6 +67,7 @@ impl SourceProgramBuilder {
             overflowed: false,
             conceals_a_call: false,
             volatile: BTreeSet::new(),
+            composed: Vec::new(),
             protocol_lengths: BTreeSet::new(),
             read_lengths: BTreeSet::new(),
         }
@@ -626,7 +629,20 @@ impl SourceProgramBuilder {
             volatile: self.volatile,
             protocol_lengths: self.protocol_lengths,
             read_lengths: self.read_lengths,
+            composed: self.composed,
         }
+    }
+
+    /// Registers a composed bound and returns the index a declared node names
+    /// it by. `LAN-116`; see [`crate::DeclaredCost::Composed`].
+    ///
+    /// `u32::MAX` bounds in one function is not a case this returns an error
+    /// for: it saturates, and a saturated index resolves to nothing, which the
+    /// engine treats as the conservative hole it would have had anyway.
+    pub fn compose(&mut self, bound: landav_bound::Bound) -> u32 {
+        let index = u32::try_from(self.composed.len()).unwrap_or(u32::MAX);
+        self.composed.push(bound);
+        index
     }
 
     // -- arena plumbing -----------------------------------------------------
