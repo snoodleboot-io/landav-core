@@ -214,7 +214,8 @@ pub struct Premise {
     /// calling that a variable would have been the field meaning something
     /// different depending on the value of another field.
     pub subject: String,
-    /// `"concrete-type"`, `"protocol"`, or `"supplied-signature"`.
+    /// `"concrete-type"`, `"protocol"`, `"supplied-signature"`, or
+    /// `"same-class-method"` (`LAN-113`).
     pub trust: &'static str,
     /// Why the number is believed, in one sentence.
     ///
@@ -247,7 +248,12 @@ pub struct Premise {
 ///
 /// A length the function never reads is still not listed: nothing about the
 /// result depends on it, and listing it would make the field noise.
-fn premises_of(program: &landav_its::SourceProgram, pack: Option<&SignaturePack>) -> Vec<Premise> {
+fn premises_of(
+    program: &landav_its::SourceProgram,
+    pack: Option<&SignaturePack>,
+    class: Option<&str>,
+    siblings: Option<&landav_python::Siblings>,
+) -> Vec<Premise> {
     let mut premises: Vec<Premise> = program
         .params()
         .iter()
@@ -276,7 +282,55 @@ fn premises_of(program: &landav_its::SourceProgram, pack: Option<&SignaturePack>
         })
         .collect();
     premises.extend(supplied_premises(program, pack));
+    premises.extend(sibling_premises(program, class, siblings));
     premises
+}
+
+/// One premise per sibling method this program's bound closed over. `LAN-113`.
+///
+/// Read back off the program exactly as [`supplied_premises`] is: a resolved
+/// call is still a node carrying the callee in `detail`, and the sibling table
+/// the driver built says which `Class.method` names were declared from a
+/// derived bound. The premise is the late-binding assumption - that `self.m()`
+/// reached *this* class's `m` and not a subclass's override, which the
+/// analysis cannot see.
+fn sibling_premises(
+    program: &landav_its::SourceProgram,
+    class: Option<&str>,
+    siblings: Option<&landav_python::Siblings>,
+) -> Vec<Premise> {
+    let (Some(siblings), Some(class)) = (siblings, class) else {
+        return Vec::new();
+    };
+    let mut resting: BTreeSet<String> = BTreeSet::new();
+    for node in program.unsupported_nodes() {
+        if node.construct() != Construct::Call || node.declared().is_none() {
+            continue;
+        }
+        let Some(detail) = node.detail() else {
+            continue;
+        };
+        let Some(method) = detail.as_str().strip_prefix('.') else {
+            continue;
+        };
+        let qualified = format!("{class}.{method}");
+        if siblings.effect_of(&qualified).is_some() {
+            resting.insert(qualified);
+        }
+    }
+    resting
+        .into_iter()
+        .map(|qualified| Premise {
+            subject: qualified.clone(),
+            trust: "same-class-method",
+            because: format!(
+                "the cost of `{qualified}` is its own derived bound, composed at the call site \
+                 because it is a constant; the premise is that the call resolves to this \
+                 class's definition and not to an override in a subclass, which the analysis \
+                 cannot see"
+            ),
+        })
+        .collect()
 }
 
 /// One premise per callee this program resolved against a row nobody shipped.
@@ -558,6 +612,7 @@ impl Collector {
         function: &landav_python::LoweredFunction,
         lowered: Result<(), &landav_its::LoweringError>,
         pack: Option<&SignaturePack>,
+        siblings: Option<&landav_python::Siblings>,
     ) {
         let at = function.location();
         // Kept as the frontend's own records for as long as possible: the hole
@@ -646,7 +701,7 @@ impl Collector {
         self.functions.push(Function {
             name: function.name().to_owned(),
             class: function.class().map(str::to_owned),
-            premises: premises_of(function.program(), pack),
+            premises: premises_of(function.program(), pack, function.class(), siblings),
             file: at.file().display().to_string(),
             line: at.line(),
             column: at.column(),

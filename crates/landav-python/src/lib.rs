@@ -114,7 +114,7 @@ pub use crate::{
     finding::Finding,
     location::Location,
     lowered_function::LoweredFunction,
-    lowering::{AnnotationTrust, lower_module, lower_module_with},
+    lowering::{AnnotationTrust, Siblings, lower_module, lower_module_with},
     python_error::PythonError,
     registry::{RETIRED_CODES, is_retired_code, registry, rule, rule_for_code},
     rule::Rule,

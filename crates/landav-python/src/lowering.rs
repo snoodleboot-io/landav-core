@@ -86,7 +86,67 @@ const MAX_EXPONENT: u32 = landav_its::MAX_DEGREE;
 /// deeply than the frontend will parse. Nothing else: a construct outside the
 /// fragment is not an error here, it is an `Unsupported` node in the program.
 pub fn lower_module(path: &Path, source: &str) -> Result<Vec<LoweredFunction>, PythonError> {
-    lower_module_with(path, source, AnnotationTrust::default(), None)
+    lower_module_with(path, source, AnnotationTrust::default(), None, None)
+}
+
+/// The sibling methods a call may be resolved against, keyed by qualified
+/// name (`Class.method`). `LAN-113`.
+///
+/// # What this is, and is not
+///
+/// `self.m()` inside `class C` where `def m` is in the same class body is a
+/// call to a *known function* - the one the frontend lowered under `C.m` - and
+/// the engine has already derived its bound. This table carries the bounds
+/// that came back **constant**: a sibling that costs `k` steps and nothing in
+/// the caller's variables can be declared at the call site exactly as a
+/// signature row is, with `steps = k`. That is the narrow, intra-class,
+/// constant-only first form of path-level composition (F-037), reusing the
+/// existing [`DeclaredEffect`] mechanism and no new node.
+///
+/// It is **not** a signature pack. A row is a claim somebody wrote down; an
+/// entry here is a bound the engine derived in this very module, keyed by
+/// definition site. A method the class merely *inherits* has no definition in
+/// this body, so it is never here and the call stays a hole; an *override* in a
+/// subclass cannot be seen from here at all, which is why a bound resting on
+/// an entry publishes a `same-class-method` premise - the late-binding
+/// assumption is real and is said, not hidden.
+///
+/// # Why it is a fixed point and not a dependency graph
+///
+/// The driver lowers a module, derives every bound, enters each constant one
+/// here, and lowers again - until a round adds nothing. A method in a call
+/// cycle (`a` calls `self.b()`, `b` calls `self.a()`) has an unresolved hole in
+/// every round, so its bound is never constant and it never enters the table:
+/// recursion excludes itself, and a chain `a -> b -> c` resolves one link per
+/// round. No cycle detection, because there is nothing to detect.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Siblings {
+    effects: BTreeMap<String, DeclaredEffect>,
+}
+
+impl Siblings {
+    /// Records that the method `qualified` (`Class.method`) costs `effect`.
+    pub fn insert(&mut self, qualified: impl Into<String>, effect: DeclaredEffect) {
+        self.effects.insert(qualified.into(), effect);
+    }
+
+    /// The declared effect of `qualified`, if it is a constant-cost sibling.
+    #[must_use]
+    pub fn effect_of(&self, qualified: &str) -> Option<DeclaredEffect> {
+        self.effects.get(qualified).copied()
+    }
+
+    /// Whether any sibling is recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.effects.is_empty()
+    }
+
+    /// How many siblings are recorded.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.effects.len()
+    }
 }
 
 /// [`lower_module`], choosing which annotations a collection's length may be
@@ -113,6 +173,7 @@ pub fn lower_module_with(
     source: &str,
     trust: AnnotationTrust,
     pack: Option<&SignaturePack>,
+    siblings: Option<&Siblings>,
 ) -> Result<Vec<LoweredFunction>, PythonError> {
     // `None` is the builtin, which is what every caller wanted until a pack
     // could be supplied. Spelling the default in the type rather than in a
@@ -143,6 +204,7 @@ pub fn lower_module_with(
                 definition,
                 module_bound.as_ref(),
                 pack,
+                siblings,
             ));
         }
     }
@@ -309,7 +371,14 @@ fn lower_function(
     function: Definition<'_>,
     module_bound: Option<&BTreeSet<String>>,
     pack: &SignaturePack,
+    siblings: Option<&Siblings>,
 ) -> LoweredFunction {
+    // The receiver a sibling call is spelled on: a method's first parameter,
+    // whatever it is called. A module-level function has none, so no
+    // `x.m()` in it can be a sibling call.
+    let receiver = function
+        .class
+        .and_then(|_| parameter_names(function).into_iter().next());
     let integers = integer_names(function);
     let name = function.qualified_name();
     let class = function.class.map(str::to_owned);
@@ -378,6 +447,9 @@ fn lower_function(
         shadowed,
         rebound,
         pack,
+        class: function.class,
+        receiver,
+        siblings,
         walks: 0,
         discarding: false,
         value_discarded: false,
@@ -1694,6 +1766,14 @@ struct Translator<'a> {
     rebound: Option<BTreeSet<String>>,
     /// The signatures a call may be resolved against.
     pack: &'a SignaturePack,
+    /// The class this function is a method of, if any. `LAN-113`.
+    class: Option<&'a str>,
+    /// The name a sibling call is spelled on - the method's first parameter -
+    /// or `None` for a module-level function. `LAN-113`.
+    receiver: Option<String>,
+    /// The constant-cost sibling methods a `self.m()` may be declared against.
+    /// `LAN-113`; see [`Siblings`].
+    siblings: Option<&'a Siblings>,
     /// How many collection walks have been lowered, to keep their synthetic
     /// counters apart.
     walks: u32,
@@ -2957,6 +3037,20 @@ impl Translator<'_> {
         if !(self.discarding || self.truth_test) {
             return None;
         }
+        // `LAN-113`: `self.m(...)` where `m` is a constant-cost method defined
+        // in this class body. Condition 2 above says a method on an unknown
+        // receiver is never resolved against a *row*; this is the one receiver
+        // whose class is known - the class this very function is in - and the
+        // cost is not a row at all but the sibling's own derived bound. The
+        // receiver must be this method's first parameter and must not have
+        // been rebound in the body (`self = other` is not our class any more),
+        // and the arguments must be accounted for exactly as for a row.
+        if let Some(effect) = self.sibling_declaration(call) {
+            if !self.arguments_are_accounted(call) {
+                return None;
+            }
+            return Some(effect);
+        }
         let Expr::Name(callee) = call.func.as_ref() else {
             return None;
         };
@@ -2969,6 +3063,38 @@ impl Translator<'_> {
             return None;
         }
         Some(effect_of(row))
+    }
+
+    /// The declared effect of `call` if it is `<receiver>.m(...)` on a
+    /// constant-cost sibling of this class. `LAN-113`.
+    ///
+    /// Keyed by definition site through the qualified name `Class.m`: an
+    /// inherited `m` has no entry, so the call stays a hole, and an `m` from
+    /// a different class with the same name is a different key.
+    fn sibling_declaration(&self, call: &ast::ExprCall) -> Option<DeclaredEffect> {
+        let siblings = self.siblings?;
+        let class = self.class?;
+        let receiver = self.receiver.as_deref()?;
+        let Expr::Attribute(method) = call.func.as_ref() else {
+            return None;
+        };
+        let Expr::Name(value) = method.value.as_ref() else {
+            return None;
+        };
+        if value.id.as_str() != receiver {
+            return None;
+        }
+        // `self` rebound in the body is some other object by the time it is
+        // called on; `rebound` being unknown refuses, exactly as it refuses a
+        // method row's receiver.
+        if self
+            .rebound
+            .as_ref()
+            .is_none_or(|names| names.contains(receiver))
+        {
+            return None;
+        }
+        siblings.effect_of(&format!("{class}.{}", method.attr.as_str()))
     }
 
     /// What a call the pack cannot *resolve* may nevertheless change in this
