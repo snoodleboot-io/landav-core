@@ -24,6 +24,15 @@ pub struct LoweredFunction {
     class: Option<String>,
     location: Location,
     program: SourceProgram,
+    /// The parameters as the source lists them, in order, receiver first for
+    /// a method. Not the bound variables - those are [`SourceProgram::params`]
+    /// and are named `len(items)` for a collection. `LAN-116` maps a sibling
+    /// call's positional arguments onto these.
+    parameters: Vec<String>,
+    /// Whether another class in the same module subclasses this one and
+    /// redefines this method. `LAN-116`: such a method is never composed at a
+    /// call site, because the call may reach the override.
+    overridden_in_module: bool,
 }
 
 impl LoweredFunction {
@@ -34,13 +43,29 @@ impl LoweredFunction {
         class: Option<String>,
         location: Location,
         program: SourceProgram,
+        parameters: Vec<String>,
+        overridden_in_module: bool,
     ) -> Self {
         Self {
             name,
             class,
             location,
             program,
+            parameters,
+            overridden_in_module,
         }
+    }
+
+    /// The parameters as written, in order, receiver first for a method.
+    #[must_use]
+    pub fn parameters(&self) -> &[String] {
+        &self.parameters
+    }
+
+    /// Whether a subclass in this module redefines this method. `LAN-116`.
+    #[must_use]
+    pub const fn overridden_in_module(&self) -> bool {
+        self.overridden_in_module
     }
 
     /// The class this is a method of, or `None` for a module-level function.
