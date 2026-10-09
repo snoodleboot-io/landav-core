@@ -57,6 +57,7 @@ fn frobnicate_is_declared(pack: Option<&SignaturePack>) -> bool {
         SOURCE,
         AnnotationTrust::default(),
         pack,
+        None,
     )
     .expect("the source is inside the fragment");
     let program = functions

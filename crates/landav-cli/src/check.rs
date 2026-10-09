@@ -884,6 +884,80 @@ const fn classify(
 /// disagreement between two entry points rather than a property of the source —
 /// it is blamed rather than swallowed, because a coverage denominator that
 /// silently lost a file is the omission this story is about.
+/// The most rounds of sibling composition one module gets. `LAN-113`.
+///
+/// Each round can only lengthen a resolved chain by one link (`a -> b -> c`
+/// takes three), so this bounds nesting depth, not file size. A class with
+/// helper chains deeper than this keeps the remaining calls as holes - sound,
+/// merely less complete - and the cap exists so a pathological module costs a
+/// known multiple of a lowering rather than an unknown one.
+const SIBLING_ROUNDS: usize = 8;
+
+/// Lowers a module to a fixed point of intra-class constant-sibling
+/// composition. `LAN-113`.
+///
+/// Round one lowers with no table. Every method whose bound came back
+/// **exact and constant** - no holes, no variables - is entered into
+/// [`landav_python::Siblings`] as a declared effect of that many steps, and the
+/// module is lowered again against the table. A round that adds nothing ends
+/// it. See [`landav_python::Siblings`] for why a cycle excludes itself and a
+/// chain resolves one link per round.
+///
+/// The table is returned alongside the final lowering because the premise a
+/// resting bound publishes is read back against it (`same-class-method`), the
+/// same way a supplied-signature premise is read back against the pack.
+fn compose_siblings<F>(
+    lower: F,
+) -> Result<(Vec<landav_python::LoweredFunction>, landav_python::Siblings), ToolError>
+where
+    F: Fn(
+        Option<&landav_python::Siblings>,
+    ) -> Result<Vec<landav_python::LoweredFunction>, ToolError>,
+{
+    let mut siblings = landav_python::Siblings::default();
+    let mut functions = lower(None)?;
+    for _ in 0..SIBLING_ROUNDS {
+        let before = siblings.len();
+        for function in &functions {
+            // Module-level functions are not siblings of anything; only a
+            // method, keyed by the `Class.method` name LAN-104 lowers it under.
+            if function.class().is_none() {
+                continue;
+            }
+            let landav_engine::TripCount::Exact(bound) = landav_engine::cost(function.program())
+            else {
+                continue;
+            };
+            if !bound.vars().is_empty() {
+                continue;
+            }
+            // A var-free bound evaluates the same under any valuation.
+            let steps = match bound.eval(&landav_bound::TotalValuation::saturating(
+                std::collections::BTreeMap::new(),
+            )) {
+                landav_bound::Nat::Fin(steps) => steps,
+                landav_bound::Nat::Omega => continue,
+            };
+            let Ok(steps) = u32::try_from(steps) else {
+                continue;
+            };
+            // A method call cannot rebind the caller's locals - Python gives
+            // a callee no access to the caller's frame - but it may mutate
+            // `self`, so the conservative `mutates_arguments` is kept, exactly
+            // as every admitted pack row keeps it.
+            siblings.insert(
+                function.name().to_owned(),
+                landav_its::DeclaredEffect::new(steps, false, true),
+            );
+        }
+        if siblings.len() == before {
+            break;
+        }
+        functions = lower(Some(&siblings))?;
+    }
+    Ok((functions, siblings))
+}
+
 fn accumulate<W: std::io::Write>(
     path: &Path,
     text: &str,
@@ -893,18 +967,27 @@ fn accumulate<W: std::io::Write>(
     mut bounds: Option<&mut Report<W>>,
     mut collected: Option<&mut machine::Collector>,
 ) -> Result<(), ToolError> {
-    let functions =
-        landav_python::lower_module_with(path, text, believed.derivation.trust, believed.pack)
-            .map_err(|error| {
-                ToolError::at_path(
-                    path,
-                    format!(
-                        "parsed for the rules but not for the lowering ({error}), so this file \
+    let lower = |siblings: Option<&landav_python::Siblings>| {
+        landav_python::lower_module_with(
+            path,
+            text,
+            believed.derivation.trust,
+            believed.pack,
+            siblings,
+        )
+        .map_err(|error| {
+            ToolError::at_path(
+                path,
+                format!(
+                    "parsed for the rules but not for the lowering ({error}), so this file \
                  is missing from the coverage report and the report's denominator \
                  would understate what was skipped"
-                    ),
-                )
-            })?;
+                ),
+            )
+        })
+    };
+    let (functions, siblings) = compose_siblings(lower)?;
+    let siblings = Some(&siblings);
     for function in &functions {
         let lowered = landav_its::lower(function.program());
         // The frontend's own refusal records, joined against the hole ledger to
@@ -937,11 +1020,17 @@ fn accumulate<W: std::io::Write>(
                     records,
                     believed.derivation.resource,
                     believed.pack,
+                    siblings,
                 )
             ));
         }
         if let Some(sink) = collected.as_deref_mut() {
-            sink.absorb_function(function, lowered.as_ref().map(|_| ()), believed.pack);
+            sink.absorb_function(
+                function,
+                lowered.as_ref().map(|_| ()),
+                believed.pack,
+                siblings,
+            );
         }
         coverage.record(lowered.as_ref());
     }
@@ -985,6 +1074,7 @@ fn describe_bound(
     records: &[landav_its::Unsupported],
     resource: Option<ResourceKind>,
     pack: Option<&SignaturePack>,
+    siblings: Option<&landav_python::Siblings>,
 ) -> String {
     let at = function.location();
     let where_ = format!("{}:{}:{}", at.file().display(), at.line(), at.column());
@@ -996,10 +1086,11 @@ fn describe_bound(
         );
     };
     let line = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         describe_cost(&where_, function, derived, records),
         protocol_premise(function, derived),
-        supplied_premise(function, derived, pack)
+        supplied_premise(function, derived, pack),
+        sibling_premise(function, derived, siblings)
     );
     match resource_clause(derived, function.program(), resource) {
         Some(clause) => format!("{line}; {clause}"),
@@ -1071,6 +1162,54 @@ fn protocol_premise(
         "; believed on {}: the parameter is annotated with an abstract collection type, so its \
          length is a user `__len__` trusted to equal the number of iterations",
         resting.join(", ")
+    )
+}
+
+/// The clause naming the sibling methods this bound closed over. `LAN-113`.
+///
+/// Said in the text for the reason the supplied-signature clause is: it is a
+/// premise that is not the baseline. `self.m()` resolved to *this* class's
+/// `m` only if no subclass overrides it, and Python's late binding means the
+/// analysis cannot see one. The number in front of the reader is complete
+/// because that was assumed, and it says so.
+fn sibling_premise(
+    function: &landav_python::LoweredFunction,
+    derived: &landav_engine::TripCount,
+    siblings: Option<&landav_python::Siblings>,
+) -> String {
+    let (Some(siblings), Some(class)) = (siblings, function.class()) else {
+        return String::new();
+    };
+    if derived.bound().is_none() {
+        return String::new();
+    }
+    let program = function.program();
+    let mut resting: BTreeSet<String> = BTreeSet::new();
+    for node in program.unsupported_nodes() {
+        if node.construct() != landav_its::Construct::Call || node.declared().is_none() {
+            continue;
+        }
+        let Some(callee) = node.detail() else {
+            continue;
+        };
+        // A method is spelled with its dot (`LAN-108`); the sibling table is
+        // keyed `Class.method`.
+        let Some(method) = callee.as_str().strip_prefix('.') else {
+            continue;
+        };
+        let qualified = format!("{class}.{method}");
+        if siblings.effect_of(&qualified).is_some() {
+            resting.insert(qualified);
+        }
+    }
+    if resting.is_empty() {
+        return String::new();
+    }
+    let said: Vec<String> = resting.into_iter().map(|q| format!("`{q}`")).collect();
+    format!(
+        "; believed on {}: the cost is the sibling method's own derived bound, assuming no \
+         subclass overrides it",
+        said.join(", ")
     )
 }
 
