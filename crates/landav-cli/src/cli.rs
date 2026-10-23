@@ -43,6 +43,58 @@ enum Command {
     Report(ReportArgs),
     /// What changed between two `check --json` runs.
     Diff(DiffArgs),
+    /// Run the declared corpora and keep the baselines by commit.
+    Bench(BenchArgs),
+}
+
+/// Arguments to `landav bench`. `LAN-123`.
+#[derive(Debug, Args)]
+struct BenchArgs {
+    /// The corpora file. Defaults to `~/.config/landav/corpora.toml`.
+    ///
+    /// Each corpus is a `[corpus.NAME]` table with `path = "..."` and, for a
+    /// virtual environment that is a corpus on purpose, `include_vendored =
+    /// true`. Paths are machine-specific, which is why this is a user file
+    /// and not part of a project.
+    #[arg(long, value_name = "FILE", global = true)]
+    config: Option<PathBuf>,
+
+    /// Where baselines are kept. Defaults to `~/.cache/landav/baselines`.
+    #[arg(long, value_name = "DIR", global = true)]
+    baselines: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: BenchCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum BenchCommand {
+    /// Run `check --json` over the named corpora (all, if none named) and
+    /// write `<label>-<corpus>.json` into the baselines directory.
+    Run {
+        /// Corpus names from the corpora file.
+        #[arg(value_name = "CORPUS")]
+        names: Vec<String>,
+        /// The label to file the runs under. Defaults to the commit this
+        /// binary was built from, with `-dirty` when the tree had changes.
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+    },
+    /// `landav diff` between two labels, corpus by corpus.
+    Diff {
+        #[arg(value_name = "BEFORE")]
+        before: String,
+        #[arg(value_name = "AFTER")]
+        after: String,
+        /// Corpus names from the corpora file.
+        #[arg(value_name = "CORPUS")]
+        names: Vec<String>,
+        /// Emit each corpus's delta as JSON instead of tables.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The labels and corpora the baselines directory holds.
+    List,
 }
 
 /// Arguments to `landav report`.
@@ -332,6 +384,24 @@ pub fn dispatch() -> Outcome {
             ),
             Command::Report(args) => crate::diff::report(&args.run, args.json),
             Command::Diff(args) => crate::diff::diff(&args.before, &args.after, args.json),
+            Command::Bench(args) => {
+                let setup = crate::bench::Setup {
+                    config: args.config,
+                    baselines: args.baselines,
+                };
+                match args.command {
+                    BenchCommand::Run { names, label } => {
+                        crate::bench::run(&setup, &names, label.as_deref())
+                    }
+                    BenchCommand::Diff {
+                        before,
+                        after,
+                        names,
+                        json,
+                    } => crate::bench::diff(&setup, &before, &after, &names, json),
+                    BenchCommand::List => crate::bench::list(&setup),
+                }
+            }
         },
         Err(error) => usage(&error),
     }

@@ -19,7 +19,9 @@
 //! and the hosted platform — never the verdict itself.
 //!
 //! Beside `check` sit `report` and `diff` (`LAN-119`), which read what `check
-//! --json` wrote: the coverage picture of a run, and of a change.
+//! --json` wrote: the coverage picture of a run, and of a change; and `bench`
+//! (`LAN-123`), which produces those runs over declared corpora and keeps them
+//! by commit.
 //!
 //! # Naming
 //!
@@ -38,6 +40,7 @@
 //! [`F-041`]: https://linear.app/snoodleboot/issue/LAN-24
 
 mod assumption;
+mod bench;
 mod check;
 mod cli;
 mod config;
