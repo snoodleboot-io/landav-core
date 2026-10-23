@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use landav_bound::{Bound, Origin, VarId};
+use landav_bound::{Bound, Origin, Symbol, VarId};
 use landav_its::{
     CondId, Construct, CostEffect, DeclaredCost, DeclaredEffect, ExprId, Extent, NodeId, RangeSpec,
     SourceCond, SourceExpr, SourceProgram, SourceStmt, StmtId, VarName, Writes,
@@ -737,9 +737,56 @@ impl<'a> Walk<'a> {
                 // `LAN-116`: a sibling method's bound, already in this
                 // function's variables. A dangling index is a frontend bug;
                 // it falls through to the hole rather than inventing a cost.
+                //
+                // `LAN-126`: the sibling's own undischarged regions come with
+                // it. Each is minted here as a fresh region of *this* function
+                // - so two calls to one sibling are two regions - carrying the
+                // sibling's construct and origin, and the sibling's variable is
+                // replaced by the fresh one in the bound. The caller's single
+                // opaque `call` thereby becomes the callee's named regions,
+                // one level deeper; nothing is dropped and nothing is guessed.
                 DeclaredCost::Composed(index) => {
-                    if let Some(bound) = self.program.composed(index) {
-                        return TripCount::Exact(bound.clone());
+                    let program = self.program;
+                    if let Some(composed) = program.composed(index) {
+                        // Two passes, because the callee's hole variables and
+                        // this function's fresh ones share one namespace: a
+                        // callee `#hole0` renamed to a fresh `#hole1` would be
+                        // renamed again by the callee's own `#hole1` a step
+                        // later. Each callee variable first becomes a private
+                        // name no bound ever mints, then the private names
+                        // become the fresh holes.
+                        let mut bound = composed.bound().clone();
+                        let mut holes = Vec::with_capacity(composed.holes().len());
+                        let staged: Vec<(VarId, Hole)> = composed
+                            .holes()
+                            .iter()
+                            .enumerate()
+                            .map(|(slot, inherited)| {
+                                let staging =
+                                    VarId::new(Symbol::from(format!("#inherited:{slot}")));
+                                bound = bound.subst(
+                                    &VarId::new(inherited.var.clone()),
+                                    &Bound::var(staging.symbol().clone()),
+                                );
+                                let fresh = self
+                                    .holes
+                                    .next(inherited.construct, inherited.origin.clone());
+                                (staging, fresh)
+                            })
+                            .collect();
+                        for (staging, fresh) in staged {
+                            bound = bound.subst(&staging, &fresh.as_bound());
+                            holes.push(fresh);
+                        }
+                        return if holes.is_empty() {
+                            TripCount::Exact(bound)
+                        } else {
+                            TripCount::Partial {
+                                bound,
+                                holes,
+                                exact_elsewhere: true,
+                            }
+                        };
                     }
                 }
             }

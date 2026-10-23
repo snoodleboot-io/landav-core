@@ -331,7 +331,7 @@ pub use crate::{
     relation::Relation,
     source_cond::SourceCond,
     source_expr::SourceExpr,
-    source_program::SourceProgram,
+    source_program::{Composed, InheritedHole, SourceProgram},
     source_program_builder::SourceProgramBuilder,
     source_stmt::SourceStmt,
     stmt_id::StmtId,

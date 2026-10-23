@@ -8,8 +8,8 @@ use crate::{
     MAX_ARENA_NODES, arith_op::ArithOp, compare_op::CompareOp, cond_id::CondId,
     construct::Construct, declared_effect::DeclaredEffect, expr_id::ExprId, extent::Extent,
     range_spec::RangeSpec, source_cond::SourceCond, source_expr::SourceExpr,
-    source_program::SourceProgram, source_stmt::SourceStmt, stmt_id::StmtId, var_name::VarName,
-    writes::Writes,
+    source_program::Composed, source_program::SourceProgram, source_stmt::SourceStmt,
+    stmt_id::StmtId, var_name::VarName, writes::Writes,
 };
 
 /// Builds a [`SourceProgram`] node by node.
@@ -44,7 +44,7 @@ pub struct SourceProgramBuilder {
     conceals_a_call: bool,
     volatile: BTreeSet<VarName>,
     /// See [`SourceProgram::composed`]. `LAN-116`.
-    composed: Vec<landav_bound::Bound>,
+    composed: Vec<Composed>,
     protocol_lengths: BTreeSet<VarName>,
     read_lengths: BTreeSet<VarName>,
 }
@@ -664,15 +664,15 @@ impl SourceProgramBuilder {
         }
     }
 
-    /// Registers a composed bound and returns the index a declared node names
-    /// it by. `LAN-116`; see [`crate::DeclaredCost::Composed`].
+    /// Registers a composed cost and returns the index a declared node names
+    /// it by. `LAN-116`, `LAN-126`.
     ///
-    /// `u32::MAX` bounds in one function is not a case this returns an error
-    /// for: it saturates, and a saturated index resolves to nothing, which the
-    /// engine treats as the conservative hole it would have had anyway.
-    pub fn compose(&mut self, bound: landav_bound::Bound) -> u32 {
+    /// Saturates rather than fails: more than `u32::MAX` composed sites in one
+    /// function is not a program this crate will meet, and the engine answers
+    /// a dangling index with the hole it would have charged anyway.
+    pub fn compose(&mut self, composed: Composed) -> u32 {
         let index = u32::try_from(self.composed.len()).unwrap_or(u32::MAX);
-        self.composed.push(bound);
+        self.composed.push(composed);
         index
     }
 

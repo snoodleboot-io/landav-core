@@ -63,8 +63,8 @@ use std::{
 use landav_bound::{Origin, Symbol};
 use landav_fdk::{Signature, SignaturePack};
 use landav_its::{
-    ArithOp, CompareOp, CondId, Construct, DeclaredEffect, ExprId, Extent, Locals, RangeSpec,
-    SourceProgramBuilder, StmtId, VarName, Writes,
+    ArithOp, CompareOp, Composed, CondId, Construct, DeclaredEffect, ExprId, Extent, InheritedHole,
+    Locals, RangeSpec, SourceProgramBuilder, StmtId, VarName, Writes,
 };
 use rustpython_parser::ast::{self, Constant, Expr, Ranged, Stmt, text_size::TextRange};
 
@@ -149,6 +149,19 @@ pub enum SiblingCost {
         /// The sibling's parameters, receiver excluded, in order.
         params: Vec<String>,
     },
+    /// A partial bound: exact apart from named regions the sibling could not
+    /// derive, none of which is a call (`LAN-126`). The regions come to the
+    /// caller as inherited holes; the bound mentions their variables beside
+    /// the sibling's parameters.
+    Partial {
+        /// The sibling's derived bound, in its own variables and hole
+        /// variables.
+        bound: landav_bound::Bound,
+        /// The sibling's parameters, receiver excluded, in order.
+        params: Vec<String>,
+        /// The sibling's undischarged regions.
+        holes: Vec<InheritedHole>,
+    },
 }
 
 impl Siblings {
@@ -168,6 +181,25 @@ impl Siblings {
     ) {
         self.costs
             .insert(qualified.into(), SiblingCost::Exact { bound, params });
+    }
+
+    /// Records that the method `qualified` has the partial bound `bound` over
+    /// `params`, apart from `holes`. `LAN-126`.
+    pub fn insert_partial(
+        &mut self,
+        qualified: impl Into<String>,
+        bound: landav_bound::Bound,
+        params: Vec<String>,
+        holes: Vec<InheritedHole>,
+    ) {
+        self.costs.insert(
+            qualified.into(),
+            SiblingCost::Partial {
+                bound,
+                params,
+                holes,
+            },
+        );
     }
 
     /// What `qualified` costs, if it is a composable sibling.
@@ -715,8 +747,8 @@ fn lower_function(
     }
     // In index order, so every `DeclaredCost::Composed(i)` on a node resolves
     // to the bound that was handed index `i`.
-    for bound in std::mem::take(&mut translator.composed) {
-        translator.builder.compose(bound);
+    for composed in std::mem::take(&mut translator.composed) {
+        translator.builder.compose(composed);
     }
     let program = translator.builder.build(body);
 
@@ -2056,7 +2088,7 @@ struct Translator<'a> {
     /// real statement node. A bound pushed into the scratch builder's table
     /// would leave that index dangling, and the engine would charge a hole.
     /// Moved into the real builder once, after the body is translated.
-    composed: Vec<landav_bound::Bound>,
+    composed: Vec<Composed>,
     /// How many collection walks have been lowered, to keep their synthetic
     /// counters apart.
     walks: u32,
@@ -3502,11 +3534,24 @@ impl Translator<'_> {
         match siblings.cost_of(&format!("{class}.{}", method.attr.as_str()))? {
             SiblingCost::Constant(effect) => Some(*effect),
             SiblingCost::Exact { bound, params } => {
-                let composed = self.compose_sibling(call, bound, params)?;
+                let composed = self.compose_sibling(call, bound, params, &[])?;
                 let index = u32::try_from(self.composed.len()).unwrap_or(u32::MAX);
-                self.composed.push(composed);
+                self.composed.push(Composed::new(composed, Vec::new()));
                 // The same answers as a constant sibling: a method call cannot
                 // rebind the caller's locals, and may mutate `self`.
+                Some(DeclaredEffect::composed(index, false, true))
+            }
+            // `LAN-126`: the same, and the sibling's regions come along. They
+            // are minted as this function's own regions by the engine, which
+            // is the one place that hands out hole variables.
+            SiblingCost::Partial {
+                bound,
+                params,
+                holes,
+            } => {
+                let composed = self.compose_sibling(call, bound, params, holes)?;
+                let index = u32::try_from(self.composed.len()).unwrap_or(u32::MAX);
+                self.composed.push(Composed::new(composed, holes.clone()));
                 Some(DeclaredEffect::composed(index, false, true))
             }
         }
@@ -3540,6 +3585,7 @@ impl Translator<'_> {
         call: &ast::ExprCall,
         bound: &landav_bound::Bound,
         params: &[String],
+        holes: &[InheritedHole],
     ) -> Option<landav_bound::Bound> {
         if !call.keywords.is_empty() || call.args.len() != params.len() {
             return None;
@@ -3547,6 +3593,12 @@ impl Translator<'_> {
         let rebound = self.rebound.as_ref()?;
         let mut result = bound.clone();
         for var in bound.vars() {
+            // `LAN-126`: a sibling's hole variable is not a parameter to map.
+            // It stays in the bound for the engine to replace with a fresh
+            // region of this function.
+            if holes.iter().any(|hole| hole.var == *var.symbol()) {
+                continue;
+            }
             let name = var.symbol().as_str();
             let (position, as_length) = match params.iter().position(|p| p == name) {
                 Some(position) => (position, false),
