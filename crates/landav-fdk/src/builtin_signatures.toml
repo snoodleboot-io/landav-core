@@ -991,3 +991,115 @@ cost = "unbounded"
 rebinds_locals = false
 mutates_arguments = true
 why = "A hash lookup on the receiver, and hashing the key is user code. Matched only on a receiver annotated dict."
+
+# ---------------------------------------------------------------------------
+# Callees reached through an imported module name. `LAN-128`.
+#
+# A row keyed `module.attr` matches a call whose receiver the module bound
+# exactly once, by an absolute import, and the function never rebinds -
+# `import os` and `os.getcwd()`, `import os as system` and
+# `system.getcwd()`, `from os import getcwd` and `getcwd()`. A name bound
+# any other way means something else and gets no row. Only callees whose
+# cost does not depend on their input are here; `codecs.charmap_encode`,
+# `re.compile`, `io.BytesIO(data)`, `struct.pack` and `os.stat` are
+# deliberately absent, each for a reason given on LAN-128.
+# ---------------------------------------------------------------------------
+
+[[signature]]
+callee = "codecs.CodecInfo"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = false
+why = """
+A tuple subclass constructed from its arguments: `tuple.__new__` over a fixed
+number of fields plus attribute stores on the result. No argument is walked.
+115 sites in the 3.12 standard library, every `encodings/*` `getregentry`.
+"""
+
+[[signature]]
+callee = "os.getcwd"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = false
+why = """
+One `getcwd(3)` syscall and a decode of a path of bounded length. Takes no
+argument.
+"""
+
+[[signature]]
+callee = "os.getpid"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = false
+why = """
+One `getpid(2)`. Takes no argument.
+"""
+
+[[signature]]
+callee = "os.close"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = false
+why = """
+One `close(2)` on an integer descriptor. The kernel's work behind it is not
+this process's steps.
+"""
+
+[[signature]]
+callee = "threading.Lock"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = false
+why = """
+Allocates one lock object. Acquiring it later is a different call with a
+different answer; constructing it is constant.
+"""
+
+[[signature]]
+callee = "threading.RLock"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = false
+why = """
+As `threading.Lock`: one object, no argument walked.
+"""
+
+[[signature]]
+callee = "time.time"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = false
+why = """
+One clock read. Takes no argument.
+"""
+
+[[signature]]
+callee = "time.monotonic"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = false
+why = """
+One clock read. Takes no argument.
+"""
+
+[[signature]]
+callee = "time.perf_counter"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = false
+why = """
+One clock read. Takes no argument.
+"""
+
+[[signature]]
+callee = "warnings.warn"
+cost = "constant"
+rebinds_locals = false
+mutates_arguments = false
+why = """
+Formats its message (already a value; a format over names is constant per
+LAN-115), walks the process's warning filters - a list bounded by what was
+registered, not by any argument - and records or prints. The `stacklevel`
+frame walk is bounded by the stack depth at the call, which is not a function
+of the call's arguments. Nothing it does is proportional to an input.
+"""
