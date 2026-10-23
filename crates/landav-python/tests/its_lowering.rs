@@ -370,12 +370,15 @@ fn python_constructs_outside_the_fragment_refuse_by_name() {
         // `a_ternary_over_integral_arms_is_inside_the_fragment` below.
         //
         // A ternary in *value* position whose arms are not integral still
-        // refuses, and so does a boolean or comparison used as a value - see the
-        // `n in [1]` row further down.
+        // refuses. A comparison bound to a name is a different story since
+        // `LAN-117`: the comparison costs its operands and is not a region, and
+        // what refuses is the *binding* - `x` is a name this transition system
+        // cannot hold, declared as bounded work that rebinds it, which this
+        // lowering refuses under the binding's own name.
         (
             "x = (n > 1)",
-            Construct::ConditionalExpression,
-            "a comparison as a value",
+            Construct::NonIntegerValue,
+            "a comparison bound to a name",
         ),
         // `for q in [1, 2]` is deliberately absent: a list display has a
         // statically known length, so `LAN-91` counts the walk exactly and the
@@ -438,14 +441,14 @@ fn python_constructs_outside_the_fragment_refuse_by_name() {
             Construct::NonIntegerValue,
             "a string bound to a name",
         ),
-        // Position matters, and both positions must refuse. In a *value*
-        // position the comparison itself is out of the fragment, so it refuses
-        // as a comparison-as-value before `in` is ever reached; in a condition
-        // position `in` is what is refused.
+        // Both positions must refuse, and since `LAN-117` both refuse under
+        // the operator's own name: `in` runs `__contains__` wherever it is
+        // written, so a membership bound to a name is a `collection` region
+        // exactly as it is in a condition, never a comparison-as-value.
         (
             "x = (n in [1])",
-            Construct::ConditionalExpression,
-            "membership as a value",
+            Construct::Collection,
+            "membership bound to a name",
         ),
         (
             "if n in [1]:\n        pass",

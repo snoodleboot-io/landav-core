@@ -228,7 +228,17 @@ impl<'a> Lowering<'a> {
             // is a bound this transition system cannot express, so here it
             // refuses exactly as an undeclared call does. The native engine
             // charges it; this lowering's reach does not grow.
-            if node.declared().is_some_and(|effect| !effect.is_composed()) {
+            // A declaration that *rebinds locals* (`LAN-117`) refuses too. The
+            // transition it would emit carries `Update::identity()`, which
+            // keeps every variable - a collection's length among them - at its
+            // old value; `items = []` followed by a loop over `items` would
+            // then be counted on the length `items` had on entry. The native
+            // engine forgets exactly what the node says it rebinds; this
+            // lowering has no update meaning "anything", so it refuses.
+            if node
+                .declared()
+                .is_some_and(|effect| !effect.is_composed() && !effect.rebinds_locals())
+            {
                 continue;
             }
             self.refuse(

@@ -577,6 +577,37 @@ impl SourceProgramBuilder {
         )
     }
 
+    /// [`SourceProgramBuilder::declared_stmt`], saying which locals the
+    /// statement rebinds.
+    ///
+    /// `LAN-117`. `declared.rebinds_locals()` on its own means "some locals,
+    /// unstated", and a consumer has to read that as *any* - the conservative
+    /// answer, and the one that costs a loop three lines below its trip count.
+    /// `writes` narrows it: `total = <a value this fragment cannot hold>`
+    /// rebinds `total` and nothing else, so the statement is bounded work that
+    /// forgets one name. See [`Writes`] for what a frontend may claim and what
+    /// it owes for the claim.
+    pub fn declared_stmt_writing(
+        &mut self,
+        construct: Construct,
+        detail: Option<Symbol>,
+        extent: Extent,
+        declared: DeclaredEffect,
+        writes: Writes,
+        origin: Origin,
+    ) -> StmtId {
+        self.push_stmt(
+            SourceStmt::Unsupported {
+                construct,
+                detail,
+                extent,
+                declared: Some(declared),
+                writes,
+            },
+            origin,
+        )
+    }
+
     /// Records that this program is incomplete for a reason the builder could
     /// not see.
     ///

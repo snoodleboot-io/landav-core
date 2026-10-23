@@ -1205,7 +1205,14 @@ fn rebound(
     writes: &Writes,
 ) -> Option<BTreeSet<VarName>> {
     match declared {
-        Some(effect) if effect.rebinds_locals() => None,
+        // `LAN-117`: a declaration that rebinds locals says which when it can.
+        // One that stated nothing is read as *any*, whatever its kind answers
+        // - a frontend declaring a rebinding owes the names, and silence is
+        // not a narrower claim.
+        Some(effect) if effect.rebinds_locals() => match writes.locals() {
+            landav_its::Locals::Unstated => None,
+            _ => writes.rebound(construct).cloned(),
+        },
         Some(_) => Some(BTreeSet::new()),
         None => writes.rebound(construct).cloned(),
     }
