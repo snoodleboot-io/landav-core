@@ -310,6 +310,18 @@ fn read(path: &Path) -> Result<RunView, ToolError> {
     Ok(run)
 }
 
+/// One line about a run on disk, for `landav bench run` to say what it wrote.
+pub fn summary_of(path: &Path) -> Result<String, ToolError> {
+    let run = read(path)?;
+    let picture = Picture::of(&run.functions);
+    Ok(format!(
+        "{} functions, {} exact, {} holes",
+        thousands(picture.functions),
+        thousands(picture.kind("exact")),
+        thousands(picture.holes)
+    ))
+}
+
 /// `landav report RUN`.
 pub fn report(run: &Path, json: bool) -> Outcome {
     let run = match read(run) {
