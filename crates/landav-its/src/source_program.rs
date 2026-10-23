@@ -52,7 +52,7 @@ pub struct SourceProgram {
     pub(crate) read_lengths: BTreeSet<VarName>,
     /// Bounds a declared node may carry by index. `LAN-116`; see
     /// [`crate::DeclaredCost::Composed`].
-    pub(crate) composed: Vec<landav_bound::Bound>,
+    pub(crate) composed: Vec<Composed>,
 }
 
 impl SourceProgram {
@@ -77,9 +77,10 @@ impl SourceProgram {
         &self.params
     }
 
-    /// The composed bound at `index`, if a declared node carries one. `LAN-116`.
+    /// The composed cost at `index`, if a declared node carries one. `LAN-116`,
+    /// `LAN-126`.
     #[must_use]
-    pub fn composed(&self, index: u32) -> Option<&landav_bound::Bound> {
+    pub fn composed(&self, index: u32) -> Option<&Composed> {
         self.composed.get(usize::try_from(index).ok()?)
     }
 
@@ -450,4 +451,56 @@ fn narrow(index: usize) -> u32 {
 /// is out of bounds, which every accessor here already reports as `None`.
 fn index_of(id: u32) -> usize {
     usize::try_from(id).unwrap_or(usize::MAX)
+}
+
+/// A callee's cost, composed into this program's variables. `LAN-116`,
+/// `LAN-126`.
+///
+/// The bound is already in *this* program's variables - the frontend
+/// substituted the callee's parameters by the call's arguments - and may still
+/// mention the callee's own hole variables. Each of those is an
+/// [`InheritedHole`]: a region the callee could not derive, which the engine
+/// mints as a fresh region of this program, attributed to the callee's origin,
+/// when it charges the node. A composed cost with no holes is exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Composed {
+    bound: landav_bound::Bound,
+    holes: Vec<InheritedHole>,
+}
+
+impl Composed {
+    /// A composed cost, exact when `holes` is empty.
+    #[must_use]
+    pub fn new(bound: landav_bound::Bound, holes: Vec<InheritedHole>) -> Self {
+        Self { bound, holes }
+    }
+
+    /// The bound, in this program's variables, mentioning each hole's variable.
+    #[must_use]
+    pub const fn bound(&self) -> &landav_bound::Bound {
+        &self.bound
+    }
+
+    /// The callee's regions this program inherits.
+    #[must_use]
+    pub fn holes(&self) -> &[InheritedHole] {
+        &self.holes
+    }
+}
+
+/// A region a callee could not derive, as its caller inherits it.
+///
+/// The variable is the callee's own hole variable as it appears in the
+/// composed bound; the engine replaces it with a fresh one of the caller's,
+/// so two calls to the same callee are two regions. The construct and origin
+/// are the callee's, which is the point: the caller's one opaque `call`
+/// becomes "the attribute read at `helper.py:12`", one level deeper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InheritedHole {
+    /// The callee's hole variable, as the composed bound mentions it.
+    pub var: landav_bound::Symbol,
+    /// What the callee's region was.
+    pub construct: &'static str,
+    /// Where it is, in the callee.
+    pub origin: landav_bound::Origin,
 }

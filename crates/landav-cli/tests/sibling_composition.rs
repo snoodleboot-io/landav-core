@@ -382,3 +382,207 @@ fn a_method_overridden_in_the_module_is_not_composed() -> io::Result<()> {
     );
     Ok(())
 }
+
+/// Phase 3 (`LAN-126`): a partial sibling composes by inheriting its holes.
+const PHASE_3: &str = "\
+class W:
+    def helper(self, items: list) -> int:
+        total = 0
+        for x in items:
+            total = total + x.weight
+        return total
+
+    def run(self, items: list, n: int) -> int:
+        for i in range(n):
+            self.helper(items)
+        return 1
+
+    def twice(self, items: list) -> int:
+        self.helper(items)
+        self.helper(items)
+        return 1
+
+    def calls_out(self, items: list) -> int:
+        f(items)
+        return self.helper(items)
+
+    def uses_calls_out(self, items: list) -> int:
+        self.calls_out(items)
+        return 1
+
+    def leaf(self, obj) -> int:
+        return obj.size
+
+    def middle(self, obj) -> int:
+        self.leaf(obj)
+        return 1
+
+    def top(self, obj) -> int:
+        self.middle(obj)
+        return 1
+";
+
+fn hole_constructs(f: &Value) -> Vec<String> {
+    f["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["construct"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn hole_origins(f: &Value) -> Vec<String> {
+    f["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["origin"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// **A partial sibling's regions become the caller's, attributed to the
+/// sibling's lines, under the loop that calls it.**
+#[test]
+fn a_partial_sibling_composes_and_its_holes_are_inherited() -> io::Result<()> {
+    let project = Project::new()?;
+    let source = project.write("w.py", PHASE_3)?;
+    let fs = functions(&project.check(&source, &["--json"])?);
+    let f = named(&fs, "W.run");
+    assert_eq!(f["bound_kind"], "partial", "{f}");
+    let b = f["bound"].as_str().unwrap();
+    assert!(
+        b.contains("len(items)") && b.contains('n'),
+        "the sibling's length term under the caller's loop: {f}"
+    );
+    let constructs = hole_constructs(f);
+    assert_eq!(
+        constructs.len(),
+        2,
+        "exactly the sibling's two regions, no `call`: {f}"
+    );
+    assert!(!constructs.contains(&"call".to_owned()), "{f}");
+    assert!(constructs.contains(&"attribute".to_owned()), "{f}");
+    assert!(
+        hole_origins(f).iter().all(|o| o.contains("w.py:5:")),
+        "every inherited hole points at the sibling's line, not the call: {f}"
+    );
+    assert!(has_sibling_premise(f, "W.helper"), "{f}");
+    Ok(())
+}
+
+/// **Two calls are two sets of regions, and no variable is shared or lost.**
+///
+/// The second half is the capture bug: the sibling's `#hole0`/`#hole1` and
+/// the caller's fresh `#hole1`/`#hole2` share a namespace, and a sequential
+/// rename turned one into the other. The bound's variables must be exactly the
+/// holes' variables, each once.
+#[test]
+fn inherited_holes_are_fresh_per_call_and_never_captured() -> io::Result<()> {
+    let project = Project::new()?;
+    let source = project.write("w.py", PHASE_3)?;
+    let fs = functions(&project.check(&source, &["--json"])?);
+    for (name, expected_holes) in [("W.twice", 4), ("W.calls_out", 3)] {
+        let f = named(&fs, name);
+        let holes: Vec<String> = f["holes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["variable"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(holes.len(), expected_holes, "{name}: {f}");
+        let bound = f["bound"].as_str().unwrap();
+        for hole in &holes {
+            assert_eq!(
+                bound.matches(hole.as_str()).count(),
+                1,
+                "{name}: `{hole}` must appear in the bound exactly once, got {bound}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// **A sibling that still calls something is not composed - the cycle rule -
+/// and a chain of partial siblings resolves through the fixed point.**
+#[test]
+fn a_sibling_with_a_call_hole_waits_and_a_partial_chain_resolves() -> io::Result<()> {
+    let project = Project::new()?;
+    let source = project.write("w.py", PHASE_3)?;
+    let fs = functions(&project.check(&source, &["--json"])?);
+    let waits = named(&fs, "W.uses_calls_out");
+    assert_eq!(
+        hole_constructs(waits),
+        vec!["call"],
+        "`calls_out` still calls `f`: {waits}"
+    );
+    assert!(!has_sibling_premise(waits, "W.calls_out"), "{waits}");
+    // leaf (attribute hole) -> middle -> top: two rounds of the fixed point.
+    let top = named(&fs, "W.top");
+    assert_eq!(hole_constructs(top), vec!["attribute"], "{top}");
+    assert!(
+        hole_origins(top)[0].contains("w.py:27:"),
+        "attributed to `leaf`'s line: {top}"
+    );
+    assert!(has_sibling_premise(top, "W.middle"), "{top}");
+    Ok(())
+}
+
+/// **Only the last definition of a method is a sibling.**
+///
+/// Python binds the last `def`. An `@overload` stub above it has the body
+/// `...` - exact, free - and until `LAN-126`'s measurement the table took the
+/// first exact definition it met, so every caller of the real method composed
+/// the stub's nothing. `getfailedcollections` in `_pytest` reported exact
+/// where its callee runs a comprehension. Here: a composable last definition
+/// composes, and a last definition with a call in it leaves the caller its
+/// hole - never the stub's zero.
+#[test]
+fn only_the_last_definition_of_a_method_is_composed() -> io::Result<()> {
+    let project = Project::new()?;
+    let source = project.write(
+        "w.py",
+        "\
+class W:
+    def helper(self, x: int) -> int: ...
+
+    def helper(self, x: str) -> int: ...
+
+    def helper(self, x, n: int) -> int:
+        for i in range(n):
+            pass
+        return 1
+
+    def uses(self, n: int) -> int:
+        self.helper(1, n)
+        return 1
+
+    def opaque(self) -> int: ...
+
+    def opaque(self, y) -> int:
+        f(y)
+        return 1
+
+    def uses_opaque(self) -> int:
+        self.opaque(1)
+        return 1
+",
+    )?;
+    let fs = functions(&project.check(&source, &["--json"])?);
+    let uses = named(&fs, "W.uses");
+    assert!(
+        is_complete(uses),
+        "the real `helper` is a counted loop, composable: {uses}"
+    );
+    assert!(
+        uses["bound"].as_str().unwrap().contains('n'),
+        "the real definition's loop, not the stub's nothing: {uses}"
+    );
+    let opaque = named(&fs, "W.uses_opaque");
+    assert_eq!(
+        hole_constructs(opaque),
+        vec!["call"],
+        "the stub must not stand in for a real `opaque` that calls `f`: {opaque}"
+    );
+    assert!(!has_sibling_premise(opaque, "W.opaque"), "{opaque}");
+    Ok(())
+}

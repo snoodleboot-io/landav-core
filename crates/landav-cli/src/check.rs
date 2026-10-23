@@ -917,14 +917,26 @@ where
     let mut siblings = landav_python::Siblings::default();
     let mut functions = lower(None)?;
     for _ in 0..SIBLING_ROUNDS {
-        // Compared whole, not by length: a key is only ever inserted once its
-        // bound is exact, and an exact bound does not change in later rounds,
-        // so equality is the fixed point and length would be too.
-        let before = siblings.clone();
-        for function in &functions {
+        // The table is rebuilt from the current bounds each round rather than
+        // accumulated, and only the **last** definition of a `Class.method`
+        // is read. Python binds the last `def`; an `@overload` stub above it
+        // has the body `...`, which is exact and costs nothing, and an
+        // accumulating table that took the first exact definition composed
+        // that nothing into every caller of the real method - a confidently
+        // wrong constant, found by `LAN-126`'s measurement on `_pytest`. The
+        // last definition is the one the call reaches, and if it is not
+        // composable nothing stands in for it.
+        let last_definition: std::collections::BTreeMap<&str, usize> = functions
+            .iter()
+            .enumerate()
+            .filter(|(_, function)| function.class().is_some())
+            .map(|(index, function)| (function.name(), index))
+            .collect();
+        let mut next = landav_python::Siblings::default();
+        for (index, function) in functions.iter().enumerate() {
             // Module-level functions are not siblings of anything; only a
             // method, keyed by the `Class.method` name LAN-104 lowers it under.
-            if function.class().is_none() {
+            if function.class().is_none() || last_definition.get(function.name()) != Some(&index) {
                 continue;
             }
             // `LAN-116`: a method a subclass in this module redefines is never
@@ -933,16 +945,37 @@ where
             if function.overridden_in_module() {
                 continue;
             }
-            let landav_engine::TripCount::Exact(bound) = landav_engine::cost(function.program())
-            else {
-                continue;
+            let bound = match landav_engine::cost(function.program()) {
+                landav_engine::TripCount::Exact(bound) => bound,
+                // `LAN-126`: a partial sibling composes too, carrying its
+                // regions to the caller - unless one of them is a call. A
+                // method that still calls something waits until that call is
+                // composed away or stays out; that is what keeps `a <-> b`
+                // from entering the table and growing a constant per round.
+                landav_engine::TripCount::Partial { bound, holes, .. }
+                    if !holes.is_empty() && holes.iter().all(|hole| hole.construct() != "call") =>
+                {
+                    let params: Vec<String> =
+                        function.parameters().iter().skip(1).cloned().collect();
+                    let inherited = holes
+                        .iter()
+                        .map(|hole| landav_its::InheritedHole {
+                            var: hole.var().symbol().clone(),
+                            construct: hole.construct(),
+                            origin: hole.origin().clone(),
+                        })
+                        .collect();
+                    next.insert_partial(function.name().to_owned(), bound, params, inherited);
+                    continue;
+                }
+                _ => continue,
             };
             if !bound.vars().is_empty() {
                 // `LAN-116`: an exact, non-constant bound composes at the call
                 // site by substitution. The sibling's parameters, receiver
                 // excluded, are what positional arguments are mapped onto.
                 let params: Vec<String> = function.parameters().iter().skip(1).cloned().collect();
-                siblings.insert_bound(function.name().to_owned(), bound.clone(), params);
+                next.insert_bound(function.name().to_owned(), bound.clone(), params);
                 continue;
             }
             // A var-free bound evaluates the same under any valuation.
@@ -959,14 +992,19 @@ where
             // a callee no access to the caller's frame - but it may mutate
             // `self`, so the conservative `mutates_arguments` is kept, exactly
             // as every admitted pack row keeps it.
-            siblings.insert(
+            next.insert(
                 function.name().to_owned(),
                 landav_its::DeclaredEffect::new(steps, false, true),
             );
         }
-        if siblings == before {
+        // Equality of the whole table is the fixed point: an exact entry does
+        // not change in later rounds, a partial one (`LAN-126`) may as *its*
+        // siblings compose into it, and a rebuilt table that matches the last
+        // one has nothing left to resolve.
+        if next == siblings {
             break;
         }
+        siblings = next;
         functions = lower(Some(&siblings))?;
     }
     Ok((functions, siblings))
