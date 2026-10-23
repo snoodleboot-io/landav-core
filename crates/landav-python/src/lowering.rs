@@ -2076,8 +2076,12 @@ impl Translator<'_> {
             .into_iter()
             .flatten()
         {
+            // Translated with the value discarded (`LAN-118`): what is raised
+            // goes to no name this fragment reads, so `raise exc` with a local
+            // `exc` is the step and `raise ValueError(explain(n))` is the step
+            // plus the call, named where it stands.
             if !is_name_lookup(expression) {
-                statements.extend(self.refusals_of(expression));
+                statements.extend(self.discarded_cost_of(expression));
             }
         }
         let origin = self.origin(node);
@@ -2217,14 +2221,19 @@ impl Translator<'_> {
     }
 
     fn assign(&mut self, assign: &ast::StmtAssign) -> Vec<StmtId> {
+        // `LAN-118`: a value stored through a target this fragment cannot bind
+        // is read by nothing here - the store is the region, and the store's
+        // `Writes` say what it reaches - so the value is translated for its
+        // cost alone, as a `return`'s is. `self.items = items` is one hole,
+        // named for the store, and not a second one for reading `items`.
         let [target] = assign.targets.as_slice() else {
             // `a = b = 0` binds two names; the fragment's assignment binds one.
-            let mut statements = self.refusals_of(&assign.value);
+            let mut statements = self.discarded_cost_of(&assign.value);
             statements.push(self.refuse_targets(assign, assign.targets.iter()));
             return statements;
         };
         let Expr::Name(name) = target else {
-            let mut statements = self.refusals_of(&assign.value);
+            let mut statements = self.discarded_cost_of(&assign.value);
             statements.push(self.refuse_targets(assign, [target]));
             return statements;
         };
@@ -2328,7 +2337,9 @@ impl Translator<'_> {
 
     fn aug_assign(&mut self, assign: &ast::StmtAugAssign) -> Vec<StmtId> {
         let Expr::Name(name) = assign.target.as_ref() else {
-            let mut statements = self.refusals_of(&assign.value);
+            // The store runs `__iadd__` on whatever the target holds and is the
+            // region; the value is read by nothing here (`LAN-118`).
+            let mut statements = self.discarded_cost_of(&assign.value);
             statements.push(self.refuse_targets(assign, [assign.target.as_ref()]));
             return statements;
         };
@@ -2379,18 +2390,16 @@ impl Translator<'_> {
             return Vec::new();
         };
         let Expr::Name(name) = assign.target.as_ref() else {
-            let mut statements = self.refusals_of(value);
+            let mut statements = self.discarded_cost_of(value);
             statements.push(self.refuse_targets(assign, [assign.target.as_ref()]));
             return statements;
         };
+        // `x: str = v` binds a name this fragment cannot hold, exactly as an
+        // unannotated `x = v` to a non-integer does; `LAN-118` gives it the
+        // same answer (`LAN-117`'s `declare_binding`): the value's cost, one
+        // step, and the name forgotten.
         if !annotation_is_int(Some(&assign.annotation)) {
-            let mut statements = self.refusals_of(value);
-            statements.push(self.refuse_named_binding(
-                Construct::NonIntegerValue,
-                name.id.as_str(),
-                assign,
-            ));
-            return statements;
+            return self.declare_binding(name.id.as_str(), assign.target.as_ref(), value);
         }
         self.bind_expression(name.id.as_str(), assign.target.as_ref(), value, assign, 0)
     }
@@ -2398,7 +2407,7 @@ impl Translator<'_> {
     /// Emits `name = value`.
     ///
     /// The caller has already established that `name` is a proven integer;
-    /// [`Translator::refuse_binding`] is the path for when it has not.
+    /// [`Translator::declare_binding`] is the path for when it has not.
     fn bind<T: Ranged>(&mut self, name: &str, value: ExprId, node: &T) -> Vec<StmtId> {
         let origin = self.origin(node);
         vec![self.builder.assign(VarName::new(name), value, origin)]
@@ -4457,6 +4466,24 @@ fn format_is_constant(expr: &Expr) -> bool {
     }
 }
 
+/// Whether `expr` is a leaf whose evaluation is one step and whose value this
+/// fragment cannot hold: a name outside `candidates`, or a constant that is
+/// neither an integer nor a boolean. `LAN-118`.
+///
+/// The free-function twin of `Translator::cost_only_leaf`, for the traversal:
+/// a parent that is itself the region - a display, an f-string, a ternary arm
+/// under a discarded value - has no use for such a child, and yielding it only
+/// produces a `non-integer-value` refusal for a construct that is not the
+/// obstacle. An integer name is *not* a cost-only leaf here, for the same
+/// reason as there: translated, it is a variable the parent may reference.
+fn is_cost_only_leaf(expr: &Expr, candidates: &BTreeSet<String>) -> bool {
+    match expr {
+        Expr::Name(name) => !candidates.contains(name.id.as_str()),
+        Expr::Constant(constant) => !matches!(constant.value, Constant::Int(_) | Constant::Bool(_)),
+        _ => false,
+    }
+}
+
 fn costs_nothing(expr: &Expr) -> bool {
     let mut work = vec![expr];
     while let Some(node) = work.pop() {
@@ -4532,11 +4559,19 @@ fn translated_children<'e>(
     if value_discarded {
         let operands: Option<Vec<&'e Expr>> = match expr {
             Expr::BoolOp(boolean) => Some(boolean.values.iter().collect()),
-            Expr::IfExp(ternary) => Some(vec![
-                ternary.test.as_ref(),
-                ternary.body.as_ref(),
-                ternary.orelse.as_ref(),
-            ]),
+            // The arms are value-only (`LAN-118`): a bare name or a non-integer
+            // constant in one is a step the enclosing statement already pays,
+            // so it is not yielded and never refused. The test is an operand -
+            // `x if cond else y` reads `cond`'s truth - and is always yielded.
+            Expr::IfExp(ternary) => Some(
+                core::iter::once(ternary.test.as_ref())
+                    .chain(
+                        [ternary.body.as_ref(), ternary.orelse.as_ref()]
+                            .into_iter()
+                            .filter(|arm| !is_cost_only_leaf(arm, candidates)),
+                    )
+                    .collect(),
+            ),
             Expr::Compare(comparison) if membership_or_identity(comparison).is_none() => Some(
                 core::iter::once(comparison.left.as_ref())
                     .chain(comparison.comparators.iter())
@@ -4566,6 +4601,16 @@ fn translated_children<'e>(
     // complete bound for a function that calls something. Of the 23 stdlib
     // functions blocked solely by `collection`, 22 hide a call, an attribute or
     // a subscript inside the display.
+    //
+    // An element that is a bare name this fragment cannot hold, or a constant
+    // that is neither an integer nor a boolean, is not yielded (`LAN-118`). The display is the
+    // consumer of its value and the display is free here; the element costs
+    // nothing of its own; and yielding it only to refuse it as
+    // `non-integer-value` named a construct that was never the obstacle. On
+    // the standard library that was 1,938 holes on `return (x, y)` and its
+    // kin, and 291 on `f"{x}"`. An element with an interior - a call, an
+    // attribute, an operator - is yielded as before, so `(f(n), x)` still
+    // names `f`.
     if discarding {
         let elements: Option<Vec<&'e Expr>> = match expr {
             Expr::List(list) => Some(list.elts.iter().collect()),
@@ -4587,7 +4632,10 @@ fn translated_children<'e>(
             _ => None,
         };
         if let Some(elements) = elements {
-            return elements;
+            return elements
+                .into_iter()
+                .filter(|element| !is_cost_only_leaf(element, candidates))
+                .collect();
         }
     }
     match expr {
