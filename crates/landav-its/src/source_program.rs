@@ -50,6 +50,9 @@ pub struct SourceProgram {
     pub(crate) volatile: BTreeSet<VarName>,
     pub(crate) protocol_lengths: BTreeSet<VarName>,
     pub(crate) read_lengths: BTreeSet<VarName>,
+    /// Bounds a declared node may carry by index. `LAN-116`; see
+    /// [`crate::DeclaredCost::Composed`].
+    pub(crate) composed: Vec<landav_bound::Bound>,
 }
 
 impl SourceProgram {
@@ -72,6 +75,12 @@ impl SourceProgram {
     #[must_use]
     pub fn params(&self) -> &[VarName] {
         &self.params
+    }
+
+    /// The composed bound at `index`, if a declared node carries one. `LAN-116`.
+    #[must_use]
+    pub fn composed(&self, index: u32) -> Option<&landav_bound::Bound> {
+        self.composed.get(usize::try_from(index).ok()?)
     }
 
     /// The top-level statements of the function body, in source order.

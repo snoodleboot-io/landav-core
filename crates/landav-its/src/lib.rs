@@ -313,7 +313,7 @@ pub use crate::{
     cost::Cost,
     cost_effect::CostEffect,
     coverage::Coverage,
-    declared_effect::DeclaredEffect,
+    declared_effect::{DeclaredCost, DeclaredEffect},
     expr_id::ExprId,
     extent::Extent,
     guard::Guard,

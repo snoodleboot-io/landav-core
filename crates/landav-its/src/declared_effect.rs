@@ -48,9 +48,40 @@
 /// declaration is only ever worth making because it says something narrower.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeclaredEffect {
-    steps: u32,
+    cost: DeclaredCost,
     rebinds_locals: bool,
     mutates_arguments: bool,
+}
+
+/// What a declared node costs. `LAN-116`.
+///
+/// # Why an index and not a bound
+///
+/// A constant is the common case and is `Copy`, which this type and every
+/// node carrying it rely on - thirteen sites read a declaration by value. A
+/// *composed* cost is a whole polynomial in the caller's variables, which is
+/// neither `Copy` nor small, so it lives in a side table on the
+/// [`crate::SourceProgram`] and the node carries its index. The engine looks
+/// it up at the one place it charges a declaration; nothing else needs to.
+///
+/// # What `Composed` means to the two consumers
+///
+/// `landav-engine` charges the bound exactly as it charges a constant. The
+/// integer-transition-system lowering in this crate does **not**: a bound may
+/// hold `max`, `log` or `omega`, none of which an ITS transition cost can
+/// express, so a composed node is a *refusal* there - the native engine
+/// composes, the ITS reach is unchanged, and a function that composed is
+/// reported through `derived::cost_of`'s "refused but every refusal was in
+/// front of the engine" rule. Expressing the polynomial subset in the ITS is
+/// a separate change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeclaredCost {
+    /// This many source steps, beyond the statement holding the node.
+    Steps(u32),
+    /// The bound at this index of [`crate::SourceProgram::composed`] - a
+    /// sibling method's own derived bound, substituted into the caller's
+    /// variables.
+    Composed(u32),
 }
 
 impl DeclaredEffect {
@@ -58,10 +89,33 @@ impl DeclaredEffect {
     #[must_use]
     pub const fn new(steps: u32, rebinds_locals: bool, mutates_arguments: bool) -> Self {
         Self {
-            steps,
+            cost: DeclaredCost::Steps(steps),
             rebinds_locals,
             mutates_arguments,
         }
+    }
+
+    /// A node whose cost is the composed bound at `index` of the program's
+    /// side table. `LAN-116`; see [`DeclaredCost::Composed`].
+    #[must_use]
+    pub const fn composed(index: u32, rebinds_locals: bool, mutates_arguments: bool) -> Self {
+        Self {
+            cost: DeclaredCost::Composed(index),
+            rebinds_locals,
+            mutates_arguments,
+        }
+    }
+
+    /// What this node costs.
+    #[must_use]
+    pub const fn cost(self) -> DeclaredCost {
+        self.cost
+    }
+
+    /// Whether the cost is a composed bound rather than a constant.
+    #[must_use]
+    pub const fn is_composed(self) -> bool {
+        matches!(self.cost, DeclaredCost::Composed(_))
     }
 
     /// How many source steps this node costs **beyond** the statement it stands
@@ -74,9 +128,15 @@ impl DeclaredEffect {
     /// `isinstance(x, int)` line still costs one step, because it is one
     /// statement; what is declared here is that the callee adds nothing to it
     /// that grows with anything.
+    ///
+    /// `None` for a composed cost, which is not a number of steps at all; see
+    /// [`DeclaredCost`].
     #[must_use]
-    pub const fn steps(self) -> u32 {
-        self.steps
+    pub const fn steps(self) -> Option<u32> {
+        match self.cost {
+            DeclaredCost::Steps(steps) => Some(steps),
+            DeclaredCost::Composed(_) => None,
+        }
     }
 
     /// Whether evaluating this node can change what a **local name** of the

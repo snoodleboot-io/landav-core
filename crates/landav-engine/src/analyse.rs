@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 use landav_bound::{Bound, Origin, VarId};
 use landav_its::{
-    CondId, Construct, CostEffect, DeclaredEffect, ExprId, Extent, NodeId, RangeSpec, SourceCond,
-    SourceExpr, SourceProgram, SourceStmt, StmtId, VarName, Writes,
+    CondId, Construct, CostEffect, DeclaredCost, DeclaredEffect, ExprId, Extent, NodeId, RangeSpec,
+    SourceCond, SourceExpr, SourceProgram, SourceStmt, StmtId, VarName, Writes,
 };
 
 use crate::{expr_bound, hole::Hole, summation, trip_count::TripCount};
@@ -730,7 +730,19 @@ impl<'a> Walk<'a> {
             // of a region, never an edge out of one, and a frontend wanting to
             // declare an early exit would be declaring something this type
             // cannot express.
-            return TripCount::Exact(Bound::constant(u64::from(effect.steps())));
+            match effect.cost() {
+                DeclaredCost::Steps(steps) => {
+                    return TripCount::Exact(Bound::constant(u64::from(steps)));
+                }
+                // `LAN-116`: a sibling method's bound, already in this
+                // function's variables. A dangling index is a frontend bug;
+                // it falls through to the hole rather than inventing a cost.
+                DeclaredCost::Composed(index) => {
+                    if let Some(bound) = self.program.composed(index) {
+                        return TripCount::Exact(bound.clone());
+                    }
+                }
+            }
         }
         let hole = self.holes.next(construct.tag(), origin);
         let charged = TripCount::opaque(hole);

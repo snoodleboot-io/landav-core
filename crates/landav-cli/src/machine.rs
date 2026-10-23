@@ -314,7 +314,7 @@ fn sibling_premises(
             continue;
         };
         let qualified = format!("{class}.{method}");
-        if siblings.effect_of(&qualified).is_some() {
+        if siblings.cost_of(&qualified).is_some() {
             resting.insert(qualified);
         }
     }

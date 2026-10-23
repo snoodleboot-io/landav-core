@@ -121,32 +121,102 @@ pub fn lower_module(path: &Path, source: &str) -> Result<Vec<LoweredFunction>, P
 /// round. No cycle detection, because there is nothing to detect.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Siblings {
-    effects: BTreeMap<String, DeclaredEffect>,
+    costs: BTreeMap<String, SiblingCost>,
+}
+
+/// What a sibling method costs, as far as its caller can use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiblingCost {
+    /// A constant: declared at the call site as that many steps (`LAN-113`).
+    Constant(DeclaredEffect),
+    /// An exact, non-constant bound over the sibling's own parameters
+    /// (`LAN-116`). `params` are the sibling's parameters as written,
+    /// receiver excluded, so a call's positional arguments can be mapped onto
+    /// the bound's variables by position.
+    Exact {
+        /// The sibling's derived bound, in its own variables.
+        bound: landav_bound::Bound,
+        /// The sibling's parameters, receiver excluded, in order.
+        params: Vec<String>,
+    },
 }
 
 impl Siblings {
     /// Records that the method `qualified` (`Class.method`) costs `effect`.
     pub fn insert(&mut self, qualified: impl Into<String>, effect: DeclaredEffect) {
-        self.effects.insert(qualified.into(), effect);
+        self.costs
+            .insert(qualified.into(), SiblingCost::Constant(effect));
     }
 
-    /// The declared effect of `qualified`, if it is a constant-cost sibling.
+    /// Records that the method `qualified` has the exact bound `bound` over
+    /// `params`. `LAN-116`.
+    pub fn insert_bound(
+        &mut self,
+        qualified: impl Into<String>,
+        bound: landav_bound::Bound,
+        params: Vec<String>,
+    ) {
+        self.costs
+            .insert(qualified.into(), SiblingCost::Exact { bound, params });
+    }
+
+    /// What `qualified` costs, if it is a composable sibling.
     #[must_use]
-    pub fn effect_of(&self, qualified: &str) -> Option<DeclaredEffect> {
-        self.effects.get(qualified).copied()
+    pub fn cost_of(&self, qualified: &str) -> Option<&SiblingCost> {
+        self.costs.get(qualified)
     }
 
     /// Whether any sibling is recorded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.effects.is_empty()
+        self.costs.is_empty()
     }
 
     /// How many siblings are recorded.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.effects.len()
+        self.costs.len()
     }
+}
+
+/// Every `Class.method` that some other class in `statements` subclasses and
+/// redefines. `LAN-116`.
+///
+/// The override decision: a method a subclass in this module replaces is never
+/// composed at a call site, because `self.m()` may reach the override and a
+/// composed bound would then be a confidently wrong *shape*, not merely a
+/// wrong constant. Only direct bases spelled as a bare name are seen; an
+/// override in another module cannot be, and the `same-class-method` premise
+/// is what still says so for those.
+fn overridden_in_module<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> BTreeSet<String> {
+    let mut overridden = BTreeSet::new();
+    for statement in statements {
+        let Stmt::ClassDef(class) = statement else {
+            continue;
+        };
+        let bases: Vec<&str> = class
+            .bases
+            .iter()
+            .filter_map(|base| match base {
+                Expr::Name(name) => Some(name.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        if bases.is_empty() {
+            continue;
+        }
+        for member in &class.body {
+            let method = match member {
+                Stmt::FunctionDef(def) => def.name.as_str(),
+                Stmt::AsyncFunctionDef(def) => def.name.as_str(),
+                _ => continue,
+            };
+            for base in &bases {
+                overridden.insert(format!("{base}.{method}"));
+            }
+        }
+    }
+    overridden
 }
 
 /// [`lower_module`], choosing which annotations a collection's length may be
@@ -184,6 +254,8 @@ pub fn lower_module_with(
         None => builtin_pack(),
     };
     let (module, index) = parse_guarded(path, source)?;
+    // `LAN-116`: which methods a subclass in this module redefines.
+    let overridden = overridden_in_module(module.iter());
     // Which names this module binds for itself, computed once. A signature pack
     // is keyed by *name*, and a module that writes `def isinstance(...)` is not
     // calling the builtin - see `SignaturePack` for the whole caveat and for
@@ -205,6 +277,7 @@ pub fn lower_module_with(
                 module_bound.as_ref(),
                 pack,
                 siblings,
+                &overridden,
             ));
         }
     }
@@ -372,13 +445,13 @@ fn lower_function(
     module_bound: Option<&BTreeSet<String>>,
     pack: &SignaturePack,
     siblings: Option<&Siblings>,
+    overridden: &BTreeSet<String>,
 ) -> LoweredFunction {
     // The receiver a sibling call is spelled on: a method's first parameter,
     // whatever it is called. A module-level function has none, so no
     // `x.m()` in it can be a sibling call.
-    let receiver = function
-        .class
-        .and_then(|_| parameter_names(function).into_iter().next());
+    let parameters = parameter_names(function);
+    let receiver = function.class.and_then(|_| parameters.first().cloned());
     let integers = integer_names(function);
     let name = function.qualified_name();
     let class = function.class.map(str::to_owned);
@@ -450,6 +523,7 @@ fn lower_function(
         class: function.class,
         receiver,
         siblings,
+        composed: Vec::new(),
         walks: 0,
         discarding: false,
         value_discarded: false,
@@ -459,9 +533,22 @@ fn lower_function(
     for length in &translator.lengths_read {
         translator.builder.mark_length_read(length.clone());
     }
+    // In index order, so every `DeclaredCost::Composed(i)` on a node resolves
+    // to the bound that was handed index `i`.
+    for bound in std::mem::take(&mut translator.composed) {
+        translator.builder.compose(bound);
+    }
     let program = translator.builder.build(body);
 
-    LoweredFunction::new(name, class, location, program)
+    let overridden_in_module = overridden.contains(&name);
+    LoweredFunction::new(
+        name,
+        class,
+        location,
+        program,
+        parameters,
+        overridden_in_module,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1774,6 +1861,17 @@ struct Translator<'a> {
     /// The constant-cost sibling methods a `self.m()` may be declared against.
     /// `LAN-113`; see [`Siblings`].
     siblings: Option<&'a Siblings>,
+    /// Bounds composed at sibling call sites, in the order their indices were
+    /// handed out. `LAN-116`.
+    ///
+    /// Kept on the translator and not the builder, for the reason
+    /// [`Translator::lengths_read`] is: a `self.m()` evaluated for its effect
+    /// is translated into a scratch builder that is thrown away, and only the
+    /// declared effect - which carries the *index* - is copied across onto the
+    /// real statement node. A bound pushed into the scratch builder's table
+    /// would leave that index dangling, and the engine would charge a hole.
+    /// Moved into the real builder once, after the body is translated.
+    composed: Vec<landav_bound::Bound>,
     /// How many collection walks have been lowered, to keep their synthetic
     /// counters apart.
     walks: u32,
@@ -3033,7 +3131,7 @@ impl Translator<'_> {
     /// language grammar. `getattr(x, name)` is one attribute lookup;
     /// `getattr(x, name, default)` is that plus a caught `AttributeError` and a
     /// third expression, and the row was written for the two-argument form.
-    fn declaration_for(&self, call: &ast::ExprCall) -> Option<DeclaredEffect> {
+    fn declaration_for(&mut self, call: &ast::ExprCall) -> Option<DeclaredEffect> {
         if !(self.discarding || self.truth_test) {
             return None;
         }
@@ -3071,7 +3169,7 @@ impl Translator<'_> {
     /// Keyed by definition site through the qualified name `Class.m`: an
     /// inherited `m` has no entry, so the call stays a hole, and an `m` from
     /// a different class with the same name is a different key.
-    fn sibling_declaration(&self, call: &ast::ExprCall) -> Option<DeclaredEffect> {
+    fn sibling_declaration(&mut self, call: &ast::ExprCall) -> Option<DeclaredEffect> {
         let siblings = self.siblings?;
         let class = self.class?;
         let receiver = self.receiver.as_deref()?;
@@ -3094,7 +3192,89 @@ impl Translator<'_> {
         {
             return None;
         }
-        siblings.effect_of(&format!("{class}.{}", method.attr.as_str()))
+        match siblings.cost_of(&format!("{class}.{}", method.attr.as_str()))? {
+            SiblingCost::Constant(effect) => Some(*effect),
+            SiblingCost::Exact { bound, params } => {
+                let composed = self.compose_sibling(call, bound, params)?;
+                let index = u32::try_from(self.composed.len()).unwrap_or(u32::MAX);
+                self.composed.push(composed);
+                // The same answers as a constant sibling: a method call cannot
+                // rebind the caller's locals, and may mutate `self`.
+                Some(DeclaredEffect::composed(index, false, true))
+            }
+        }
+    }
+
+    /// `bound`, a sibling's exact bound over its own `params`, rewritten into
+    /// this function's variables by `call`'s arguments - or `None` if any
+    /// variable the bound mentions cannot be mapped to a size this function
+    /// can read. `LAN-116`.
+    ///
+    /// # What maps, and what refuses
+    ///
+    /// Only positional arguments, one per sibling parameter, no keywords: the
+    /// sibling's parameter list is the only thing this function knows about
+    /// the callee's shape, and defaults or `**kwargs` would be a guess. For
+    /// each variable the bound mentions - `n` for an integer parameter, or
+    /// `len(items)` for a collection one - the argument in that position must
+    /// be a size this function can already read: an integer **parameter** of
+    /// its own (a name it never rebinds; a loop counter or a local is refused,
+    /// because it is not a variable the engine names), a collection parameter
+    /// of its own for a length, or an integer literal. Anything else - an
+    /// expression, a call, a local, a parameter of the wrong kind - refuses
+    /// the whole composition and the call stays a hole, never a bound with a
+    /// variable this function cannot name.
+    ///
+    /// A variable the bound mentions that is not one of the sibling's
+    /// parameters at all (a synthetic counter that leaked, a global) refuses
+    /// for the same reason.
+    fn compose_sibling(
+        &self,
+        call: &ast::ExprCall,
+        bound: &landav_bound::Bound,
+        params: &[String],
+    ) -> Option<landav_bound::Bound> {
+        if !call.keywords.is_empty() || call.args.len() != params.len() {
+            return None;
+        }
+        let rebound = self.rebound.as_ref()?;
+        let mut result = bound.clone();
+        for var in bound.vars() {
+            let name = var.symbol().as_str();
+            let (position, as_length) = match params.iter().position(|p| p == name) {
+                Some(position) => (position, false),
+                None => {
+                    let inner = name.strip_prefix("len(")?.strip_suffix(')')?;
+                    (params.iter().position(|p| p == inner)?, true)
+                }
+            };
+            let replacement = match &call.args[position] {
+                Expr::Name(argument) => {
+                    let argument = argument.id.as_str();
+                    if as_length {
+                        if !self.collections.contains(argument) {
+                            return None;
+                        }
+                        landav_bound::Bound::var(format!("len({argument})"))
+                    } else {
+                        if !self.integers.contains(argument) || rebound.contains(argument) {
+                            return None;
+                        }
+                        landav_bound::Bound::var(argument)
+                    }
+                }
+                Expr::Constant(constant) if !as_length => match &constant.value {
+                    Constant::Int(value) => {
+                        let value = i64::try_from(value.clone()).ok()?;
+                        landav_bound::Bound::constant(u64::try_from(value).ok()?)
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            result = result.subst(&var, &replacement);
+        }
+        Some(result)
     }
 
     /// What a call the pack cannot *resolve* may nevertheless change in this
