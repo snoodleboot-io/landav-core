@@ -37,14 +37,19 @@
 //! program that short-circuits. `a_skipped_operand_is_never_claimed_exact`
 //! pins that.
 //!
-//! # Value position is deliberately not widened
+//! # Value position: widened by `LAN-117`, for a binding
 //!
-//! `x = a and b` keeps its `conditional-expression` region. Soundness does not
-//! require it - `x` is condemned as `non-integer-value` either way - but the
-//! report does: without it the user is told that `x` is not an integer and
-//! never told which construct made it one. `a_boolean_in_value_position_stays_
-//! a_region` here and `boolean_and_comparison_values_stay_refused` in
-//! `conditional_expression.rs` pin the two halves of that fence.
+//! `x = a and b` kept its `conditional-expression` region until `LAN-117`.
+//! Soundness never required it - `x` was condemned as `non-integer-value`
+//! either way - and the argument for it was the report: without the region the
+//! user was told that `x` is not an integer and never told which construct made
+//! it one. That argument fell with the binding's own hole: a binding to a name
+//! this fragment cannot hold is bounded work now, not a hole, so there is no
+//! "`x` is not an integer" to explain at that line. The explanation surfaces
+//! where `x` is finally read as a number, which refuses as before.
+//! `a_boolean_bound_to_a_name_is_bounded_work` here and
+//! `a_conjunction_bound_to_a_name_is_bounded_work` in
+//! `conditional_expression.rs` record the two halves.
 //!
 //! # The rule that makes all of this safe
 //!
@@ -280,18 +285,20 @@ fn a_returned_boolean_over_integers_is_fully_derived() {
 // the fences
 // ---------------------------------------------------------------------------
 
-/// **A boolean or comparison bound to a name is still a region.**
+/// **A boolean or comparison bound to a name is bounded work.**
 ///
-/// The near half of the fence. `Translator::refusals_of` hoists the right-hand
-/// side of `x = a and b` through the same scratch builder a `return` uses, so a
-/// widening keyed on "am I in a scratch builder" would take this with it.
+/// The near half of the fence, until `LAN-117` flipped it.
+/// `Translator::declare_binding` translates the right-hand side of
+/// `x = a and b` with its value discarded, through the same scratch builder a
+/// `return` uses, and the `and` costs its operands and nothing else.
 ///
-/// Soundness would survive that: `x` is condemned as `non-integer-value`
-/// whatever happens to the `and`. The **report** would not. "`x` is not a
-/// proven integer" without "because of the boolean at 2:9" names a symptom and
-/// withholds the cause, and a user cannot act on it.
+/// The report argument that held this as a region - "`x` is not a proven
+/// integer" needs "because of the boolean at 2:9" beside it - no longer has a
+/// subject: the binding is not reported, because binding a name is one step and
+/// not a hole. A guard or a `range(x)` further down still refuses on `x` by
+/// name, which is where a user can act.
 #[test]
-fn a_boolean_in_value_position_stays_a_region() {
+fn a_boolean_bound_to_a_name_is_bounded_work() {
     for source in [
         "def conjunction(a: int, b: int) -> int:\n    x = a and b\n    return x\n",
         "def disjunction(a: int, b: int) -> int:\n    x = a or b\n    return x\n",
@@ -300,11 +307,9 @@ fn a_boolean_in_value_position_stays_a_region() {
         let function = only_function(source);
         let result = cost(function.program());
         assert!(
-            !holes_blamed_on(&result, "conditional-expression").is_empty(),
-            "a binding names a value, and the construct that made that value \
-             unreadable has to be named beside it. If this is now empty, the \
-             discarded-position widening was keyed on the scratch builder \
-             rather than on there being no value slot: {} for:\n{source}",
+            result.holes().is_empty(),
+            "the operands are integers, the binding is one step and nothing \
+             reads `x` as a number; there is nothing left to hole: {} for:\n{source}",
             describe(&result)
         );
     }

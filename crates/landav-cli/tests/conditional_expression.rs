@@ -50,9 +50,10 @@
 //! `Expr::IfExp`, `Expr::BoolOp` and `Expr::Compare` share one match arm in
 //! `landav_python`'s `build_expression` today, and all three refuse as
 //! `Construct::ConditionalExpression`. This ticket is about the ternary.
-//! `boolean_and_comparison_values_stay_refused` pins the other two where they
-//! are, so that splitting the arm cannot widen them by accident; see its doc
-//! comment for what a later ticket would have to argue.
+//! `a_conjunction_bound_to_a_name_is_bounded_work` records what became of the
+//! other two in value position: `LAN-117` made a binding to a name this
+//! fragment cannot hold bounded work, and the region that stood for the value
+//! went with the value. Its doc comment carries the argument.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -770,30 +771,28 @@ def risky(a: int, b: int, c: int) -> int:
 // the scope fence: what shares the match arm and must not move with it
 // ---------------------------------------------------------------------------
 
-/// **`and`, `or` and comparisons used as *values* stay refused.**
+/// **`and`, `or` and a comparison bound to a name are bounded work.**
 ///
-/// These three share one match arm with `Expr::IfExp` in `build_expression`
-/// today and all refuse as `Construct::ConditionalExpression`. Splitting the
-/// ternary out of that arm is the whole ticket, and this test is what stops the
-/// other two coming along by accident - the implementer has to delete an
-/// assertion to widen them, which is a decision rather than a side effect.
+/// # The argument this test used to pin, and why it flipped
 ///
-/// # Why they are genuinely a separate question
+/// Until `LAN-117` this test was `boolean_and_comparison_values_stay_refused`:
+/// `x = a and b` kept a `conditional-expression` region in **value** position,
+/// so that the report could say why `x` had stopped being an integer. The
+/// binding itself was a `non-integer-value` hole for the same reason.
 ///
-/// `a and b` does not evaluate to a boolean in Python: it evaluates to `a` when
-/// `a` is falsy and to `b` otherwise, so it is a ternary whose condition and
-/// first arm are the *same expression*. `a < b` evaluates to a `bool`, which is
-/// `0` or `1` and which the fragment could in principle read - a different
-/// argument again, and one about values rather than cost. Both may be worth
-/// doing; neither is `LAN-91`, and neither is justified by anything this file
-/// establishes.
+/// Neither hole bounded a cost. `a and b` over two names costs its operands,
+/// one step each; binding `x` is one step; `return x` is one step. What the
+/// holes stood for was an unknown *value*, and the engine has a narrower answer
+/// for that - the binding forgets `x` and nothing else - while any read that
+/// needs the value, a guard or a `range(x)`, refuses on its own and names `x`.
+/// The explanation moved to where it matters; the cost was never in doubt.
 ///
-/// # This passes today
-///
-/// It pins current behaviour deliberately. A later ticket that extends either
-/// construct updates this test with its own argument recorded here.
+/// So these three derive a bound and it is exact. A conjunction whose operand
+/// has a cost this fragment cannot see - a call, an attribute - still carries
+/// that cost as the operand's own region; `the_operands_of_a_bound_conjunction_are_still_charged`
+/// pins that half.
 #[test]
-fn boolean_and_comparison_values_stay_refused() {
+fn a_conjunction_bound_to_a_name_is_bounded_work() {
     for source in [
         "def conjunction(a: int, b: int) -> int:\n    x = a and b\n    return x\n",
         "def disjunction(a: int, b: int) -> int:\n    x = a or b\n    return x\n",
@@ -801,24 +800,28 @@ fn boolean_and_comparison_values_stay_refused() {
     ] {
         let function = only_function(source);
         let result = cost(function.program());
-        let refused = holes_blamed_on(&result, "conditional-expression");
         assert!(
-            !refused.is_empty(),
-            "`and`, `or` and comparisons in **value** position are outside \
-             `LAN-91` and must still be reported as regions. If this now \
-             derives a bound, the ternary was split out of the shared match arm \
-             in a way that took its neighbours with it - which is a widening \
-             nobody argued for. Got {} for:\n{source}",
+            result.holes().is_empty(),
+            "a boolean or a comparison bound to a name costs its operands and \
+             one step, and nothing reads the value as a number: the function \
+             must derive exactly. Got {} for:\n{source}",
             describe(&result)
         );
-        for hole in refused {
-            assert!(
-                hole.origin().as_str().contains(':'),
-                "a region must be placed as well as named, got {} for:\n{source}",
-                hole.origin()
-            );
-        }
     }
+}
+
+/// **The operands of a bound conjunction are still charged.**
+#[test]
+fn the_operands_of_a_bound_conjunction_are_still_charged() {
+    let source = "def g(a: int, obj) -> int:\n    x = a and obj.ready()\n    return x\n";
+    let function = only_function(source);
+    let result = cost(function.program());
+    assert!(
+        !holes_blamed_on(&result, "call").is_empty(),
+        "the method call inside the conjunction is a cost this fragment cannot \
+         see and must survive as a `call` region, got {} for:\n{source}",
+        describe(&result)
+    );
 }
 
 /// **`and`, `or` and comparisons used as *conditions* stay fully derived.**

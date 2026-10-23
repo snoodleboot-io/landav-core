@@ -21,10 +21,20 @@
 //! right-hand side. That is a least-fixed-point computation, started
 //! optimistically and refined until it stops shrinking.
 //!
-//! A name that does not survive is not guessed at — every read of it becomes
-//! [`Construct::NonIntegerValue`], naming the variable. Guessing here is the
-//! shortest path to an unsound bound: a `float` treated as an integer makes
-//! every guard mentioning it mean something else.
+//! A name that does not survive is not guessed at — every read of it **that
+//! needs the value** becomes [`Construct::NonIntegerValue`], naming the
+//! variable. Guessing here is the shortest path to an unsound bound: a `float`
+//! treated as an integer makes every guard mentioning it mean something else.
+//!
+//! A read nothing consumes is a different matter (`LAN-117`). `return x` and
+//! `y = x` cost one step whatever `x` holds, and the hole that stood there
+//! never bounded a *cost*: it stood for an unknown *value*, which the engine
+//! already tracks per name and which refuses, as above, at the guard or the
+//! `range` that finally reads it. So a bare name or a non-integer constant at
+//! the root of a discarded value is one step, and a binding to a name this
+//! fragment cannot hold is a declared statement that costs the value plus one
+//! step and forgets that name. On the standard library that is a third of
+//! every hole, and most of them were on `return self.x` and `name = value`.
 //!
 //! # Refusal is the default, not the exception
 //!
@@ -1903,20 +1913,24 @@ struct Translator<'a> {
     /// Strictly narrower than [`Translator::discarding`], and the two are not
     /// the same question. `discarding` says the nodes go to a scratch builder,
     /// which is true of the right-hand side of `x = a and b` as well - that
-    /// value is hoisted for its refusals only. But a binding *names* a value,
-    /// and the report has to say why that name became unknowable: `x = a and b`
-    /// yields `non-integer-value: x`, and without the `conditional-expression`
-    /// beside it the user is told that `x` is not an integer and never told
-    /// which construct made it one. So value position keeps its refusal, and
-    /// `boolean_and_comparison_values_stay_refused` pins that.
+    /// value is hoisted for its refusals only.
     ///
-    /// This flag is for the positions where there is no name and no value slot
-    /// at all: a `return`, whose [`landav_its::SourceStmt::Return`] never
-    /// represents what is returned, and a bare expression statement. There the
-    /// only question a boolean, a comparison or a ternary raises is what it
-    /// **costs**, and the answer is its operands' regions and nothing else.
-    /// `return a and b` can no more publish a bound variable than `return [a]`
-    /// can, because there is nowhere for the value to go.
+    /// This flag is for the positions where there is no value slot at all: a
+    /// `return`, whose [`landav_its::SourceStmt::Return`] never represents what
+    /// is returned; a bare expression statement; and, since `LAN-117`, a
+    /// binding to a name this fragment cannot hold, where the value goes to a
+    /// name nothing will read as a number. There the only question a boolean,
+    /// a comparison or a ternary raises is what it **costs**, and the answer is
+    /// its operands' regions and nothing else. `return a and b` can no more
+    /// publish a bound variable than `return [a]` can, because there is
+    /// nowhere for the value to go.
+    ///
+    /// Before `LAN-117` a binding kept its refusal so that the report could say
+    /// *why* `x` was no longer an integer. The binding is not reported at all
+    /// now - it is bounded work, not a hole - and the reason surfaces where it
+    /// matters: at the `range(x)` or the guard that reads `x`, which refuses
+    /// as `non-integer-value: x` exactly as before.
+    /// `a_conjunction_bound_to_a_name_is_bounded_work` pins the flip.
     value_discarded: bool,
     /// Whether the expression being translated is the subject of a **truth
     /// test** rather than a value the fragment will read as a number.
@@ -2268,10 +2282,48 @@ impl Translator<'_> {
             return vec![self.builder.if_else(cond, then_body, else_body, origin)];
         }
         if !self.integers.contains(name) {
-            return self.refuse_binding(name, target, value);
+            return self.declare_binding(name, target, value);
         }
         let translated = self.expression(value);
         self.bind(name, translated, node)
+    }
+
+    /// Binds a name this fragment cannot hold a value for: the value's own
+    /// cost, one step, and the name forgotten. `LAN-117`.
+    ///
+    /// # Why this is not a refusal
+    ///
+    /// [`Translator::refuse_binding`] reported `x = v` as a hole because the
+    /// value of `x` afterwards is one the fragment cannot write down. That is
+    /// true and it is not a cost: binding a name is one step whatever is bound,
+    /// and what the value costs to *compute* is hoisted in front of it, exactly
+    /// as before. The hole stood in for an unknown value, and the engine has a
+    /// narrower answer for that - `Writes::only` forgets `x` (and `len(x)`,
+    /// when `x` is a collection) and nothing else, which is what `LAN-100`
+    /// established for the refused form. A later read of `x` that needs its
+    /// value refuses on its own, at the guard or the `range` that reads it.
+    ///
+    /// The value is translated with its value discarded, not merely hoisted:
+    /// `x = a and b` costs `a` and `b`, and the `conditional-expression` region
+    /// that stood for the value is gone with the value. A call, an attribute,
+    /// an operator over operands this fragment cannot type - anything whose
+    /// cost is unknown - still refuses inside the value, so `x = a + b` over two
+    /// strings keeps its hole where the `__add__` is.
+    ///
+    /// An augmented assignment is **not** this: `s += v` runs `__iadd__`, which
+    /// is user code, and stays with [`Translator::refuse_binding`].
+    fn declare_binding(&mut self, name: &str, target: &Expr, value: &Expr) -> Vec<StmtId> {
+        let mut statements = self.discarded_cost_of(value);
+        let origin = self.origin(target);
+        statements.push(self.builder.declared_stmt_writing(
+            Construct::NonIntegerValue,
+            Some(Symbol::from(name)),
+            Extent::Statement,
+            DeclaredEffect::new(0, true, false),
+            Writes::only(self.rebound_names(name)),
+            origin,
+        ));
+        statements
     }
 
     fn aug_assign(&mut self, assign: &ast::StmtAugAssign) -> Vec<StmtId> {
@@ -2352,13 +2404,15 @@ impl Translator<'_> {
         vec![self.builder.assign(VarName::new(name), value, origin)]
     }
 
-    /// Refuses a binding whose target is not a proven integer, keeping the
-    /// value's own refusals as statements in front of it.
+    /// Refuses an augmented assignment whose target is not a proven integer,
+    /// keeping the value's own refusals as statements in front of it.
     ///
-    /// The variable's value after this statement is unknown, so every later
-    /// guard mentioning it would be wrong. That is one refusal; a call on the
-    /// right-hand side is another, and both are real. Hoisting the second means
-    /// the arena holds no node that the statement tree cannot reach - see
+    /// Since `LAN-117` a plain binding is [`Translator::declare_binding`]; this
+    /// is what remains. `s += v` reads `s`, runs `__iadd__` on it - user code
+    /// with a cost this fragment cannot see - and rebinds it, so the statement
+    /// is a hole and not bounded work. A call on the right-hand side is a
+    /// second refusal, and both are real. Hoisting the second means the arena
+    /// holds no node that the statement tree cannot reach - see
     /// [`Translator::refusals_of`].
     fn refuse_binding(&mut self, name: &str, target: &Expr, value: &Expr) -> Vec<StmtId> {
         let mut statements = self.refusals_of(value);
@@ -3596,6 +3650,9 @@ impl Translator<'_> {
     fn expression(&mut self, root: &Expr) -> ExprId {
         let discarding = self.discarding;
         let value_discarded = self.value_discarded;
+        if value_discarded && let Some(leaf) = self.cost_only_leaf(root) {
+            return leaf;
+        }
         let ordered = postorder(root, |expr| {
             expression_children(
                 expr,
@@ -3626,6 +3683,34 @@ impl Translator<'_> {
                 let origin = self.origin(root);
                 self.refuse_expr(Construct::NonIntegerValue, None, root, origin)
             })
+    }
+
+    /// A root whose value nothing reads and whose evaluation is one step: a
+    /// name this fragment cannot hold, or a constant that is neither an integer
+    /// nor a boolean. `LAN-117`.
+    ///
+    /// Only the **root** qualifies, and only under
+    /// [`Translator::value_discarded`]. An operand is not a root: `return -x`
+    /// and `y = a + b` run an operator over values this fragment cannot type,
+    /// which may be user code, so the operands keep refusing and the operator's
+    /// cost stays covered. A name that *is* an integer is translated as itself;
+    /// nothing is gained by hiding it.
+    ///
+    /// The node built is a literal `0` with no region, like the string constant
+    /// in a discarded position above it: the value is wrong and nothing reads
+    /// it, and the step is the enclosing statement's own.
+    fn cost_only_leaf(&mut self, root: &Expr) -> Option<ExprId> {
+        let leaf = match root {
+            Expr::Name(name) => !self.integers.contains(name.id.as_str()),
+            Expr::Constant(constant) => {
+                !matches!(constant.value, Constant::Int(_) | Constant::Bool(_))
+            }
+            _ => false,
+        };
+        leaf.then(|| {
+            let origin = self.origin(root);
+            self.builder.int(0, origin)
+        })
     }
 
     fn build_expression(&mut self, node: &Expr, built: &HashMap<usize, ExprId>) -> ExprId {

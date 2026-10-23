@@ -387,21 +387,20 @@ fn each_stdlib_negation_names_its_real_obstacle() {
 // 4. the fences
 // ---------------------------------------------------------------------------
 
-/// **A negation bound to a name is still a region.**
+/// **A negation bound to a name is bounded work.**
 ///
-/// The near half of the fence, and the same one
-/// `discarded_expressions::a_boolean_in_value_position_stays_a_region` holds
-/// for `and`. `Translator::refusals_of` hoists the right-hand side of
-/// `x = not n` through the same scratch builder a `return` uses, so a widening
-/// keyed on "am I in a scratch builder" rather than on "is there a value slot"
-/// takes this with it.
+/// The near half of the fence, flipped by `LAN-117` together with
+/// `discarded_expressions::a_boolean_bound_to_a_name_is_bounded_work`.
+/// `Translator::declare_binding` translates the right-hand side of `x = not n`
+/// with its value discarded, and a `not` over an integer costs its operand and
+/// nothing else.
 ///
-/// Soundness survives that - `x` is condemned as `non-integer-value` whatever
-/// happens to the `not`. The report does not: "`x` is not a proven integer"
-/// without "because of the negation at 2:9" names a symptom and withholds the
-/// cause.
+/// The report argument that held this as a region - "`x` is not a proven
+/// integer" needs "because of the negation at 2:9" beside it - has no subject
+/// left: binding `x` is one step and is not reported, and a guard or a
+/// `range(x)` further down still refuses on `x` by name, where a user can act.
 #[test]
-fn a_negation_in_value_position_stays_a_region() {
+fn a_negation_bound_to_a_name_is_bounded_work() {
     for source in [
         "def bound(n: int) -> int:\n    x = not n\n    return x\n",
         "def compared(a: int, b: int) -> int:\n    x = not (a < b)\n    return x\n",
@@ -409,11 +408,9 @@ fn a_negation_in_value_position_stays_a_region() {
         let function = only_function(source);
         let result = cost(function.program());
         assert!(
-            !holes_blamed_on(&result, "conditional-expression").is_empty(),
-            "a binding names a value, and the construct that made that value \
-             unreadable has to be named beside it. If this is now empty, the \
-             widening was keyed on the scratch builder rather than on there \
-             being no value slot: {} for:\n{source}",
+            result.holes().is_empty(),
+            "the operand is an integer, the binding is one step and nothing \
+             reads `x` as a number; there is nothing left to hole: {} for:\n{source}",
             describe(&result)
         );
     }
