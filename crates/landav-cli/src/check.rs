@@ -929,16 +929,20 @@ where
         let last_definition: std::collections::BTreeMap<&str, usize> = functions
             .iter()
             .enumerate()
-            .filter(|(_, function)| function.class().is_some())
             .map(|(index, function)| (function.name(), index))
             .collect();
         let mut next = landav_python::Siblings::default();
         for (index, function) in functions.iter().enumerate() {
-            // Module-level functions are not siblings of anything; only a
-            // method, keyed by the `Class.method` name LAN-104 lowers it under.
-            if function.class().is_none() || last_definition.get(function.name()) != Some(&index) {
+            // A method is keyed by the `Class.method` name LAN-104 lowers it
+            // under; a module-level function (`LAN-129`) by its bare name, and
+            // the frontend decides at the call site whether that name still
+            // means this definition.
+            if last_definition.get(function.name()) != Some(&index) {
                 continue;
             }
+            // A method's first parameter is its receiver and is not mapped;
+            // a module-level function maps every parameter.
+            let skip = usize::from(function.class().is_some());
             // `LAN-116`: a method a subclass in this module redefines is never
             // composed - the call may reach the override, and a composed bound
             // would then be the wrong shape.
@@ -956,7 +960,7 @@ where
                     if !holes.is_empty() && holes.iter().all(|hole| hole.construct() != "call") =>
                 {
                     let params: Vec<String> =
-                        function.parameters().iter().skip(1).cloned().collect();
+                        function.parameters().iter().skip(skip).cloned().collect();
                     let inherited = holes
                         .iter()
                         .map(|hole| landav_its::InheritedHole {
@@ -974,7 +978,8 @@ where
                 // `LAN-116`: an exact, non-constant bound composes at the call
                 // site by substitution. The sibling's parameters, receiver
                 // excluded, are what positional arguments are mapped onto.
-                let params: Vec<String> = function.parameters().iter().skip(1).cloned().collect();
+                let params: Vec<String> =
+                    function.parameters().iter().skip(skip).cloned().collect();
                 next.insert_bound(function.name().to_owned(), bound.clone(), params);
                 continue;
             }
@@ -1270,14 +1275,15 @@ fn sibling_premise(
     derived: &landav_engine::TripCount,
     siblings: Option<&landav_python::Siblings>,
 ) -> String {
-    let (Some(siblings), Some(class)) = (siblings, function.class()) else {
+    let Some(siblings) = siblings else {
         return String::new();
     };
     if derived.bound().is_none() {
         return String::new();
     }
     let program = function.program();
-    let mut resting: BTreeSet<String> = BTreeSet::new();
+    let mut methods: BTreeSet<String> = BTreeSet::new();
+    let mut functions: BTreeSet<String> = BTreeSet::new();
     for node in program.unsupported_nodes() {
         if node.construct() != landav_its::Construct::Call || node.declared().is_none() {
             continue;
@@ -1286,24 +1292,41 @@ fn sibling_premise(
             continue;
         };
         // A method is spelled with its dot (`LAN-108`); the sibling table is
-        // keyed `Class.method`.
-        let Some(method) = callee.as_str().strip_prefix('.') else {
-            continue;
-        };
-        let qualified = format!("{class}.{method}");
-        if siblings.cost_of(&qualified).is_some() {
-            resting.insert(qualified);
+        // keyed `Class.method`. A bare name (`LAN-129`) is keyed as itself.
+        match callee.as_str().strip_prefix('.') {
+            Some(method) => {
+                if let Some(class) = function.class() {
+                    let qualified = format!("{class}.{method}");
+                    if siblings.cost_of(&qualified).is_some() {
+                        methods.insert(qualified);
+                    }
+                }
+            }
+            None => {
+                if siblings.cost_of(callee.as_str()).is_some() {
+                    functions.insert(callee.as_str().to_owned());
+                }
+            }
         }
     }
-    if resting.is_empty() {
-        return String::new();
+    let mut out = String::new();
+    if !methods.is_empty() {
+        let said: Vec<String> = methods.into_iter().map(|q| format!("`{q}`")).collect();
+        out.push_str(&format!(
+            "; believed on {}: the cost is the sibling method's own derived bound, assuming no \
+             subclass overrides it",
+            said.join(", ")
+        ));
     }
-    let said: Vec<String> = resting.into_iter().map(|q| format!("`{q}`")).collect();
-    format!(
-        "; believed on {}: the cost is the sibling method's own derived bound, assuming no \
-         subclass overrides it",
-        said.join(", ")
-    )
+    if !functions.is_empty() {
+        let said: Vec<String> = functions.into_iter().map(|q| format!("`{q}`")).collect();
+        out.push_str(&format!(
+            "; believed on {}: the cost is this module's own function's derived bound, assuming \
+             nothing rebinds the module's name at run time",
+            said.join(", ")
+        ));
+    }
+    out
 }
 
 /// `text` with every run of whitespace collapsed to one space.

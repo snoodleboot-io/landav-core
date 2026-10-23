@@ -215,10 +215,13 @@ pub struct Premise {
     /// different depending on the value of another field.
     pub subject: String,
     /// `"concrete-type"`, `"protocol"`, `"supplied-signature"`,
-    /// `"same-class-method"` (`LAN-113`), or `"plain-attribute-store"`
+    /// `"same-class-method"` (`LAN-113`), `"plain-attribute-store"`
     /// (`LAN-120`: a `self.attr = v` taken as one step because nothing in the
     /// class's same-module chain intercepts it; the premise is that nothing
-    /// outside the module does either).
+    /// outside the module does either), or `"same-module-function"`
+    /// (`LAN-129`: a call to a function this module defines once, composed
+    /// from that definition's own bound; the premise is that nothing rebinds
+    /// the module's name at run time).
     pub trust: &'static str,
     /// Why the number is believed, in one sentence.
     ///
@@ -344,10 +347,11 @@ fn sibling_premises(
     class: Option<&str>,
     siblings: Option<&landav_python::Siblings>,
 ) -> Vec<Premise> {
-    let (Some(siblings), Some(class)) = (siblings, class) else {
+    let Some(siblings) = siblings else {
         return Vec::new();
     };
-    let mut resting: BTreeSet<String> = BTreeSet::new();
+    let mut methods: BTreeSet<String> = BTreeSet::new();
+    let mut functions: BTreeSet<String> = BTreeSet::new();
     for node in program.unsupported_nodes() {
         if node.construct() != Construct::Call || node.declared().is_none() {
             continue;
@@ -355,26 +359,44 @@ fn sibling_premises(
         let Some(detail) = node.detail() else {
             continue;
         };
-        let Some(method) = detail.as_str().strip_prefix('.') else {
-            continue;
-        };
-        let qualified = format!("{class}.{method}");
-        if siblings.cost_of(&qualified).is_some() {
-            resting.insert(qualified);
+        match detail.as_str().strip_prefix('.') {
+            Some(method) => {
+                if let Some(class) = class {
+                    let qualified = format!("{class}.{method}");
+                    if siblings.cost_of(&qualified).is_some() {
+                        methods.insert(qualified);
+                    }
+                }
+            }
+            // `LAN-129`: a bare name is a module-level function the driver
+            // entered under that name.
+            None => {
+                if siblings.cost_of(detail.as_str()).is_some() {
+                    functions.insert(detail.as_str().to_owned());
+                }
+            }
         }
     }
-    resting
+    methods
         .into_iter()
         .map(|qualified| Premise {
             subject: qualified.clone(),
             trust: "same-class-method",
             because: format!(
-                "the cost of `{qualified}` is its own derived bound, composed at the call site \
-                 because it is a constant; the premise is that the call resolves to this \
-                 class's definition and not to an override in a subclass, which the analysis \
-                 cannot see"
+                "the cost of `{qualified}` is its own derived bound, composed at the call site; \
+                 the premise is that the call resolves to this class's definition and not to an \
+                 override in a subclass, which the analysis cannot see"
             ),
         })
+        .chain(functions.into_iter().map(|name| Premise {
+            subject: name.clone(),
+            trust: "same-module-function",
+            because: format!(
+                "the cost of `{name}` is this module's own function's derived bound, composed at \
+                 the call site; the premise is that nothing rebinds the module's `{name}` at run \
+                 time - a monkeypatch, a later assignment - which the analysis cannot see"
+            ),
+        }))
         .collect()
 }
 

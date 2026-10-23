@@ -434,6 +434,30 @@ struct ModuleFacts {
     /// Names this module binds **once**, by an absolute import, to the module
     /// or attribute they stand for. `LAN-128`.
     imports: BTreeMap<String, String>,
+    /// Names this module binds **once**, by a module-level `def`. `LAN-129`:
+    /// a call to one of these resolves to that definition and nothing else
+    /// the module says, so its derived bound may compose at the call site.
+    functions: BTreeSet<String>,
+}
+
+/// The names a module binds exactly once, by a `def` or `async def` at module
+/// level. `LAN-129`.
+fn module_functions_of(statements: &[Stmt]) -> BTreeSet<String> {
+    let mut bound_times: BTreeMap<String, usize> = BTreeMap::new();
+    if !binding_sites(statements, &mut |name, _| {
+        *bound_times.entry(name).or_default() += 1;
+    }) {
+        return BTreeSet::new();
+    }
+    statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Stmt::FunctionDef(def) => Some(def.name.to_string()),
+            Stmt::AsyncFunctionDef(def) => Some(def.name.to_string()),
+            _ => None,
+        })
+        .filter(|name| bound_times.get(name).copied() == Some(1))
+        .collect()
 }
 
 /// The names a module binds exactly once, by an absolute import, mapped to
@@ -515,6 +539,7 @@ pub fn lower_module_with(
         overridden: overridden_in_module(module.iter()),
         stores: store_facts(module.iter()),
         imports: imports_of(&module),
+        functions: module_functions_of(&module),
     };
     // Which names this module binds for itself, computed once. A signature pack
     // is keyed by *name*, and a module that writes `def isinstance(...)` is not
@@ -796,6 +821,8 @@ fn lower_function(
         instance_method,
         stores: &facts.stores,
         imports: &facts.imports,
+        module_functions: &facts.functions,
+        parameters: &parameters,
         siblings,
         composed: Vec::new(),
         walks: 0,
@@ -2139,6 +2166,11 @@ struct Translator<'a> {
     stores: &'a StoreFacts,
     /// What the module's once-bound import names stand for. `LAN-128`.
     imports: &'a BTreeMap<String, String>,
+    /// The module's once-bound function names. `LAN-129`.
+    module_functions: &'a BTreeSet<String>,
+    /// This function's own parameter names: a parameter named like a module
+    /// function is the parameter, not the function.
+    parameters: &'a [String],
     /// The constant-cost sibling methods a `self.m()` may be declared against.
     /// `LAN-113`; see [`Siblings`].
     siblings: Option<&'a Siblings>,
@@ -3618,28 +3650,47 @@ impl Translator<'_> {
     /// a different class with the same name is a different key.
     fn sibling_declaration(&mut self, call: &ast::ExprCall) -> Option<DeclaredEffect> {
         let siblings = self.siblings?;
-        let class = self.class?;
-        let receiver = self.receiver.as_deref()?;
-        let Expr::Attribute(method) = call.func.as_ref() else {
-            return None;
+        let key = match call.func.as_ref() {
+            // `LAN-129`: a bare name the module binds once, by a `def`, that
+            // this function neither takes as a parameter nor rebinds. The
+            // table holds it under that bare name.
+            Expr::Name(callee) => {
+                let callee = callee.id.as_str();
+                if !self.module_functions.contains(callee)
+                    || self.parameters.iter().any(|p| p == callee)
+                    || self
+                        .rebound
+                        .as_ref()
+                        .is_none_or(|names| names.contains(callee))
+                {
+                    return None;
+                }
+                callee.to_owned()
+            }
+            Expr::Attribute(method) => {
+                let class = self.class?;
+                let receiver = self.receiver.as_deref()?;
+                let Expr::Name(value) = method.value.as_ref() else {
+                    return None;
+                };
+                if value.id.as_str() != receiver {
+                    return None;
+                }
+                // `self` rebound in the body is some other object by the time
+                // it is called on; `rebound` being unknown refuses, exactly as
+                // it refuses a method row's receiver.
+                if self
+                    .rebound
+                    .as_ref()
+                    .is_none_or(|names| names.contains(receiver))
+                {
+                    return None;
+                }
+                format!("{class}.{}", method.attr.as_str())
+            }
+            _ => return None,
         };
-        let Expr::Name(value) = method.value.as_ref() else {
-            return None;
-        };
-        if value.id.as_str() != receiver {
-            return None;
-        }
-        // `self` rebound in the body is some other object by the time it is
-        // called on; `rebound` being unknown refuses, exactly as it refuses a
-        // method row's receiver.
-        if self
-            .rebound
-            .as_ref()
-            .is_none_or(|names| names.contains(receiver))
-        {
-            return None;
-        }
-        match siblings.cost_of(&format!("{class}.{}", method.attr.as_str()))? {
+        match siblings.cost_of(&key)? {
             SiblingCost::Constant(effect) => Some(*effect),
             SiblingCost::Exact { bound, params } => {
                 let composed = self.compose_sibling(call, bound, params, &[])?;
