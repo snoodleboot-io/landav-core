@@ -2432,10 +2432,15 @@ impl Translator<'_> {
     /// What the chain cannot see is published as the `plain-attribute-store`
     /// premise, read back off this node's `detail` by the driver.
     ///
-    /// `mutates_arguments` is `true`: a store on `self` is a mutation of the
-    /// object, and a length read through it (`LAN-101`'s volatile names) must
-    /// not survive this line. `rebinds_locals` is `false`: no name in this
-    /// frame changes.
+    /// `mutates_arguments` is `false` (`LAN-122`): what the premise says is
+    /// precisely that this is `object.__setattr__`, which writes the
+    /// instance's own dictionary or slot and touches no other object, so a
+    /// parameter's length (`LAN-101`'s volatile names) is the same after this
+    /// line as before it. `LAN-120` shipped it as `true` to stay neutral on
+    /// lengths; that was a second claim stacked on the same premise for
+    /// nothing the premise did not already cover. `rebinds_locals` is
+    /// `false`: no name in this frame changes. A store the chain refuses keeps
+    /// the refusal's `mutates`, because there a `__setattr__` may run anything.
     ///
     /// An augmented store (`self.n += 1`) is deliberately not this: it reads
     /// `self.n`, which may run a `property`, and the operator may be user code
@@ -2470,8 +2475,8 @@ impl Translator<'_> {
             Construct::ComplexAssignmentTarget,
             Some(Symbol::from(format!(".{}", attribute.attr))),
             Extent::Statement,
-            DeclaredEffect::new(0, false, true),
-            Writes::at_most(Vec::new()),
+            DeclaredEffect::new(0, false, false),
+            Writes::nothing(),
             origin,
         ))
     }

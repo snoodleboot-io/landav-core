@@ -313,16 +313,17 @@ def free(self, x) -> int:
     Ok(())
 }
 
-/// **Soundness: the admitted store forgets what the refused one forgot.**
+/// **An admitted store touches nothing the frame can read; a refused one
+/// still forgets everything.**
 ///
-/// A collection parameter's length is a property of an object (`LAN-101`),
-/// and a store on `self` is a mutation; the refused store already carried
-/// `mutates`, so a loop below it was not counted on the entry length. The
-/// declared store says the same - the premise is about the store's cost, not
-/// about what else the receiver's `__setattr__` might touch - and the loop
-/// above it is unchanged.
+/// `LAN-122`. The premise the store is published under says it is
+/// `object.__setattr__`: the instance's own dictionary or slot, no other
+/// object. So a parameter's length (`LAN-101`'s volatile names) survives it,
+/// and the loop below is counted exactly as the loop above. The control is the
+/// same store on a chain that intercepts - there a `__setattr__` may run
+/// anything, and the loop below loses its length as before.
 #[test]
-fn the_admitted_store_is_as_conservative_about_lengths_as_the_refusal() -> io::Result<()> {
+fn an_admitted_store_keeps_lengths_and_a_refused_one_forgets_them() -> io::Result<()> {
     let (_, fs) = check(
         "\
 class A:
@@ -339,18 +340,32 @@ class A:
         for a in items:
             total = total + 1
         return total
+
+
+class Hooked:
+    def __setattr__(self, name, value):
+        pass
+
+    def after(self, items: list) -> int:
+        self.items = items
+        total = 0
+        for a in items:
+            total = total + 1
+        return total
 ",
     )?;
-    let before = named(&fs, "A.before");
+    for name in ["A.before", "A.after"] {
+        let f = named(&fs, name);
+        assert!(
+            is_exact(f) && f["bound"].as_str().unwrap().contains("len(items)"),
+            "{name}: the loop is counted on the parameter's length whichever side of the \
+             store it is on: {f}"
+        );
+    }
+    let hooked = named(&fs, "Hooked.after");
     assert!(
-        is_exact(before) && before["bound"].as_str().unwrap().contains("len(items)"),
-        "the loop above the store is counted and the function is exact: {before}"
-    );
-    let after = named(&fs, "A.after");
-    assert!(
-        !is_exact(after) && holes(after).contains(&"for".to_owned()),
-        "the loop below the store is not counted on the entry length - the store forgets \
-         it, as the refusal did, and the loop is the one hole left: {after}"
+        !is_exact(hooked) && holes(hooked).contains(&"complex-assignment-target".to_owned()),
+        "a store the chain intercepts is a hole and forgets the length below it: {hooked}"
     );
     Ok(())
 }
