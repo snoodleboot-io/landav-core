@@ -70,21 +70,27 @@
 // feature exists to avoid.
 
 pub mod cost_class;
+pub mod envelope_provider;
 pub mod pack_error;
 pub mod pack_origin;
 pub mod result_length;
 pub mod shadowed;
 pub mod signature;
 pub mod signature_pack;
+pub mod size_envelope;
 
 pub use crate::{
     cost_class::CostClass,
+    envelope_provider::{
+        Answer, DeclarationProvider, EnvelopeError, Overridden, SizeEnvelopeProvider, SizeEnvelopes,
+    },
     pack_error::PackError,
     pack_origin::PackOrigin,
     result_length::ResultLength,
     shadowed::Shadowed,
     signature::Signature,
     signature_pack::{PACK_FORMAT, SignaturePack},
+    size_envelope::{EnvelopeOrigin, SIZE_ENVELOPE_TRUST, SizeEnvelope, SizeKey, SizePremise},
 };
 
 /// Placeholder so the workspace builds before `LAN-25` lands.
