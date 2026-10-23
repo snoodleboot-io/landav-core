@@ -45,10 +45,12 @@ use crate::{cost_class::CostClass, result_length::ResultLength};
 pub struct Signature {
     /// The callee's name, as the source writes it.
     ///
-    /// A bare name (`isinstance`) or a bare attribute (`append`); a frontend
-    /// matches whichever of the two it can see at the call site. Matching by
-    /// name is the caveat this whole mechanism carries - see
-    /// [`crate::SignaturePack`], where the shadowing rule lives.
+    /// A bare name (`isinstance`), a bare attribute (`append`), or, since
+    /// `LAN-128`, a module-qualified name (`os.getcwd`) that a frontend
+    /// resolves through what the module's imports bind; a frontend matches
+    /// whichever it can see at the call site. Matching by name is the caveat
+    /// this whole mechanism carries - see [`crate::SignaturePack`], where the
+    /// shadowing rule lives.
     pub callee: String,
     /// What the callee costs.
     pub cost: CostClass,

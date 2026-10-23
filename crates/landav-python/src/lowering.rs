@@ -431,6 +431,66 @@ struct ModuleFacts {
     overridden: BTreeSet<String>,
     /// What each class's chain says about a store on `self`.
     stores: StoreFacts,
+    /// Names this module binds **once**, by an absolute import, to the module
+    /// or attribute they stand for. `LAN-128`.
+    imports: BTreeMap<String, String>,
+}
+
+/// The names a module binds exactly once, by an absolute import, mapped to
+/// what they import. `LAN-128`.
+///
+/// `import os` binds `os` to `os`; `import os.path as osp` binds `osp` to
+/// `os.path`; `from threading import Lock as L` binds `L` to
+/// `threading.Lock`. A name the module binds a second time any other way -
+/// `os = fake()` further down, a `def os` - is not here at all: the pack is
+/// keyed by what the name *means*, and a name with two meanings has none this
+/// can use. A relative import names a module of this package and is skipped
+/// for the same reason `binding_sites` skips it for `typing`.
+fn imports_of(statements: &[Stmt]) -> BTreeMap<String, String> {
+    let mut bound_times: BTreeMap<String, usize> = BTreeMap::new();
+    if !binding_sites(statements, &mut |name, _| {
+        *bound_times.entry(name).or_default() += 1;
+    }) {
+        return BTreeMap::new();
+    }
+    let mut imports = BTreeMap::new();
+    for statement in statements {
+        match statement {
+            Stmt::Import(node) => {
+                for alias in &node.names {
+                    let (bound, target) = match &alias.asname {
+                        Some(name) => (name.to_string(), alias.name.to_string()),
+                        None => {
+                            let head = alias.name.split('.').next().unwrap_or(alias.name.as_str());
+                            (head.to_owned(), head.to_owned())
+                        }
+                    };
+                    imports.insert(bound, target);
+                }
+            }
+            Stmt::ImportFrom(node) => {
+                if node.level.is_some_and(|level| level.to_u32() != 0) {
+                    continue;
+                }
+                let Some(module) = node.module.as_ref() else {
+                    continue;
+                };
+                for alias in &node.names {
+                    if alias.name.as_str() == "*" {
+                        continue;
+                    }
+                    let bound = alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| alias.name.to_string(), ToString::to_string);
+                    imports.insert(bound, format!("{module}.{}", alias.name));
+                }
+            }
+            _ => {}
+        }
+    }
+    imports.retain(|name, _| bound_times.get(name).copied() == Some(1));
+    imports
 }
 
 /// As [`lower_module`].
@@ -454,6 +514,7 @@ pub fn lower_module_with(
     let facts = ModuleFacts {
         overridden: overridden_in_module(module.iter()),
         stores: store_facts(module.iter()),
+        imports: imports_of(&module),
     };
     // Which names this module binds for itself, computed once. A signature pack
     // is keyed by *name*, and a module that writes `def isinstance(...)` is not
@@ -734,6 +795,7 @@ fn lower_function(
         receiver,
         instance_method,
         stores: &facts.stores,
+        imports: &facts.imports,
         siblings,
         composed: Vec::new(),
         walks: 0,
@@ -2075,6 +2137,8 @@ struct Translator<'a> {
     instance_method: bool,
     /// What the module says about a store on the receiver. `LAN-120`.
     stores: &'a StoreFacts,
+    /// What the module's once-bound import names stand for. `LAN-128`.
+    imports: &'a BTreeMap<String, String>,
     /// The constant-cost sibling methods a `self.m()` may be declared against.
     /// `LAN-113`; see [`Siblings`].
     siblings: Option<&'a Siblings>,
@@ -3488,6 +3552,18 @@ impl Translator<'_> {
             }
             return Some(effect);
         }
+        // `LAN-128`: a callee reached through an imported module - `os.getcwd()`,
+        // `threading.Lock()` - or a name a `from` import bound, looked up in
+        // the pack under what the import says it is. The receiver or the name
+        // has to be bound exactly once in the module, by that import, and not
+        // rebound in this body; a name with any other meaning gets no row.
+        if let Some(qualified) = self.imported_callee(call) {
+            let row = self.pack.signature(&qualified, |_| false)?;
+            if !self.arguments_are_accounted(call) {
+                return None;
+            }
+            return Some(effect_of(row));
+        }
         let Expr::Name(callee) = call.func.as_ref() else {
             return None;
         };
@@ -3500,6 +3576,38 @@ impl Translator<'_> {
             return None;
         }
         Some(effect_of(row))
+    }
+
+    /// The pack key for a call through an import, if it is one. `LAN-128`.
+    ///
+    /// `os.getcwd()` with `import os` is `os.getcwd`; `osp.join()` with
+    /// `import os.path as osp` is `os.path.join`; `getcwd()` with `from os
+    /// import getcwd` is `os.getcwd`. The bound name must be in the module's
+    /// once-bound imports and must not be rebound in this function: `os =
+    /// fake()` in the body makes `os.getcwd` someone else's.
+    fn imported_callee(&self, call: &ast::ExprCall) -> Option<String> {
+        let rebound = self.rebound.as_ref()?;
+        match call.func.as_ref() {
+            Expr::Attribute(method) => {
+                let Expr::Name(receiver) = method.value.as_ref() else {
+                    return None;
+                };
+                let receiver = receiver.id.as_str();
+                if rebound.contains(receiver) {
+                    return None;
+                }
+                let module = self.imports.get(receiver)?;
+                Some(format!("{module}.{}", method.attr))
+            }
+            Expr::Name(callee) => {
+                let callee = callee.id.as_str();
+                if rebound.contains(callee) {
+                    return None;
+                }
+                self.imports.get(callee).cloned()
+            }
+            _ => None,
+        }
     }
 
     /// The declared effect of `call` if it is `<receiver>.m(...)` on a
@@ -3698,6 +3806,9 @@ impl Translator<'_> {
     /// length either way - never rebound here, so it still holds what the
     /// caller passed. `obj.copy()` on an unannotated `obj` matches nothing.
     fn row_for(&self, call: &ast::ExprCall) -> Option<&Signature> {
+        if let Some(qualified) = self.imported_callee(call) {
+            return self.pack.row(&qualified);
+        }
         match call.func.as_ref() {
             Expr::Name(callee) => {
                 let callee = callee.id.as_str();
