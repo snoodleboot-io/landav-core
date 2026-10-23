@@ -33,11 +33,53 @@ struct Cli {
     command: Command,
 }
 
-/// The subcommands. `check` is the whole surface at M0.
+/// The subcommands. `check` is the analysis; `report` and `diff` read what
+/// it wrote (`LAN-119`).
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Analyse PATH and report what could be concluded about it.
     Check(CheckArgs),
+    /// The coverage picture of one `check --json` run.
+    Report(ReportArgs),
+    /// What changed between two `check --json` runs.
+    Diff(DiffArgs),
+}
+
+/// Arguments to `landav report`.
+#[derive(Debug, Args)]
+struct ReportArgs {
+    /// A run written by `landav check --json`.
+    #[arg(value_name = "RUN")]
+    run: PathBuf,
+
+    /// Emit the picture as JSON instead of tables.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments to `landav diff`.
+#[derive(Debug, Args)]
+struct DiffArgs {
+    /// The earlier run, written by `landav check --json`.
+    #[arg(value_name = "BEFORE")]
+    before: PathBuf,
+
+    /// The later run, over the same code, written by `landav check --json`.
+    #[arg(value_name = "AFTER")]
+    after: PathBuf,
+
+    /// Emit the picture as JSON instead of tables.
+    #[arg(
+        long,
+        long_help = "Emit the picture as JSON on stdout instead of tables.\n\n\
+                     Both runs are read by their stable fields - position, bound kind \
+                     and the construct of each hole - and must carry the schema version \
+                     this binary writes. Functions are matched by file and line.\n\n\
+                     The exit code is always clean: this is a report, not a gate. A \
+                     consumer that wants to fail on a function going from exact to \
+                     anything else reads `regressions` here."
+    )]
+    json: bool,
 }
 
 /// Arguments to `landav check`.
@@ -288,6 +330,8 @@ pub fn dispatch() -> Outcome {
                 args.bounds,
                 args.json,
             ),
+            Command::Report(args) => crate::diff::report(&args.run, args.json),
+            Command::Diff(args) => crate::diff::diff(&args.before, &args.after, args.json),
         },
         Err(error) => usage(&error),
     }
@@ -334,7 +378,7 @@ mod tests {
     #[test]
     fn the_resource_help_is_the_registry_rendering() {
         let check = Cli::command().find_subcommand("check").cloned();
-        assert!(check.is_some(), "`check` is the whole surface at M0");
+        assert!(check.is_some(), "`check` is the analysis subcommand");
         let Some(check) = check else { return };
 
         let arg = check

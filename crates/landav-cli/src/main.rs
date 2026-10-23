@@ -9,7 +9,7 @@
 //!
 //! Subcommands `check`, `explain`, `calibrate` and `version`; configuration
 //! discovery via `pyproject.toml`; consistent exit codes. Everything else in
-//! the product is reachable through this binary. At M0 only `check` exists.
+//! the product is reachable through this binary. At M0 `check` is the analysis.
 //!
 //! # Free forever
 //!
@@ -17,6 +17,9 @@
 //! OSS". The CLI, the analysis it drives and the CI integrations that wrap it
 //! all ship Apache-2.0 in `landav-core`. What is paid is org-level governance
 //! and the hosted platform — never the verdict itself.
+//!
+//! Beside `check` sit `report` and `diff` (`LAN-119`), which read what `check
+//! --json` wrote: the coverage picture of a run, and of a change.
 //!
 //! # Naming
 //!
@@ -40,6 +43,7 @@ mod cli;
 mod config;
 mod derived;
 mod diagnostic;
+mod diff;
 mod machine;
 mod outcome;
 mod resource;
