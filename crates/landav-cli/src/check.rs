@@ -1100,11 +1100,12 @@ fn describe_bound(
         );
     };
     let line = format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
         describe_cost(&where_, function, derived, records),
         protocol_premise(function, derived),
         supplied_premise(function, derived, pack),
-        sibling_premise(function, derived, siblings)
+        sibling_premise(function, derived, siblings),
+        store_premise(function, derived)
     );
     match resource_clause(derived, function.program(), resource) {
         Some(clause) => format!("{line}; {clause}"),
@@ -1186,6 +1187,46 @@ fn protocol_premise(
 /// `m` only if no subclass overrides it, and Python's late binding means the
 /// analysis cannot see one. The number in front of the reader is complete
 /// because that was assumed, and it says so.
+/// The `plain-attribute-store` clause: which `Class.attr` stores this bound
+/// treats as one step. `LAN-120`. Read back off the program like the sibling
+/// clause: a store the frontend admitted is a declared
+/// `complex-assignment-target` node whose `detail` is the attribute.
+fn store_premise(
+    function: &landav_python::LoweredFunction,
+    derived: &landav_engine::TripCount,
+) -> String {
+    let Some(class) = function.class() else {
+        return String::new();
+    };
+    if derived.bound().is_none() {
+        return String::new();
+    }
+    let mut resting: BTreeSet<String> = BTreeSet::new();
+    for node in function.program().unsupported_nodes() {
+        if node.construct() != landav_its::Construct::ComplexAssignmentTarget
+            || node.declared().is_none()
+        {
+            continue;
+        }
+        let Some(attr) = node
+            .detail()
+            .and_then(|detail| detail.as_str().strip_prefix('.'))
+        else {
+            continue;
+        };
+        resting.insert(format!("{class}.{attr}"));
+    }
+    if resting.is_empty() {
+        return String::new();
+    }
+    let said: Vec<String> = resting.into_iter().map(|q| format!("`{q}`")).collect();
+    format!(
+        "; believed on {}: the store is a plain `object.__setattr__`, assuming no base outside \
+         this module and no subclass intercepts it with `__setattr__` or a descriptor",
+        said.join(", ")
+    )
+}
+
 fn sibling_premise(
     function: &landav_python::LoweredFunction,
     derived: &landav_engine::TripCount,

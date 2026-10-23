@@ -247,6 +247,156 @@ fn overridden_in_module<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> B
 ///
 /// # Errors
 ///
+/// What a module says about a store on `self` in each of its classes.
+/// `LAN-120`.
+///
+/// `self.attr = v` is `object.__setattr__` - a dictionary write, one step -
+/// unless the receiver's type intercepts it: a `__setattr__` of its own, a
+/// data descriptor for `attr` (a `property`, a custom descriptor; both are
+/// bound at class level), `__slots__`, or a metaclass or class decorator that
+/// may install any of those. The receiver's exact type is unknown, but it is
+/// *some* instance of the enclosing class, so the classes that matter are the
+/// enclosing class, every same-module subclass of it (the instance may be one),
+/// and every same-module base of those (the method resolution order runs
+/// through them). That is the **chain**, and these are its facts.
+///
+/// What the chain cannot see - a base imported from elsewhere, a subclass in
+/// another module - is the `plain-attribute-store` premise the bound is
+/// published with, exactly as `same-class-method` says for a sibling call.
+#[derive(Debug, Default)]
+struct StoreFacts {
+    /// Classes whose chain intercepts every store.
+    intercepted: BTreeSet<String>,
+    /// Per class, every name bound at class level anywhere in its chain.
+    class_level: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl StoreFacts {
+    /// Whether `self.attr = v` in a method of `class` is a plain store, as
+    /// far as this module can say. A class the module does not define answers
+    /// `false`: there is no chain to read.
+    fn plain(&self, class: &str, attr: &str) -> bool {
+        !self.intercepted.contains(class)
+            && self
+                .class_level
+                .get(class)
+                .is_some_and(|names| !names.contains(attr))
+    }
+}
+
+/// The [`StoreFacts`] of a module. `LAN-120`.
+///
+/// Conservative in every direction a static reading can be: a class decorator
+/// of any kind intercepts (`@dataclass(frozen=True)` installs a `__setattr__`),
+/// a metaclass intercepts, `__slots__` intercepts (a slotted chain usually
+/// carries descriptors too, and the argument for admitting it is a separate
+/// one), and any class-level binding of `attr` - a method, a nested class, a
+/// plain class attribute, a `property` - refuses the store of `attr`.
+fn store_facts<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> StoreFacts {
+    struct Own<'a> {
+        bases: Vec<&'a str>,
+        intercepts: bool,
+        names: BTreeSet<String>,
+    }
+    let mut own: BTreeMap<&str, Own<'_>> = BTreeMap::new();
+    for statement in statements {
+        let Stmt::ClassDef(class) = statement else {
+            continue;
+        };
+        let bases = class
+            .bases
+            .iter()
+            .filter_map(|base| match base {
+                Expr::Name(name) => Some(name.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut intercepts = !class.keywords.is_empty() || !class.decorator_list.is_empty();
+        let mut names = BTreeSet::new();
+        for member in &class.body {
+            match member {
+                Stmt::FunctionDef(def) => {
+                    intercepts |= def.name.as_str() == "__setattr__";
+                    names.insert(def.name.to_string());
+                }
+                Stmt::AsyncFunctionDef(def) => {
+                    names.insert(def.name.to_string());
+                }
+                Stmt::ClassDef(def) => {
+                    names.insert(def.name.to_string());
+                }
+                Stmt::Assign(assign) => {
+                    for target in &assign.targets {
+                        collect_target_names(target, &mut names);
+                    }
+                }
+                Stmt::AnnAssign(assign) => collect_target_names(&assign.target, &mut names),
+                Stmt::AugAssign(assign) => collect_target_names(&assign.target, &mut names),
+                _ => {}
+            }
+        }
+        intercepts |= names.contains("__slots__");
+        own.insert(
+            class.name.as_str(),
+            Own {
+                bases,
+                intercepts,
+                names,
+            },
+        );
+    }
+    let mut facts = StoreFacts::default();
+    for class in own.keys() {
+        // The class and its same-module subclasses, transitively ...
+        let mut chain: BTreeSet<&str> = BTreeSet::new();
+        let mut frontier = vec![*class];
+        while let Some(current) = frontier.pop() {
+            if !chain.insert(current) {
+                continue;
+            }
+            frontier.extend(
+                own.iter()
+                    .filter(|(_, facts)| facts.bases.contains(&current))
+                    .map(|(name, _)| *name),
+            );
+        }
+        // ... and every same-module base of those, transitively.
+        let mut frontier: Vec<&str> = chain.iter().copied().collect();
+        while let Some(current) = frontier.pop() {
+            let Some(facts) = own.get(current) else {
+                continue;
+            };
+            for base in &facts.bases {
+                if chain.insert(base) {
+                    frontier.push(base);
+                }
+            }
+        }
+        let mut names = BTreeSet::new();
+        let mut intercepted = false;
+        for member in &chain {
+            if let Some(facts) = own.get(member) {
+                intercepted |= facts.intercepts;
+                names.extend(facts.names.iter().cloned());
+            }
+        }
+        if intercepted {
+            facts.intercepted.insert((*class).to_owned());
+        }
+        facts.class_level.insert((*class).to_owned(), names);
+    }
+    facts
+}
+
+/// What one pass over a module tells every function in it. `LAN-116`,
+/// `LAN-120`.
+struct ModuleFacts {
+    /// Every `Class.method` a subclass in the module redefines.
+    overridden: BTreeSet<String>,
+    /// What each class's chain says about a store on `self`.
+    stores: StoreFacts,
+}
+
 /// As [`lower_module`].
 pub fn lower_module_with(
     path: &Path,
@@ -265,7 +415,10 @@ pub fn lower_module_with(
     };
     let (module, index) = parse_guarded(path, source)?;
     // `LAN-116`: which methods a subclass in this module redefines.
-    let overridden = overridden_in_module(module.iter());
+    let facts = ModuleFacts {
+        overridden: overridden_in_module(module.iter()),
+        stores: store_facts(module.iter()),
+    };
     // Which names this module binds for itself, computed once. A signature pack
     // is keyed by *name*, and a module that writes `def isinstance(...)` is not
     // calling the builtin - see `SignaturePack` for the whole caveat and for
@@ -287,7 +440,7 @@ pub fn lower_module_with(
                 module_bound.as_ref(),
                 pack,
                 siblings,
-                &overridden,
+                &facts,
             ));
         }
     }
@@ -371,6 +524,10 @@ struct Definition<'a> {
     args: &'a ast::Arguments,
     /// The statements to translate.
     body: &'a [Stmt],
+    /// The decorators, as written. `@staticmethod` and `@classmethod` say the
+    /// first parameter is not an instance, which a store on it depends on
+    /// (`LAN-120`).
+    decorators: &'a [Expr],
     /// The extent of the **whole statement**. For an `async def` that starts at
     /// the `async` keyword, not at the `def` five characters later, so a report
     /// points at the line as the reader sees it.
@@ -394,6 +551,7 @@ impl<'a> Definition<'a> {
                 trust,
                 args: function.args.as_ref(),
                 body: &function.body,
+                decorators: &function.decorator_list,
                 range: function.range,
             }),
             Stmt::AsyncFunctionDef(function) => Some(Self {
@@ -404,6 +562,7 @@ impl<'a> Definition<'a> {
                 trust,
                 args: function.args.as_ref(),
                 body: &function.body,
+                decorators: &function.decorator_list,
                 range: function.range,
             }),
             _ => None,
@@ -455,13 +614,18 @@ fn lower_function(
     module_bound: Option<&BTreeSet<String>>,
     pack: &SignaturePack,
     siblings: Option<&Siblings>,
-    overridden: &BTreeSet<String>,
+    facts: &ModuleFacts,
 ) -> LoweredFunction {
     // The receiver a sibling call is spelled on: a method's first parameter,
     // whatever it is called. A module-level function has none, so no
     // `x.m()` in it can be a sibling call.
     let parameters = parameter_names(function);
     let receiver = function.class.and_then(|_| parameters.first().cloned());
+    // Whether that receiver is an instance. `@staticmethod` and `@classmethod`
+    // make it something else, and a store on it is then not a store on an
+    // instance of the class (`LAN-120`).
+    let instance_method =
+        function.class.is_some() && !function.decorators.iter().any(is_static_or_class);
     let integers = integer_names(function);
     let name = function.qualified_name();
     let class = function.class.map(str::to_owned);
@@ -532,6 +696,8 @@ fn lower_function(
         pack,
         class: function.class,
         receiver,
+        instance_method,
+        stores: &facts.stores,
         siblings,
         composed: Vec::new(),
         walks: 0,
@@ -550,7 +716,7 @@ fn lower_function(
     }
     let program = translator.builder.build(body);
 
-    let overridden_in_module = overridden.contains(&name);
+    let overridden_in_module = facts.overridden.contains(&name);
     LoweredFunction::new(
         name,
         class,
@@ -1868,6 +2034,11 @@ struct Translator<'a> {
     /// The name a sibling call is spelled on - the method's first parameter -
     /// or `None` for a module-level function. `LAN-113`.
     receiver: Option<String>,
+    /// Whether [`Self::receiver`] is an instance of [`Self::class`], rather
+    /// than the class itself or an ordinary first argument. `LAN-120`.
+    instance_method: bool,
+    /// What the module says about a store on the receiver. `LAN-120`.
+    stores: &'a StoreFacts,
     /// The constant-cost sibling methods a `self.m()` may be declared against.
     /// `LAN-113`; see [`Siblings`].
     siblings: Option<&'a Siblings>,
@@ -2234,10 +2405,71 @@ impl Translator<'_> {
         };
         let Expr::Name(name) = target else {
             let mut statements = self.discarded_cost_of(&assign.value);
-            statements.push(self.refuse_targets(assign, [target]));
+            let store = self
+                .plain_store(assign, target)
+                .unwrap_or_else(|| self.refuse_targets(assign, [target]));
+            statements.push(store);
             return statements;
         };
         self.bind_expression(name.id.as_str(), target, &assign.value, assign, 0)
+    }
+
+    /// `self.attr = v` as bounded work, when the module says nothing
+    /// intercepts it; `None` otherwise, and the caller refuses. `LAN-120`.
+    ///
+    /// # What is being claimed
+    ///
+    /// That the store is `object.__setattr__`: one step, no local rebound,
+    /// an object mutated. The receiver has to be the method's first parameter
+    /// in an instance method, not rebound before this line (a `self = other`
+    /// makes it some other object), and the enclosing class's chain - see
+    /// [`StoreFacts`] - has to define no `__setattr__`, no `__slots__`, no
+    /// metaclass or class decorator, and no class-level binding of `attr`.
+    /// What the chain cannot see is published as the `plain-attribute-store`
+    /// premise, read back off this node's `detail` by the driver.
+    ///
+    /// `mutates_arguments` is `true`: a store on `self` is a mutation of the
+    /// object, and a length read through it (`LAN-101`'s volatile names) must
+    /// not survive this line. `rebinds_locals` is `false`: no name in this
+    /// frame changes.
+    ///
+    /// An augmented store (`self.n += 1`) is deliberately not this: it reads
+    /// `self.n`, which may run a `property`, and the operator may be user code
+    /// on whatever is stored.
+    fn plain_store<T: Ranged>(&mut self, node: &T, target: &Expr) -> Option<StmtId> {
+        if !self.instance_method {
+            return None;
+        }
+        let class = self.class?;
+        let receiver = self.receiver.as_deref()?;
+        let Expr::Attribute(attribute) = target else {
+            return None;
+        };
+        let Expr::Name(value) = attribute.value.as_ref() else {
+            return None;
+        };
+        if value.id.as_str() != receiver {
+            return None;
+        }
+        if self
+            .rebound
+            .as_ref()
+            .is_none_or(|names| names.contains(receiver))
+        {
+            return None;
+        }
+        if !self.stores.plain(class, attribute.attr.as_str()) {
+            return None;
+        }
+        let origin = self.origin(node);
+        Some(self.builder.declared_stmt_writing(
+            Construct::ComplexAssignmentTarget,
+            Some(Symbol::from(format!(".{}", attribute.attr))),
+            Extent::Statement,
+            DeclaredEffect::new(0, false, true),
+            Writes::at_most(Vec::new()),
+            origin,
+        ))
     }
 
     /// Emits `name = value`, splitting a conditional expression into a branch.
@@ -2391,7 +2623,10 @@ impl Translator<'_> {
         };
         let Expr::Name(name) = assign.target.as_ref() else {
             let mut statements = self.discarded_cost_of(value);
-            statements.push(self.refuse_targets(assign, [assign.target.as_ref()]));
+            let store = self
+                .plain_store(assign, assign.target.as_ref())
+                .unwrap_or_else(|| self.refuse_targets(assign, [assign.target.as_ref()]));
+            statements.push(store);
             return statements;
         };
         // `x: str = v` binds a name this fragment cannot hold, exactly as an
@@ -4017,6 +4252,18 @@ impl Translator<'_> {
 /// Anything else is translated as usual. `except self.errors:` runs a
 /// `property`; `raise ValueError(explain(n))` runs a call. Both have unknown
 /// costs and both must be named where they stand.
+/// Whether a decorator makes a method's first parameter not an instance.
+/// `LAN-120`.
+fn is_static_or_class(decorator: &Expr) -> bool {
+    let name = match decorator {
+        Expr::Name(name) => name.id.as_str(),
+        Expr::Attribute(attribute) => attribute.attr.as_str(),
+        Expr::Call(call) => return is_static_or_class(&call.func),
+        _ => return true,
+    };
+    matches!(name, "staticmethod" | "classmethod")
+}
+
 fn is_name_lookup(expr: &Expr) -> bool {
     match expr {
         Expr::Name(_) => true,

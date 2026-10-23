@@ -214,8 +214,11 @@ pub struct Premise {
     /// calling that a variable would have been the field meaning something
     /// different depending on the value of another field.
     pub subject: String,
-    /// `"concrete-type"`, `"protocol"`, `"supplied-signature"`, or
-    /// `"same-class-method"` (`LAN-113`).
+    /// `"concrete-type"`, `"protocol"`, `"supplied-signature"`,
+    /// `"same-class-method"` (`LAN-113`), or `"plain-attribute-store"`
+    /// (`LAN-120`: a `self.attr = v` taken as one step because nothing in the
+    /// class's same-module chain intercepts it; the premise is that nothing
+    /// outside the module does either).
     pub trust: &'static str,
     /// Why the number is believed, in one sentence.
     ///
@@ -283,7 +286,49 @@ fn premises_of(
         .collect();
     premises.extend(supplied_premises(program, pack));
     premises.extend(sibling_premises(program, class, siblings));
+    premises.extend(store_premises(program, class));
     premises
+}
+
+/// One premise per attribute this program's bound stores to as one step.
+/// `LAN-120`.
+///
+/// Read back off the program like [`sibling_premises`]: an admitted store is
+/// still a node, a declared `complex-assignment-target` whose `detail` is the
+/// attribute. The premise is that the receiver's real type - some instance of
+/// this class, possibly of a subclass in another module, possibly with a base
+/// from another module - does not intercept the store with a `__setattr__` or
+/// a descriptor, which the module scan that admitted it could not see.
+fn store_premises(program: &landav_its::SourceProgram, class: Option<&str>) -> Vec<Premise> {
+    let Some(class) = class else {
+        return Vec::new();
+    };
+    let mut resting: BTreeSet<String> = BTreeSet::new();
+    for node in program.unsupported_nodes() {
+        if node.construct() != Construct::ComplexAssignmentTarget || node.declared().is_none() {
+            continue;
+        }
+        let Some(attr) = node
+            .detail()
+            .and_then(|detail| detail.as_str().strip_prefix('.'))
+        else {
+            continue;
+        };
+        resting.insert(format!("{class}.{attr}"));
+    }
+    resting
+        .into_iter()
+        .map(|qualified| Premise {
+            subject: qualified.clone(),
+            trust: "plain-attribute-store",
+            because: format!(
+                "the store to `{qualified}` is taken as a plain `object.__setattr__`, one step, \
+                 because nothing in the class's same-module chain intercepts it; the premise is \
+                 that no base outside this module and no subclass elsewhere intercepts it with a \
+                 `__setattr__` or a descriptor, which the analysis cannot see"
+            ),
+        })
+        .collect()
 }
 
 /// One premise per sibling method this program's bound closed over. `LAN-113`.
