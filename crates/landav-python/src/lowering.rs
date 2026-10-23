@@ -250,11 +250,11 @@ fn overridden_in_module<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> B
 /// What a module says about a store on `self` in each of its classes.
 /// `LAN-120`.
 ///
-/// `self.attr = v` is `object.__setattr__` - a dictionary write, one step -
-/// unless the receiver's type intercepts it: a `__setattr__` of its own, a
-/// data descriptor for `attr` (a `property`, a custom descriptor; both are
-/// bound at class level), `__slots__`, or a metaclass or class decorator that
-/// may install any of those. The receiver's exact type is unknown, but it is
+/// `self.attr = v` is `object.__setattr__` - a dictionary write, or a slot
+/// write, one step either way - unless the receiver's type intercepts it: a
+/// `__setattr__` of its own, a data descriptor for `attr` (a `property`, a
+/// custom descriptor; both are bound at class level), or a metaclass or class
+/// decorator that may install any of those. The receiver's exact type is unknown, but it is
 /// *some* instance of the enclosing class, so the classes that matter are the
 /// enclosing class, every same-module subclass of it (the instance may be one),
 /// and every same-module base of those (the method resolution order runs
@@ -288,10 +288,9 @@ impl StoreFacts {
 ///
 /// Conservative in every direction a static reading can be: a class decorator
 /// of any kind intercepts (`@dataclass(frozen=True)` installs a `__setattr__`),
-/// a metaclass intercepts, `__slots__` intercepts (a slotted chain usually
-/// carries descriptors too, and the argument for admitting it is a separate
-/// one), and any class-level binding of `attr` - a method, a nested class, a
-/// plain class attribute, a `property` - refuses the store of `attr`.
+/// a metaclass intercepts, and any class-level binding of `attr` - a method, a
+/// nested class, a plain class attribute, a `property` - refuses the store of
+/// `attr`. `__slots__` does not intercept; see the note in the scan.
 fn store_facts<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> StoreFacts {
     struct Own<'a> {
         bases: Vec<&'a str>,
@@ -335,7 +334,12 @@ fn store_facts<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> StoreFacts
                 _ => {}
             }
         }
-        intercepts |= names.contains("__slots__");
+        // `__slots__` is deliberately *not* an interception (`LAN-121`): a slot
+        // is a member descriptor whose `__set__` writes a fixed offset, the
+        // same one step as a dictionary write, and a store to a name that is
+        // not a slot raises in one step too. What a slotted chain may carry
+        // besides - a `property`, a descriptor, a `__setattr__` - is checked
+        // on its own above and below, per name and per chain.
         own.insert(
             class.name.as_str(),
             Own {

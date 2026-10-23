@@ -146,8 +146,8 @@ class A:
 }
 
 /// **What the chain can see refuses: `__setattr__`, a class-level binding of
-/// the name, `__slots__`, a metaclass, a class decorator - in the class, a
-/// same-module base, or a same-module subclass.**
+/// the name, a metaclass, a class decorator - in the class, a same-module
+/// base, or a same-module subclass. `__slots__` does not (`LAN-121`).**
 #[test]
 fn an_intercepted_chain_refuses() -> io::Result<()> {
     let source = "\
@@ -221,7 +221,10 @@ class ClassAttr:
             "ViaBase.put",
             "a property on `v` in a base says nothing about `w`",
         ),
-        ("Slotted.set", "`__slots__`"),
+        (
+            "Slotted.set",
+            "a slot is a fixed-offset write, not an interception",
+        ),
         ("WithMeta.set", "a metaclass"),
         (
             "Decorated.set",
@@ -234,6 +237,14 @@ class ClassAttr:
             // `w` is bound nowhere in the chain and nothing intercepts stores
             // generally: a property on `v` says nothing about `w`. Admitted.
             assert!(is_exact(f), "{name}: {why}: {f}");
+            continue;
+        }
+        if name == "Slotted.set" {
+            // `LAN-121`: a slot is a member descriptor, one step to write.
+            assert!(
+                is_exact(f) && has_store_premise(f, "Slotted.x"),
+                "{name}: {why}: {f}"
+            );
             continue;
         }
         assert!(
