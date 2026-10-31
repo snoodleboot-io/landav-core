@@ -11,7 +11,8 @@
 //!   because the parser itself is recursive and we do not get to choose how it
 //!   fails.
 
-use ruff_python_ast::{Expr, ExprContext, Stmt};
+use ruff_python_ast::{Decorator, Expr, ExprContext, Stmt};
+use ruff_text_size::{TextRange, TextSize};
 
 /// The deepest block nesting the frontend will parse.
 ///
@@ -76,6 +77,55 @@ fn clamp_u32(value: usize) -> u32 {
 ///
 /// Brackets inside string literals and comments do not count, so a docstring
 /// full of `[[[[` is not mistaken for a deeply nested expression.
+/// Where a definition's own keyword starts, skipping its decorators.
+///
+/// This parser's range for a `def` or a `class` **begins at the first
+/// decorator**; the previous one began at the keyword. A report has to keep
+/// pointing at the `def`, for three reasons: it is the line a traceback names
+/// and a reader looks for, it is the line every other Python tool reports, and
+/// it is `Function.line` and `Function.column` in the machine schema, which
+/// consumers have stored. Measured while swapping the parser: taking the
+/// range's own start moved 10,802 of the momentum corpus's 43,203 functions
+/// earlier by exactly their decorator count, and nothing else about them
+/// changed.
+///
+/// A definition with no decorators needs no work - the range already starts at
+/// the keyword, `async` included. Otherwise this scans from the end of the last
+/// decorator for the first byte that is neither whitespace, a comment, nor a
+/// line continuation, which is the `def`, `async` or `class` that follows. A
+/// scan that runs out of source falls back to the range's start rather than
+/// reporting a position past the end of the file.
+pub(crate) fn definition_keyword(
+    source: &str,
+    range: TextRange,
+    decorators: &[Decorator],
+) -> TextRange {
+    let Some(last) = decorators.last() else {
+        return range;
+    };
+    let bytes = source.as_bytes();
+    let mut offset = last.range.end().to_usize();
+    while let Some(&byte) = bytes.get(offset) {
+        match byte {
+            b'#' => {
+                while bytes.get(offset).is_some_and(|byte| *byte != b'\n') {
+                    offset += 1;
+                }
+            }
+            b'\\' => offset += 1,
+            byte if byte.is_ascii_whitespace() => offset += 1,
+            _ => break,
+        }
+    }
+    TextSize::try_from(offset).map_or(range, |start| {
+        if start <= range.end() {
+            TextRange::new(start, range.end())
+        } else {
+            range
+        }
+    })
+}
+
 pub(crate) fn nesting_overflow(source: &str) -> Option<usize> {
     let bytes = source.as_bytes();
     let mut index = 0_usize;

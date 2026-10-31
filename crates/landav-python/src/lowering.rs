@@ -550,7 +550,7 @@ pub fn lower_module_with(
     // empty set.
     let mut lowered = Vec::new();
     for statement in &module {
-        for definition in Definition::all_of(statement, &typing, trust) {
+        for definition in Definition::all_of(statement, source, &typing, trust) {
             lowered.push(lower_function(
                 path,
                 &index,
@@ -659,7 +659,12 @@ impl<'a> Definition<'a> {
     /// place that decides what counts as a top-level function, so a node type
     /// missing from it is missing from the denominator and says nothing about
     /// itself anywhere in the output. That silence is the whole of `LAN-93`.
-    fn of(statement: &'a Stmt, typing: &'a TypingNames, trust: AnnotationTrust) -> Option<Self> {
+    fn of(
+        statement: &'a Stmt,
+        source: &str,
+        typing: &'a TypingNames,
+        trust: AnnotationTrust,
+    ) -> Option<Self> {
         match statement {
             Stmt::FunctionDef(function) => Some(Self {
                 name: function.name.as_str(),
@@ -670,7 +675,13 @@ impl<'a> Definition<'a> {
                 args: function.parameters.as_ref(),
                 body: &function.body,
                 decorators: &function.decorator_list,
-                range: function.range,
+                // Not `function.range`: that starts at the first decorator.
+                // See `syntax::definition_keyword`.
+                range: crate::syntax::definition_keyword(
+                    source,
+                    function.range,
+                    &function.decorator_list,
+                ),
             }),
             _ => None,
         }
@@ -678,8 +689,13 @@ impl<'a> Definition<'a> {
 
     /// Every definition a module-level `statement` holds: the function it is,
     /// or the methods of the class it is. See the type's doc for `LAN-104`.
-    fn all_of(statement: &'a Stmt, typing: &'a TypingNames, trust: AnnotationTrust) -> Vec<Self> {
-        if let Some(function) = Self::of(statement, typing, trust) {
+    fn all_of(
+        statement: &'a Stmt,
+        source: &str,
+        typing: &'a TypingNames,
+        trust: AnnotationTrust,
+    ) -> Vec<Self> {
+        if let Some(function) = Self::of(statement, source, typing, trust) {
             return vec![function];
         }
         let Stmt::ClassDef(class) = statement else {
@@ -688,7 +704,7 @@ impl<'a> Definition<'a> {
         class
             .body
             .iter()
-            .filter_map(|member| Self::of(member, typing, trust))
+            .filter_map(|member| Self::of(member, source, typing, trust))
             .map(|method| Self {
                 class: Some(class.name.as_str()),
                 class_body: Some(&class.body),
