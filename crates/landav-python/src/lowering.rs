@@ -466,6 +466,21 @@ fn module_functions_of(statements: &[Stmt]) -> BTreeSet<String> {
 /// keyed by what the name *means*, and a name with two meanings has none this
 /// can use. A relative import names a module of this package and is skipped
 /// for the same reason `binding_sites` skips it for `typing`.
+///
+/// # A lazy import binds nothing this can use
+///
+/// `lazy import os` (PEP 810, Python 3.15) does not import `os`. It binds
+/// `os` to a promise, and the **first read of the name** runs the whole
+/// module import. So `os.getcwd()` under a lazy import is not the one step
+/// `LAN-128`'s row claims; it is one step plus however long importing `os`
+/// takes, which is unbounded and is exactly the cost a row must not hide. A
+/// lazily bound name is therefore absent from this map, and a call through it
+/// keeps its `call` hole.
+///
+/// [`binding_sites`] does the opposite and still counts it, which is not an
+/// inconsistency: a lazy import does bind the name, so it must still
+/// disqualify a pack row keyed by that name. What changes under `lazy` is the
+/// *cost* of reading it, not the *meaning*.
 fn imports_of(statements: &[Stmt]) -> BTreeMap<String, String> {
     let mut bound_times: BTreeMap<String, usize> = BTreeMap::new();
     if !binding_sites(statements, &mut |name, _| {
@@ -477,6 +492,9 @@ fn imports_of(statements: &[Stmt]) -> BTreeMap<String, String> {
     for statement in statements {
         match statement {
             Stmt::Import(node) => {
+                if node.is_lazy {
+                    continue;
+                }
                 for alias in &node.names {
                     let (bound, target) = match &alias.asname {
                         Some(name) => (name.to_string(), alias.name.to_string()),
@@ -489,7 +507,7 @@ fn imports_of(statements: &[Stmt]) -> BTreeMap<String, String> {
                 }
             }
             Stmt::ImportFrom(node) => {
-                if node.level != 0 {
+                if node.is_lazy || node.level != 0 {
                     continue;
                 }
                 let Some(module) = node.module.as_ref() else {
@@ -4438,17 +4456,17 @@ impl Translator<'_> {
                 }
                 self.refuse_expr(Construct::Collection, None, node, origin)
             }
-            // A template string (PEP 750) is a `Template` object, not a
-            // string: its interpolations are handed to a user-written
-            // processing function rather than formatted. So it is **not**
-            // freed the way `LAN-115` freed an f-string, and it is not walked
-            // like one either. `LAN-132` gives it a construct of its own; at
-            // the level this build claims it cannot appear at all.
+            // A template string (PEP 750) builds a `Template`, not a
+            // `str`. Before `LAN-132` it refused as `Collection`, which named
+            // it a string value and was wrong about the program;
+            // [`Construct::TemplateString`] carries the reasoning. The
+            // interpolations are still walked, so the region still gets its
+            // interior named.
             Expr::TString(_) => {
                 if self.discarding {
                     return self.builder.int(0, origin);
                 }
-                self.refuse_expr(Construct::Collection, None, node, origin)
+                self.refuse_expr(Construct::TemplateString, None, node, origin)
             }
             // Jupyter magic. Unreachable from a `.py` file parsed as a
             // module; refused rather than dropped, for the reason this file's
@@ -5009,6 +5027,14 @@ fn format_is_constant(expr: &Expr) -> bool {
         // A plain `"..."` or `b"..."`. Not an integer, so not something whose
         // value is read.
         Expr::StringLiteral(_) | Expr::BytesLiteral(_) => true,
+        // A t-string is **not** one of these, and says so here rather than
+        // falling into the catch-all, because this is the one place somebody
+        // extending PEP 750 support would reach for. `f"..."` is free here
+        // because the `str` it builds is bounded by the format literal;
+        // `t"..."` builds a `Template` that user-written code consumes
+        // afterwards, so the bound does not follow. See
+        // [`Construct::TemplateString`].
+        Expr::TString(_) => false,
         // `"fmt" % args` - `%` formatting, distinguished from integer modulo by
         // a string literal on the left. The right is the interpolated values,
         // which must cost nothing; a tuple of names (`"%s %s" % (a, b)`) is

@@ -50,11 +50,18 @@ mod common;
 use std::io;
 
 use common::{
-    ABOVE_SUPPORTED_LEVEL_PY, CLEAN_PY, EXIT_CLEAN, FINDINGS_PY, PYPROJECT_MALFORMED,
-    PYPROJECT_NO_LANDAV, Project, UNREADABLE_AS_PYTHON_PY,
+    CLEAN_PY, EXIT_CLEAN, FINDINGS_PY, PYPROJECT_MALFORMED, PYPROJECT_NO_LANDAV, Project,
+    UNREADABLE_AS_PYTHON_PY,
 };
 
-/// The criterion, stated directly, over both classes of unreadable source.
+/// The criterion, stated directly, over every class of unreadable source.
+///
+/// **There used to be two, and there is one.** The second was valid Python
+/// above the declared level, which `LAN-132` emptied by raising that level to
+/// the newest release there is; `common/mod.rs` records where the fixture
+/// went. The loop is kept rather than flattened because the class comes back
+/// the day the parser learns a Python this build does not claim, and a loop
+/// over one entry costs nothing to extend.
 ///
 /// **Deliberately `!= 0` rather than an exact code.** The implementation has
 /// since chosen `1` (`Outcome::Inconclusive => ExitCode::Findings`, on the
@@ -67,10 +74,11 @@ use common::{
 fn inconclusive_analysis_does_not_report_clean() -> io::Result<()> {
     let project = Project::new()?;
 
-    for (name, body) in [
-        ("python2_module.py", UNREADABLE_AS_PYTHON_PY),
-        ("above_level.py", ABOVE_SUPPORTED_LEVEL_PY),
-    ] {
+    // One class of unreadable source today, and the loop is the point - see
+    // this test's docs. Flattening it would have to be undone the day a
+    // Python this build does not claim exists again.
+    #[allow(clippy::single_element_loop)]
+    for (name, body) in [("python2_module.py", UNREADABLE_AS_PYTHON_PY)] {
         let target = project.write(name, body)?;
 
         let run = project.check(&target, &[])?;

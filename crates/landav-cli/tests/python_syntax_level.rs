@@ -11,19 +11,27 @@
 //! shrinks its own base. That is the failure mode `LAN-68` exists to prevent,
 //! reappearing one level lower down.
 //!
-//! Measured, not assumed. Over the Python 3.12 standard library the pinned
-//! parser reads 567 of 570 files. The three it cannot read —
-//! `test/support/socket_helper.py`, `traceback.py` and `turtle.py` — fail for
-//! the *same* reason, a PEP 701 f-string reusing the enclosing quote, and take
-//! 51 top-level functions with them. Over momentum's backend (7,689 files,
-//! running on CPython 3.14) it reads every one.
+//! Measured, not assumed, and the measurement is now history: over the
+//! Python 3.12 standard library `rustpython-parser 0.4.0` read 564 of the 567
+//! files landav collects. The three it could not read -
+//! `test/support/socket_helper.py`, `traceback.py` and `turtle.py` - failed
+//! for the *same* reason, a PEP 701 f-string reusing the enclosing quote.
+//! `LAN-130` swapped the parser and all three read, taking that corpus from
+//! 12,760 functions to 13,039:
 //!
-//! Fifty-one functions is not a crisis, and this file does not pretend
-//! otherwise. What makes the gap worth closing is its direction: PEP 701 is
-//! what a formatter now *emits*, so the count only goes up, and the reader is
-//! never told. Three unreadable files reported as three problems is honest;
-//! three unreadable files whose functions vanish from a coverage percentage is
-//! not.
+//! | file | functions recovered |
+//! |---|---:|
+//! | `turtle.py` | 214 |
+//! | `traceback.py` | 54 |
+//! | `test/support/socket_helper.py` | 11 |
+//!
+//! `LAN-82` priced the same three files at 51 functions. Both numbers are
+//! right: 51 counted module-level `def`s, which was all the lowering produced
+//! before `LAN-104` reached methods. The *direction* was the argument for
+//! paying, and it held - PEP 701 is what a formatter now emits, so the cost of
+//! not swapping was rising on its own. Three unreadable files reported as
+//! three problems is honest; three unreadable files whose functions vanish
+//! from a coverage percentage is not.
 //!
 //! # Why this file, when `landav-python`'s `parser_boundary.rs` exists
 //!
@@ -36,29 +44,54 @@
 //! pass `parser_boundary.rs` and empty every bound in the product. The
 //! regression tests below are here to make that impossible to ship quietly.
 //!
-//! # Seven of these are `#[ignore]`d, deliberately, and stay runnable
-//!
-//! # The swap this file was written to force
+//! # The swap this file was written to force, and why nothing is `#[ignore]`d
 //!
 //! `LAN-82` left seven tests `#[ignore]`d rather than deleted, each naming the
 //! syntax it needed and the reason it could not have it: `rustpython-parser
 //! 0.4.0` was already the newest release that would ever exist, the
 //! alternative was a `0.0.x` crate, and the measured cost of not swapping was
-//! three stdlib files and 51 top-level functions. A *priced* deferral.
+//! three stdlib files. A *priced* deferral.
 //!
 //! `LAN-130` paid it. `ruff_python_parser` reads all five PEP 701 forms, so
-//! those five tests are no longer ignored, [`UNREAD_AT_SUPPORTED_LEVEL`] is
-//! empty, and the standard library reads **570 of 570** files where it read
-//! 567. The two remaining `#[ignore]`s are PEP 696 (3.13), and they are
-//! deferred for a different reason now: the parser reads that syntax, and the
-//! *declared level* is still 3.12, so it is refused **by version** rather than
-//! by capability. `LAN-132` raises the claim and takes them off.
+//! those five came off `#[ignore]` and [`UNREAD_AT_SUPPORTED_LEVEL`] emptied.
+//! The last two were PEP 696 (3.13), deferred for a different reason by then:
+//! the parser read that syntax and the *declared level* was still 3.12, so it
+//! was refused **by version** rather than by capability. `LAN-132` raised the
+//! claim to 3.15 and took them off. **No test in this file is `#[ignore]`d.**
 //!
-//! That distinction is the one this file now exists to keep honest. The parser
-//! reports syntax above the target separately from malformed source, and
-//! `analysis::parse_guarded` folds both into one refusal, so a form being
+//! That distinction is still the one this file exists to keep honest. The
+//! parser reports syntax above the target separately from malformed source,
+//! and `analysis::parse_guarded` folds both into one refusal, so a form being
 //! "unread" can mean either "nothing can parse this" or "we do not claim this
 //! version yet" - and the second must never be mistaken for the first.
+//!
+//! # There is no longer any Python above the declared level
+//!
+//! 3.15 is the newest released Python *and* the newest its parser knows, so
+//! the second of those two classes is **empty**: no well-formed file exists
+//! that this build is too old to read. That is asserted rather than assumed -
+//! `landav-python`'s `the_declared_level_is_the_newest_python_the_parser_knows`
+//! fails the moment the parser learns 3.16, which is the signal to pick a
+//! 3.16-only form and put the class back. Until then the only parse refusal
+//! left is source that is not Python at any version, and
+//! `a_file_that_is_not_python_at_any_version_still_refuses_with_a_position`
+//! below is what stands for it.
+//!
+//! # What 3.13, 3.14 and 3.15 cost: nothing measurable, which is still worth
+//! asserting
+//!
+//! Raising the claim three releases moved no bound on either corpus, because
+//! neither corpus contains the syntax. The value is not in today's numbers; it
+//! is that a file using the new forms is now *read* and its functions
+//! *counted* rather than dropped before the first `def`. Two of the forms
+//! needed a decision rather than a parser:
+//!
+//! - a t-string is read and then refused as a named construct, because it
+//!   builds a `Template` rather than a `str`;
+//! - `lazy import` **removes** a cost row, because a lazily bound name pays
+//!   its module's import on first read. That one is a soundness fix, and
+//!   `a_lazy_import_does_not_resolve_a_module_attribute_row` below is the
+//!   pin.
 //!
 //! # What "supported version" means here
 //!
@@ -81,6 +114,7 @@
 
 use std::path::Path;
 
+use landav_its::Construct;
 use landav_python::{PythonError, SUPPORTED_PYTHON, UNREAD_AT_SUPPORTED_LEVEL};
 
 // ---------------------------------------------------------------------------
@@ -125,12 +159,34 @@ fn assert_reads(source: &str, name: &str) {
     }
 }
 
+/// The constructs the function called `name` refuses.
+///
+/// For the cases where "the file reads" is only half the claim. A form can be
+/// read and still be outside the analysable fragment, and the two outcomes
+/// are not comparable: the first costs one node and shows up by name, the
+/// second costs every function in the file and shows up nowhere.
+fn constructs_of(source: &str, name: &str) -> Vec<Construct> {
+    let functions = landav_python::lower_module(Path::new("level.py"), source)
+        .unwrap_or_else(|error| panic!("expected this to parse:\n{source}\n{error}"));
+    let function = functions
+        .iter()
+        .find(|function| function.name() == name)
+        .unwrap_or_else(|| panic!("no function `{name}` was lowered from:\n{source}"));
+    function
+        .program()
+        .unsupported_nodes()
+        .map(|node| node.construct())
+        .collect()
+}
+
 /// The frontend refuses `source`, and says where.
 ///
-/// Used only for forms this file has decided **not** to claim yet. The
-/// position is asserted alongside the refusal because a parse error with no
-/// position is indistinguishable from a crash to the operator reading it, and
-/// the whole value of a deferred limit is that a reader can see it.
+/// Since `LAN-132` there is exactly one thing this is for: source that is not
+/// Python at any version. The *other* reason a file used to be refused - being
+/// written in a Python newer than the declared level - cannot happen while the
+/// level is the newest release there is. The position is asserted alongside
+/// the refusal because a parse error with no position is indistinguishable
+/// from a crash to the operator reading it.
 fn assert_refuses(source: &str, why: &str) {
     match lowered_names(source) {
         Ok(names) => panic!(
@@ -251,9 +307,13 @@ def label(row) -> int:
 // 3.13 added exactly one piece of syntax: a default on a type parameter. It
 // appears nowhere in either corpus today, so unlike PEP 701 it costs nothing
 // measurable right now. It is asserted anyway, because it is the *only* thing
-// that distinguishes "reads 3.12" from "reads 3.13", and the ticket asks for
-// 3.13+. A version claim with no test behind it is the drift this file exists
-// to stop.
+// that distinguishes "reads 3.12" from "reads 3.13", and a version claim with
+// no test behind it is the drift this file exists to stop.
+//
+// Both tests ran under `#[ignore]` from `LAN-82` to `LAN-132`, and the reason
+// changed once along the way: first the parser could not read this, then it
+// could and the declared level was still 3.12. `LAN-132` raised the level, so
+// they run.
 
 /// **A generic function may give its type parameter a default.**
 ///
@@ -261,7 +321,6 @@ def label(row) -> int:
 /// `= int` after the parameter. The narrowness is the point: it is one token,
 /// and it is the entire syntactic difference between the two versions.
 #[test]
-#[ignore = "LAN-130 swapped the parser, which reads this; the declared level is still 3.12, so it is refused by version. LAN-132 raises the claim to 3.15 and un-ignores it; run with --ignored to see the parser is ready"]
 fn a_type_parameter_may_have_a_default() {
     let source = "\
 def make[T = int](value: T) -> T:
@@ -278,7 +337,6 @@ def make[T = int](value: T) -> T:
 /// the module. That is the file-scale failure this ticket is about, reproduced
 /// in five lines.
 #[test]
-#[ignore = "LAN-130 swapped the parser, which reads this; the declared level is still 3.12, so it is refused by version. LAN-132 raises the claim to 3.15 and un-ignores it"]
 fn a_defaulted_type_parameter_on_a_class_or_alias_does_not_lose_the_module() {
     let source = "\
 type Pair[T = int] = tuple[T, T]
@@ -391,23 +449,32 @@ def join(rows: list) -> int:
 }
 
 // ---------------------------------------------------------------------------
-// deliberately not claimed
+// PEP 758 and PEP 750 - the 3.14 line
 // ---------------------------------------------------------------------------
+//
+// Both of these were pinned as *deferred* while the declared level was 3.12,
+// each with its reason written down: the syntax cost nothing to omit, and
+// reaching 3.14 was to be a decision somebody made and recorded rather than
+// something a dependency bump did on its own. `LAN-132` is that decision. The
+// parser has read both since `LAN-130`; what changes here is the claim.
 
-/// **Deferred: PEP 758, `except A, B:` without parentheses (3.14).**
+/// **An unparenthesised tuple of exception types reads, and lowers to exactly
+/// what the parenthesised spelling lowers to (PEP 758).**
 ///
-/// Not a gap — a limit, and the difference is that this one is chosen. The
-/// stated level is 3.12, this is 3.14-only syntax, and it appears zero times
-/// across both corpora (momentum runs *on* 3.14 and has not written one). It
-/// is also cost-free to omit: the parenthesised spelling means the same thing,
-/// is still valid, and is what every existing file contains.
+/// The two programs mean the same thing, so the assertion is equivalence
+/// rather than a named construct: whatever this frontend makes of a `try`, it
+/// must make the same of both spellings. That is stronger than naming a
+/// refusal and it cannot rot - if the handling of `try` changes, both sides
+/// move together and this still holds, while a hard-coded construct name
+/// would have to be chased.
 ///
-/// Pinned rather than left untested so that reaching 3.14 is a decision
-/// somebody makes and records here, not something a dependency bump does on
-/// its own.
+/// Measured while writing it: in this shape neither spelling refuses the
+/// handler at all, and the only refusal is the `go(n)` call. A test asserting
+/// `exceptional-control-flow` here would have been asserting something false
+/// about both.
 #[test]
-fn an_unparenthesised_multi_except_is_deferred() {
-    let source = "\
+fn an_unparenthesised_multi_except_reads() {
+    let bare = "\
 def run(n: int) -> int:
     try:
         go(n)
@@ -415,30 +482,177 @@ def run(n: int) -> int:
         pass
     return n
 ";
-    assert_refuses(
-        source,
-        "it is 3.14-only syntax, the stated level is 3.12, and the \
-         parenthesised spelling it replaces is unaffected",
+    let parenthesised = "\
+def run(n: int) -> int:
+    try:
+        go(n)
+    except (ValueError, TypeError):
+        pass
+    return n
+";
+    assert_reads(bare, "run");
+    assert_eq!(
+        constructs_of(bare, "run"),
+        constructs_of(parenthesised, "run"),
+        "PEP 758 is a spelling of the parenthesised form, so the two must \
+         lower alike; a difference here means one of them is being accounted \
+         for and the other is not"
     );
 }
 
-/// **Deferred: PEP 750 template strings (3.14).**
+/// **A template string reads, and is then refused by name (PEP 750).**
 ///
-/// Same argument as PEP 758 and a stronger one: a `t"..."` is not a string at
-/// all but a `Template` object, so reading it would mean teaching the lowering
-/// a new kind of value rather than accepting a new spelling of an old one.
-/// That is fragment work, which `LAN-82` puts out of scope explicitly.
+/// The *shape* of this assertion is the point, and it is the shape that
+/// changed. While the level was 3.12 a `t"..."` was a parse refusal, so this
+/// test asserted that the whole file was lost. At 3.15 it parses: the file is
+/// read, the function is counted, and the t-string is an ordinary named
+/// refusal inside it. That is exactly what raising the level buys - a
+/// construct outside the fragment costs one node and appears by name, a
+/// construct outside the parser costs every function in the file and appears
+/// nowhere.
+///
+/// It is pinned in a *condition* because that is where the construct is
+/// reachable. `message = t"..."` refuses one level earlier as
+/// `non-integer-value` naming the local it rebinds (`LAN-100`), precisely as
+/// an f-string assignment does; a value's own kind is only asked for where an
+/// integer or a truth value is demanded. Measured, not assumed - in that
+/// position an f-string refuses as `collection`, and the whole reason
+/// [`Construct::TemplateString`] exists is that a `Template` is not a string.
 #[test]
-fn a_template_string_is_deferred() {
+fn a_template_string_reads_and_is_refused_as_a_construct() {
     let source = "\
-def greet(name) -> int:
-    message = t\"hello {name}\"
-    return len(message)
+def label(name) -> int:
+    if t\"hello {name}\":
+        return 1
+    return 0
 ";
+    assert_reads(source, "label");
+    let refused = constructs_of(source, "label");
+    assert!(
+        refused.contains(&Construct::TemplateString),
+        "a t-string must be refused under its own name, not as a string \
+         value: got {refused:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PEP 810 and PEP 798 - the 3.15 line
+// ---------------------------------------------------------------------------
+//
+// 3.15 is the newest released Python and the newest the parser knows, so this
+// is the top of the file in both senses. One of the three forms below is not
+// a coverage matter at all: `lazy import` changes what a cost row may claim,
+// and that rule is pinned where the rows live, in `module_rows.rs`.
+
+/// **A `lazy import` reads, and the module after it is not lost (PEP 810).**
+///
+/// The assertion is on the `def` below the import rather than on the import
+/// itself, for the reason the PEP 696 class case gives: an import lowers to no
+/// function of its own, so a parser that stops at line 1 takes the rest of the
+/// module with it and nothing says so.
+///
+/// What a lazy import *costs* is a separate question with a separate answer:
+/// a name bound this way pays its module's import on first read, so it must
+/// not resolve against a `module.attr` cost row. That is a soundness rule, and
+/// `module_rows.rs` holds it.
+#[test]
+fn a_lazy_import_does_not_lose_the_module() {
+    let source = "\
+lazy import os
+lazy from threading import Lock
+
+
+def label(n: int) -> int:
+    total = 0
+    for i in range(n):
+        total = total + 1
+    return total
+";
+    assert_reads(source, "label");
+}
+
+/// **A starred element in a comprehension reads (PEP 798).**
+///
+/// `[*row for row in rows]` was a syntax error before 3.15 and is now the
+/// comprehension spelling of what `[*a, *b]` already did in a display. It
+/// stays refused as `comprehension` - this ticket is about reading the
+/// grammar, not about widening the fragment - and the refusal being *placed*
+/// is what distinguishes that from losing the file.
+#[test]
+fn a_starred_element_in_a_comprehension_reads() {
+    let source = "\
+def label(rows) -> int:
+    items = [*row for row in rows]
+    return len(items)
+";
+    assert_reads(source, "label");
+    assert!(
+        constructs_of(source, "label").contains(&Construct::Comprehension),
+        "the comprehension must still be refused by name"
+    );
+}
+
+/// **A unary-plus pattern reads.**
+///
+/// `case +1:` is 3.15 grammar; before it, only `-1` was allowed as a pattern
+/// literal, which is the kind of asymmetry a reader never guesses at. Still
+/// `pattern-match`, and emphatically not a parse error - a `match` statement
+/// is usually most of a function, so losing the file to one `case` line is
+/// the expensive failure.
+#[test]
+fn a_unary_plus_pattern_reads() {
+    let source = "\
+def label(value) -> int:
+    match value:
+        case +1:
+            return 1
+        case _:
+            return 0
+";
+    assert_reads(source, "label");
+    assert!(
+        constructs_of(source, "label").contains(&Construct::PatternMatch),
+        "the match must still be refused by name"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// deliberately not claimed
+// ---------------------------------------------------------------------------
+//
+// **This section is empty of version deferrals, and that is a measured claim
+// rather than an omission.** It held two: PEP 758 and PEP 750, both 3.14, both
+// now read. Nothing replaced them because nothing can - 3.15 is the newest
+// released Python and the newest the parser knows, so there is no well-formed
+// Python file this build is too old to read. `landav-python`'s
+// `the_declared_level_is_the_newest_python_the_parser_knows` is the tripwire
+// that fails when that stops being true.
+//
+// What remains is the other class of refusal, which no version claim can ever
+// empty: source that is not Python at all.
+
+/// **A file that is not Python at any version is still refused, with a
+/// position.**
+///
+/// The last parse refusal left, and the one that must survive every future
+/// level raise. Python 2 `print` syntax is chosen because it will never start
+/// parsing as Python 3, so this case cannot quietly change what it tests - the
+/// failing-for-the-wrong-reason trap that the above-level fixtures fell into
+/// the moment the frontend caught up with them.
+///
+/// The position is the substance of the assertion. A whole file dropped is the
+/// most expensive refusal this frontend can make, and an operator who cannot
+/// see which line caused it cannot act on it.
+#[test]
+fn a_file_that_is_not_python_at_any_version_still_refuses_with_a_position() {
     assert_refuses(
-        source,
-        "it introduces a new runtime value rather than a new spelling, so \
-         reading it is fragment work and LAN-82 puts that out of scope",
+        "\
+def ok(n):
+    print \"this module was written for Python 2\"
+    return n
+",
+        "no Python 3 parser will ever accept a `print` statement, so this \
+         stands for the one class of refusal a version claim cannot empty",
     );
 }
 
@@ -556,6 +770,55 @@ type Row = tuple[int, int]
 
 
 def label(row) -> int:
+    return 1
+",
+    ),
+    (
+        "3.13",
+        "a PEP 696 default on a type parameter",
+        "\
+def label[T = int](value: T) -> int:
+    return 1
+",
+    ),
+    (
+        "3.14",
+        "a PEP 758 unparenthesised `except` tuple",
+        "\
+def label(n: int) -> int:
+    try:
+        go(n)
+    except ValueError, TypeError:
+        pass
+    return n
+",
+    ),
+    (
+        "3.14",
+        "a PEP 750 template string",
+        "\
+def label(name) -> int:
+    message = t\"hello {name}\"
+    return 1
+",
+    ),
+    (
+        "3.15",
+        "a PEP 810 `lazy import`",
+        "\
+lazy import os
+
+
+def label(n: int) -> int:
+    return 1
+",
+    ),
+    (
+        "3.15",
+        "a PEP 798 starred element in a comprehension",
+        "\
+def label(rows) -> int:
+    items = [*row for row in rows]
     return 1
 ",
     ),
