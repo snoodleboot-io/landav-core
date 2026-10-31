@@ -67,14 +67,27 @@ const SUPPORTED: [(&str, &str); 12] = [
     ),
 ];
 
-/// Syntax that Python 3.12 accepts and this frontend does not.
+/// Source this frontend cannot read, in both of the classes there are.
 ///
-/// PEP 701 lifted the restriction on reusing the enclosing quote inside an
-/// f-string and on splitting the expression across lines. Both are now emitted
-/// by formatters, so a 3.12 repository will contain them.
-const PEP_701: [(&str, &str); 2] = [
-    ("same quote nested", "label = f\"{row[\"name\"]}\"\n"),
-    ("multi-line expression", "label = f\"{\n    row.name\n}\"\n"),
+/// Until `LAN-130` this list was two PEP 701 f-strings - valid Python 3.12 the
+/// parser predated - and they have moved into [`SUPPORTED`]. What is left is
+/// the distinction that replaced them:
+///
+/// * **not Python at any version.** Nothing will ever parse it.
+/// * **Python above the declared level.** `except A, B:` is PEP 758, valid
+///   3.14, and `landav_python::SUPPORTED_PYTHON` says 3.12. The parser reads
+///   the form and reports it as unsupported *for the target*, which
+///   `parse_guarded` folds into the same refusal - because a file above the
+///   level is a file this build has not read.
+///
+/// The second entry tracks the declared level and is expected to move into
+/// [`SUPPORTED`] when the level passes 3.14, exactly as the f-strings did.
+const UNREADABLE: [(&str, &str); 2] = [
+    ("not Python at any version", "def f(:\n    return 1\n"),
+    (
+        "PEP 758 multi-except, above the declared level",
+        "def f(xs):\n    try:\n        go(xs)\n    except ValueError, TypeError:\n        pass\n",
+    ),
 ];
 
 #[test]
@@ -97,12 +110,12 @@ fn supported_syntax_is_analysed_rather_than_rejected() {
 /// being reported as "nothing to see".
 #[test]
 fn unparsable_source_is_an_error_with_a_position_and_never_an_empty_result() {
-    for (label, source) in PEP_701 {
+    for (label, source) in UNREADABLE {
         match analyze_source(Path::new("modern.py"), source) {
-            Ok(findings) => assert!(
-                !findings.is_empty(),
-                "{label}: parsed but yielded nothing; if the parser now reads PEP 701 this test \
-                 should be moved into SUPPORTED"
+            Ok(findings) => panic!(
+                "{label}: parsed, yielding {} finding(s). If the frontend now reads this, move \
+                 the entry into SUPPORTED rather than leaving a claim here that no longer holds",
+                findings.len()
             ),
             Err(PythonError::Parse { line, column, .. }) => {
                 assert!(line >= 1 && column >= 1, "{label}: position is not 1-based");
@@ -110,25 +123,4 @@ fn unparsable_source_is_an_error_with_a_position_and_never_an_empty_result() {
             Err(other) => panic!("{label}: expected a parse error, got {other}"),
         }
     }
-}
-
-/// The frontend's Python ceiling, asserted so that it is a published fact.
-///
-/// This currently records a **gap**: PEP 701 f-strings are valid Python 3.12
-/// and are rejected. When the parser is upgraded this test starts failing, and
-/// the fix is to move the two cases into [`SUPPORTED`] and delete this test —
-/// which is exactly the notification an upgrade should produce.
-#[test]
-fn pep_701_f_strings_are_a_known_gap() {
-    let unread: Vec<&str> = PEP_701
-        .iter()
-        .filter(|(_, source)| analyze_source(Path::new("modern.py"), source).is_err())
-        .map(|(label, _)| *label)
-        .collect();
-    assert_eq!(
-        unread.len(),
-        PEP_701.len(),
-        "the parser now reads some PEP 701 f-strings ({unread:?} still fail); move the readable \
-         cases into SUPPORTED and retire this test"
-    );
 }

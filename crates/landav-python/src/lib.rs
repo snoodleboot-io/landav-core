@@ -144,22 +144,43 @@ pub const MINIMUM_RULE_COUNT: usize = 8;
 /// this number. Raising it without teaching the frontend the syntax fails.
 pub const SUPPORTED_PYTHON: &str = "3.12";
 
+/// [`SUPPORTED_PYTHON`] as the parser's own version, which is what
+/// `analysis::parse_guarded` hands it.
+///
+/// The two must be the same fact, so this derives one from the other rather
+/// than restating it: a version the parser does not know is a compile error
+/// here, not a frontend that quietly reads a different language from the one
+/// it advertises. `LAN-130`.
+#[must_use]
+pub fn target_version() -> ruff_python_ast::PythonVersion {
+    match SUPPORTED_PYTHON {
+        "3.12" => ruff_python_ast::PythonVersion::PY312,
+        "3.13" => ruff_python_ast::PythonVersion::PY313,
+        "3.14" => ruff_python_ast::PythonVersion::PY314,
+        "3.15" => ruff_python_ast::PythonVersion::PY315,
+        // Unreachable while `SUPPORTED_PYTHON` is one of the above, and a
+        // deliberate floor rather than a panic: a library may not abort over
+        // its own constant. Reading *less* Python than claimed makes
+        // `python_syntax_level.rs` fail, which is where this would surface.
+        _ => ruff_python_ast::PythonVersion::PY312,
+    }
+}
+
 /// The forms at or below [`SUPPORTED_PYTHON`] the frontend nonetheless refuses.
 ///
-/// All five are PEP 701, all five cost a whole *file* rather than a function,
-/// and together they are the entire measured loss: three files of the 3.12
-/// standard library, 51 top-level functions, zero on momentum's backend. The
-/// pinned `rustpython-parser 0.4.0` predates PEP 701 and is already the newest
-/// published release, so this list is a priced deferral — see
-/// `python_syntax_level.rs`, which samples each entry and fails if one is
-/// missing, unused, or quietly starts parsing.
-pub const UNREAD_AT_SUPPORTED_LEVEL: &[&str] = &[
-    "a replacement field reusing the enclosing quote",
-    "an f-string nested in an f-string in the same quotes",
-    "a replacement field spanning lines",
-    "a comment inside a multi-line replacement field",
-    "a format spec reusing the enclosing quote",
-];
+/// **Empty since `LAN-130`**, and that is the point of the constant rather
+/// than an invitation to delete it. It held five PEP 701 f-string forms, which
+/// `rustpython-parser 0.4.0` predated and which cost three files of the 3.12
+/// standard library and the 51 top-level functions in them. With
+/// `ruff_python_parser` every one reads, so the list emptied - and
+/// `python_syntax_level.rs` asserts the list against its own samples, so it
+/// could not have stayed full by accident.
+///
+/// An entry goes back here the moment a form at the declared level turns out
+/// unreadable, with its measured cost beside it. A gap nobody published is a
+/// coverage denominator that silently shrank, which is the failure `LAN-82`
+/// opens with.
+pub const UNREAD_AT_SUPPORTED_LEVEL: &[&str] = &[];
 
 #[cfg(test)]
 mod tests {

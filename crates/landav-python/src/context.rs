@@ -27,7 +27,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use rustpython_parser::ast::{Constant, Expr, Ranged, Stmt};
+use ruff_python_ast::{Expr, Stmt};
+use ruff_text_size::Ranged;
 
 use crate::syntax::{
     expr_tree, free_names, integer_literal, name_of, stmt_child_bodies, stmt_own_exprs, stmt_tree,
@@ -195,7 +196,7 @@ fn collect<'a>(module: &'a [Stmt], source: &'a str) -> Walk<'a> {
             });
 
             let loop_index = match stmt {
-                Stmt::For(_) | Stmt::AsyncFor(_) | Stmt::While(_) => {
+                Stmt::For(_) | Stmt::While(_) => {
                     walk.loops
                         .push(describe_loop(stmt, source, scope, &enclosing));
                     Some(walk.loops.len() - 1)
@@ -231,9 +232,10 @@ fn collect<'a>(module: &'a [Stmt], source: &'a str) -> Walk<'a> {
 }
 
 fn parameters_of(stmt: &Stmt) -> Vec<String> {
+    // One arm for both: `async def` is `is_async` on the same node now, and
+    // a parameter list is a parameter list either way.
     let args = match stmt {
-        Stmt::FunctionDef(node) => node.args.as_ref(),
-        Stmt::AsyncFunctionDef(node) => node.args.as_ref(),
+        Stmt::FunctionDef(node) => node.parameters.as_ref(),
         _ => return Vec::new(),
     };
     let mut names: Vec<String> = args
@@ -241,13 +243,13 @@ fn parameters_of(stmt: &Stmt) -> Vec<String> {
         .iter()
         .chain(args.args.iter())
         .chain(args.kwonlyargs.iter())
-        .map(|arg| arg.def.arg.as_str().to_owned())
+        .map(|arg| arg.parameter.name.as_str().to_owned())
         .collect();
     names.extend(
         args.vararg
             .iter()
             .chain(args.kwarg.iter())
-            .map(|arg| arg.arg.as_str().to_owned()),
+            .map(|arg| arg.name.as_str().to_owned()),
     );
     names
 }
@@ -256,7 +258,6 @@ fn parameters_of(stmt: &Stmt) -> Vec<String> {
 fn is_loop_body(stmt: &Stmt, child: &[Stmt]) -> bool {
     let body = match stmt {
         Stmt::For(node) => node.body.as_slice(),
-        Stmt::AsyncFor(node) => node.body.as_slice(),
         Stmt::While(node) => node.body.as_slice(),
         _ => return false,
     };
@@ -271,11 +272,6 @@ fn describe_loop<'a>(
 ) -> PartialLoop<'a> {
     let (target, iter, body) = match stmt {
         Stmt::For(node) => (
-            Some(node.target.as_ref()),
-            Some(node.iter.as_ref()),
-            node.body.as_slice(),
-        ),
-        Stmt::AsyncFor(node) => (
             Some(node.target.as_ref()),
             Some(node.iter.as_ref()),
             node.body.as_slice(),
@@ -336,9 +332,6 @@ fn spread_taint(body: &[Stmt], seeds: &BTreeSet<String>) -> BTreeSet<String> {
                     add_target_names(node.target.as_ref(), &mut varies);
                 }
                 Stmt::For(node) if reads_any(node.iter.as_ref(), &varies) => {
-                    add_target_names(node.target.as_ref(), &mut varies);
-                }
-                Stmt::AsyncFor(node) if reads_any(node.iter.as_ref(), &varies) => {
                     add_target_names(node.target.as_ref(), &mut varies);
                 }
                 Stmt::With(node) => {
@@ -406,7 +399,6 @@ fn build_bindings<'a>(walk: &Walk<'a>) -> Bindings<'a> {
             Stmt::AugAssign(node) => ban(node.target.as_ref(), &mut disqualified),
             Stmt::AnnAssign(node) => ban(node.target.as_ref(), &mut disqualified),
             Stmt::For(node) => ban(node.target.as_ref(), &mut disqualified),
-            Stmt::AsyncFor(node) => ban(node.target.as_ref(), &mut disqualified),
             Stmt::With(node) => {
                 for item in &node.items {
                     if let Some(vars) = item.optional_vars.as_deref() {
@@ -414,17 +406,7 @@ fn build_bindings<'a>(walk: &Walk<'a>) -> Bindings<'a> {
                     }
                 }
             }
-            Stmt::AsyncWith(node) => {
-                for item in &node.items {
-                    if let Some(vars) = item.optional_vars.as_deref() {
-                        ban(vars, &mut disqualified);
-                    }
-                }
-            }
             Stmt::FunctionDef(node) => {
-                disqualified.insert((scope, node.name.as_str().to_owned()));
-            }
-            Stmt::AsyncFunctionDef(node) => {
                 disqualified.insert((scope, node.name.as_str().to_owned()));
             }
             Stmt::ClassDef(node) => {
@@ -462,8 +444,9 @@ fn build_bindings<'a>(walk: &Walk<'a>) -> Bindings<'a> {
                         .map(|name| (scope, name.as_str().to_owned())),
                 );
             }
+            // `try` and `try`/`except*` alike: `is_star` changes which
+            // handlers run, not which names they bind.
             Stmt::Try(node) => ban_handlers(&node.handlers, scope, &mut disqualified),
-            Stmt::TryStar(node) => ban_handlers(&node.handlers, scope, &mut disqualified),
             _ => {}
         }
     }
@@ -483,12 +466,12 @@ fn build_bindings<'a>(walk: &Walk<'a>) -> Bindings<'a> {
 }
 
 fn ban_handlers(
-    handlers: &[rustpython_parser::ast::ExceptHandler],
+    handlers: &[ruff_python_ast::ExceptHandler],
     scope: usize,
     out: &mut HashSet<(usize, String)>,
 ) {
     for handler in handlers {
-        let rustpython_parser::ast::ExceptHandler::ExceptHandler(handler) = handler;
+        let ruff_python_ast::ExceptHandler::ExceptHandler(handler) = handler;
         if let Some(name) = handler.name.as_ref() {
             out.insert((scope, name.as_str().to_owned()));
         }
@@ -542,7 +525,6 @@ pub(crate) fn assigned_names(body: &[Stmt]) -> BTreeSet<String> {
             Stmt::AugAssign(node) => target_names(&node.target, &mut names),
             Stmt::AnnAssign(node) => target_names(&node.target, &mut names),
             Stmt::For(node) => target_names(&node.target, &mut names),
-            Stmt::AsyncFor(node) => target_names(&node.target, &mut names),
             Stmt::With(node) => {
                 for item in &node.items {
                     if let Some(vars) = item.optional_vars.as_deref() {
@@ -594,24 +576,26 @@ fn is_bounded_iterable(expr: &Expr, bindings: &Bindings<'_>, scope: usize, depth
     }
     match expr {
         Expr::Tuple(_) | Expr::List(_) | Expr::Set(_) | Expr::Dict(_) => true,
-        Expr::Constant(node) => matches!(node.value, Constant::Str(_) | Constant::Bytes(_)),
+        Expr::StringLiteral(_) | Expr::BytesLiteral(_) => true,
         Expr::Call(node) => match node.func.as_ref() {
             Expr::Name(func) => match func.id.as_str() {
                 "range" => {
-                    !node.args.is_empty()
-                        && node.args.iter().all(|arg| {
+                    !node.arguments.args.is_empty()
+                        && node.arguments.args.iter().all(|arg| {
                             integer_constant(arg, bindings, scope, RESOLUTION_DEPTH).is_some()
                         })
                 }
                 // A view of a fixed mapping is as fixed as the mapping.
                 "enumerate" | "reversed" | "sorted" | "list" | "tuple" | "set" | "frozenset" => {
-                    node.args
+                    node.arguments
+                        .args
                         .first()
                         .is_some_and(|arg| is_bounded_iterable(arg, bindings, scope, depth - 1))
                 }
                 "zip" => {
-                    !node.args.is_empty()
+                    !node.arguments.args.is_empty()
                         && node
+                            .arguments
                             .args
                             .iter()
                             .any(|arg| is_bounded_iterable(arg, bindings, scope, depth - 1))
@@ -621,7 +605,7 @@ fn is_bounded_iterable(expr: &Expr, bindings: &Bindings<'_>, scope: usize, depth
             // `_SUBSTITUTIONS.items()` over a dict literal is four iterations.
             Expr::Attribute(func) => {
                 matches!(func.attr.as_str(), "items" | "keys" | "values")
-                    && node.args.is_empty()
+                    && node.arguments.args.is_empty()
                     && is_dict_like(func.value.as_ref(), bindings, scope, depth - 1)
             }
             _ => false,
@@ -662,7 +646,7 @@ pub(crate) fn is_one_shot_iterator(
         return false;
     }
     match expr {
-        Expr::GeneratorExp(_) => true,
+        Expr::Generator(_) => true,
         Expr::Call(node) => matches!(
             name_of(node.func.as_ref()),
             Some("iter" | "enumerate" | "zip" | "reversed" | "map" | "filter")
@@ -680,14 +664,14 @@ pub(crate) fn is_str_expr(expr: &Expr, bindings: &Bindings<'_>, scope: usize, de
         return false;
     }
     match expr {
-        Expr::Constant(node) => matches!(node.value, Constant::Str(_)),
-        Expr::JoinedStr(_) => true,
+        Expr::StringLiteral(_) => true,
+        Expr::FString(_) => true,
         Expr::BinOp(node) => {
-            matches!(node.op, rustpython_parser::ast::Operator::Add)
+            matches!(node.op, ruff_python_ast::Operator::Add)
                 && (is_str_expr(node.left.as_ref(), bindings, scope, depth - 1)
                     || is_str_expr(node.right.as_ref(), bindings, scope, depth - 1))
         }
-        Expr::IfExp(node) => {
+        Expr::If(node) => {
             is_str_expr(node.body.as_ref(), bindings, scope, depth - 1)
                 || is_str_expr(node.orelse.as_ref(), bindings, scope, depth - 1)
         }
@@ -730,7 +714,8 @@ pub(crate) fn is_scanned_list(
         }
         Expr::ListComp(_) => true,
         Expr::Call(node) => {
-            matches!(name_of(node.func.as_ref()), Some("list" | "sorted")) && !node.args.is_empty()
+            matches!(name_of(node.func.as_ref()), Some("list" | "sorted"))
+                && !node.arguments.args.is_empty()
         }
         Expr::Name(_) => bindings
             .deref(scope, expr)
@@ -863,9 +848,10 @@ pub(crate) fn escapes_the_iteration(body: &[Stmt], name: &str) -> bool {
             match expr {
                 Expr::Call(call) => {
                     let handed_over = call
+                        .arguments
                         .args
                         .iter()
-                        .chain(call.keywords.iter().map(|keyword| &keyword.value))
+                        .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
                         .any(|argument| carries(argument, name));
                     if handed_over {
                         return true;

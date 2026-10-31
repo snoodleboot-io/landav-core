@@ -50,8 +50,8 @@ mod common;
 use std::io;
 
 use common::{
-    CLEAN_PY, EXIT_CLEAN, FINDINGS_PY, PEP701_FSTRING_PY, PYPROJECT_MALFORMED, PYPROJECT_NO_LANDAV,
-    Project, UNREADABLE_AS_PYTHON_PY,
+    ABOVE_SUPPORTED_LEVEL_PY, CLEAN_PY, EXIT_CLEAN, FINDINGS_PY, PYPROJECT_MALFORMED,
+    PYPROJECT_NO_LANDAV, Project, UNREADABLE_AS_PYTHON_PY,
 };
 
 /// The criterion, stated directly, over both classes of unreadable source.
@@ -69,7 +69,7 @@ fn inconclusive_analysis_does_not_report_clean() -> io::Result<()> {
 
     for (name, body) in [
         ("python2_module.py", UNREADABLE_AS_PYTHON_PY),
-        ("pep701_fstring.py", PEP701_FSTRING_PY),
+        ("above_level.py", ABOVE_SUPPORTED_LEVEL_PY),
     ] {
         let target = project.write(name, body)?;
 

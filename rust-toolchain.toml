@@ -1,7 +1,11 @@
 [toolchain]
-# Pinned to the version installed on the development machine so builds are
-# reproducible today. The project conventions target 1.97 — raise this once
-# that toolchain is actually installed and CI is updated to match.
-channel = "1.95.0"
+# Raised from 1.95.0 by `LAN-130`, which needs it: `ruff_python_parser`
+# declares `rust-version = "1.97"`, and the frontend cannot read Python 3.13 or
+# later without it. 1.99.1 is the current stable rather than the 1.97 minimum,
+# so the next parser bump is unlikely to force a second toolchain change.
+#
+# CI pins nothing of its own - `dtolnay/rust-toolchain@stable` honours this
+# file - so this line is the single place the version is decided.
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 profile = "default"

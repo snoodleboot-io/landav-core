@@ -11,7 +11,8 @@
 //!   because the parser itself is recursive and we do not get to choose how it
 //!   fails.
 
-use rustpython_parser::ast::{Expr, ExprContext, Stmt};
+use ruff_python_ast::{Decorator, Expr, ExprContext, Stmt};
+use ruff_text_size::{TextRange, TextSize};
 
 /// The deepest block nesting the frontend will parse.
 ///
@@ -76,6 +77,55 @@ fn clamp_u32(value: usize) -> u32 {
 ///
 /// Brackets inside string literals and comments do not count, so a docstring
 /// full of `[[[[` is not mistaken for a deeply nested expression.
+/// Where a definition's own keyword starts, skipping its decorators.
+///
+/// This parser's range for a `def` or a `class` **begins at the first
+/// decorator**; the previous one began at the keyword. A report has to keep
+/// pointing at the `def`, for three reasons: it is the line a traceback names
+/// and a reader looks for, it is the line every other Python tool reports, and
+/// it is `Function.line` and `Function.column` in the machine schema, which
+/// consumers have stored. Measured while swapping the parser: taking the
+/// range's own start moved 10,802 of the momentum corpus's 43,203 functions
+/// earlier by exactly their decorator count, and nothing else about them
+/// changed.
+///
+/// A definition with no decorators needs no work - the range already starts at
+/// the keyword, `async` included. Otherwise this scans from the end of the last
+/// decorator for the first byte that is neither whitespace, a comment, nor a
+/// line continuation, which is the `def`, `async` or `class` that follows. A
+/// scan that runs out of source falls back to the range's start rather than
+/// reporting a position past the end of the file.
+pub(crate) fn definition_keyword(
+    source: &str,
+    range: TextRange,
+    decorators: &[Decorator],
+) -> TextRange {
+    let Some(last) = decorators.last() else {
+        return range;
+    };
+    let bytes = source.as_bytes();
+    let mut offset = last.range.end().to_usize();
+    while let Some(&byte) = bytes.get(offset) {
+        match byte {
+            b'#' => {
+                while bytes.get(offset).is_some_and(|byte| *byte != b'\n') {
+                    offset += 1;
+                }
+            }
+            b'\\' => offset += 1,
+            byte if byte.is_ascii_whitespace() => offset += 1,
+            _ => break,
+        }
+    }
+    TextSize::try_from(offset).map_or(range, |start| {
+        if start <= range.end() {
+            TextRange::new(start, range.end())
+        } else {
+            range
+        }
+    })
+}
+
 pub(crate) fn nesting_overflow(source: &str) -> Option<usize> {
     let bytes = source.as_bytes();
     let mut index = 0_usize;
@@ -260,7 +310,7 @@ pub(crate) fn skip_string(bytes: &[u8], index: usize) -> usize {
 pub(crate) fn expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     match expr {
         Expr::BoolOp(node) => out.extend(node.values.iter()),
-        Expr::NamedExpr(node) => {
+        Expr::Named(node) => {
             out.push(node.target.as_ref());
             out.push(node.value.as_ref());
         }
@@ -270,14 +320,16 @@ pub(crate) fn expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
         }
         Expr::UnaryOp(node) => out.push(node.operand.as_ref()),
         Expr::Lambda(node) => out.push(node.body.as_ref()),
-        Expr::IfExp(node) => {
+        Expr::If(node) => {
             out.push(node.test.as_ref());
             out.push(node.body.as_ref());
             out.push(node.orelse.as_ref());
         }
         Expr::Dict(node) => {
-            out.extend(node.keys.iter().flatten());
-            out.extend(node.values.iter());
+            // A `None` key is `**mapping`: the value is the mapping and there
+            // is no key expression to walk.
+            out.extend(node.items.iter().filter_map(|item| item.key.as_ref()));
+            out.extend(node.items.iter().map(|item| &item.value));
         }
         Expr::Set(node) => out.extend(node.elts.iter()),
         Expr::ListComp(node) => {
@@ -289,32 +341,54 @@ pub(crate) fn expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
             push_generators(&node.generators, out);
         }
         Expr::DictComp(node) => {
-            out.push(node.key.as_ref());
+            // No key in `{**d for d in dicts}` (PEP 798).
+            out.extend(node.key.as_deref());
             out.push(node.value.as_ref());
             push_generators(&node.generators, out);
         }
-        Expr::GeneratorExp(node) => {
+        Expr::Generator(node) => {
             out.push(node.elt.as_ref());
             push_generators(&node.generators, out);
         }
         Expr::Await(node) => out.push(node.value.as_ref()),
         Expr::Yield(node) => out.extend(node.value.as_deref()),
         Expr::YieldFrom(node) => out.push(node.value.as_ref()),
-        Expr::Compare(node) => {
-            out.push(node.left.as_ref());
-            out.extend(node.comparators.iter());
-        }
+        // One flat operand list here, where the previous parser kept a
+        // `left` beside the rest; the walk wants all of them either way.
+        Expr::Compare(node) => out.extend(node.operands.iter()),
         Expr::Call(node) => {
             out.push(node.func.as_ref());
-            out.extend(node.args.iter());
-            out.extend(node.keywords.iter().map(|keyword| &keyword.value));
+            out.extend(node.arguments.args.iter());
+            out.extend(node.arguments.keywords.iter().map(|keyword| &keyword.value));
         }
-        Expr::FormattedValue(node) => {
-            out.push(node.value.as_ref());
-            out.extend(node.format_spec.as_deref());
-        }
-        Expr::JoinedStr(node) => out.extend(node.values.iter()),
-        Expr::Constant(_) | Expr::Name(_) => {}
+        // An f-string's interpolations, and the interpolations inside their
+        // format specs. The previous parser spelled this as two levels - a
+        // `JoinedStr` of `FormattedValue`s, each of which was itself an
+        // `Expr` - so a walk reached the interpolated expression one hop
+        // later. Here the literal runs are not expressions at all, which is
+        // what collapses the two arms into one: what a walk wants from an
+        // f-string is exactly the expressions it evaluates.
+        Expr::FString(node) => out.extend(fstring_expressions(node)),
+        // A t-string's interpolations are walked even though the t-string
+        // itself is refused: see `tstring_expressions`.
+        Expr::TString(node) => out.extend(tstring_expressions(node)),
+        // Jupyter magic carries no sub-expression.
+        Expr::IpyEscapeCommand(_) => {}
+        // A t-string (PEP 750) is deliberately **not** here. Its
+        // interpolations are handed to a user-written processing function
+        // rather than formatted, so it is refused as its own construct rather
+        // than walked like an f-string. See `landav_its::Construct`.
+        // Spelled out rather than asked with `is_literal_expr`, because this
+        // match has no catch-all: a guard satisfies no exhaustiveness check,
+        // and a literal kind added to the parser must break this build rather
+        // than slip through unwalked.
+        Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_)
+        | Expr::Name(_) => {}
         Expr::Attribute(node) => out.push(node.value.as_ref()),
         Expr::Subscript(node) => {
             out.push(node.value.as_ref());
@@ -331,10 +405,7 @@ pub(crate) fn expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
-fn push_generators<'a>(
-    generators: &'a [rustpython_parser::ast::Comprehension],
-    out: &mut Vec<&'a Expr>,
-) {
+fn push_generators<'a>(generators: &'a [ruff_python_ast::Comprehension], out: &mut Vec<&'a Expr>) {
     for generator in generators {
         out.push(&generator.target);
         out.push(&generator.iter);
@@ -366,17 +437,13 @@ pub(crate) fn expr_tree(root: &Expr) -> Vec<&Expr> {
 pub(crate) fn stmt_own_exprs<'a>(stmt: &'a Stmt, out: &mut Vec<&'a Expr>) {
     match stmt {
         Stmt::FunctionDef(node) => {
-            out.extend(node.decorator_list.iter());
-            out.extend(node.returns.as_deref());
-        }
-        Stmt::AsyncFunctionDef(node) => {
-            out.extend(node.decorator_list.iter());
+            out.extend(decorator_expressions(&node.decorator_list));
             out.extend(node.returns.as_deref());
         }
         Stmt::ClassDef(node) => {
-            out.extend(node.bases.iter());
-            out.extend(node.keywords.iter().map(|keyword| &keyword.value));
-            out.extend(node.decorator_list.iter());
+            out.extend(node.bases());
+            out.extend(node.keywords().iter().map(|keyword| &keyword.value));
+            out.extend(decorator_expressions(&node.decorator_list));
         }
         Stmt::Return(node) => out.extend(node.value.as_deref()),
         Stmt::Delete(node) => out.extend(node.targets.iter()),
@@ -401,14 +468,21 @@ pub(crate) fn stmt_own_exprs<'a>(stmt: &'a Stmt, out: &mut Vec<&'a Expr>) {
             out.push(node.target.as_ref());
             out.push(node.iter.as_ref());
         }
-        Stmt::AsyncFor(node) => {
-            out.push(node.target.as_ref());
-            out.push(node.iter.as_ref());
-        }
         Stmt::While(node) => out.push(node.test.as_ref()),
-        Stmt::If(node) => out.push(node.test.as_ref()),
+        // An `elif` is a clause of this `if`, not a nested `if` in its `else`
+        // as the previous parser spelled it, so each clause's own test belongs
+        // to *this* statement. Missing them would leave the conditions of
+        // every `elif` in the corpus unvisited - no finding, no refusal, no
+        // trace. An `else` clause has no test.
+        Stmt::If(node) => {
+            out.push(node.test.as_ref());
+            out.extend(
+                node.elif_else_clauses
+                    .iter()
+                    .filter_map(|clause| clause.test.as_ref()),
+            );
+        }
         Stmt::With(node) => push_with_items(&node.items, out),
-        Stmt::AsyncWith(node) => push_with_items(&node.items, out),
         Stmt::Match(node) => {
             out.push(node.subject.as_ref());
             out.extend(node.cases.iter().filter_map(|case| case.guard.as_deref()));
@@ -418,7 +492,6 @@ pub(crate) fn stmt_own_exprs<'a>(stmt: &'a Stmt, out: &mut Vec<&'a Expr>) {
             out.extend(node.cause.as_deref());
         }
         Stmt::Try(node) => push_handler_types(&node.handlers, out),
-        Stmt::TryStar(node) => push_handler_types(&node.handlers, out),
         Stmt::Assert(node) => {
             out.push(node.test.as_ref());
             out.extend(node.msg.as_deref());
@@ -430,23 +503,23 @@ pub(crate) fn stmt_own_exprs<'a>(stmt: &'a Stmt, out: &mut Vec<&'a Expr>) {
         | Stmt::Nonlocal(_)
         | Stmt::Pass(_)
         | Stmt::Break(_)
-        | Stmt::Continue(_) => {}
+        | Stmt::Continue(_)
+        // Jupyter magic: no sub-expression a walk can reach, and no module
+        // parse produces one.
+        | Stmt::IpyEscapeCommand(_) => {}
     }
 }
 
-fn push_with_items<'a>(items: &'a [rustpython_parser::ast::WithItem], out: &mut Vec<&'a Expr>) {
+fn push_with_items<'a>(items: &'a [ruff_python_ast::WithItem], out: &mut Vec<&'a Expr>) {
     for item in items {
         out.push(&item.context_expr);
         out.extend(item.optional_vars.as_deref());
     }
 }
 
-fn push_handler_types<'a>(
-    handlers: &'a [rustpython_parser::ast::ExceptHandler],
-    out: &mut Vec<&'a Expr>,
-) {
+fn push_handler_types<'a>(handlers: &'a [ruff_python_ast::ExceptHandler], out: &mut Vec<&'a Expr>) {
     for handler in handlers {
-        let rustpython_parser::ast::ExceptHandler::ExceptHandler(handler) = handler;
+        let ruff_python_ast::ExceptHandler::ExceptHandler(handler) = handler;
         out.extend(handler.type_.as_deref());
     }
 }
@@ -459,13 +532,8 @@ fn push_handler_types<'a>(
 pub(crate) fn stmt_child_bodies(stmt: &Stmt) -> Vec<(&[Stmt], bool)> {
     match stmt {
         Stmt::FunctionDef(node) => vec![(node.body.as_slice(), true)],
-        Stmt::AsyncFunctionDef(node) => vec![(node.body.as_slice(), true)],
         Stmt::ClassDef(node) => vec![(node.body.as_slice(), true)],
         Stmt::For(node) => vec![
-            (node.body.as_slice(), false),
-            (node.orelse.as_slice(), false),
-        ],
-        Stmt::AsyncFor(node) => vec![
             (node.body.as_slice(), false),
             (node.orelse.as_slice(), false),
         ],
@@ -473,34 +541,35 @@ pub(crate) fn stmt_child_bodies(stmt: &Stmt) -> Vec<(&[Stmt], bool)> {
             (node.body.as_slice(), false),
             (node.orelse.as_slice(), false),
         ],
-        Stmt::If(node) => vec![
-            (node.body.as_slice(), false),
-            (node.orelse.as_slice(), false),
-        ],
+        // One body per clause: the `if`'s own, then every `elif` and the
+        // `else`. See `stmt_own_exprs` for why the flattening matters.
+        Stmt::If(node) => core::iter::once((node.body.as_slice(), false))
+            .chain(
+                node.elif_else_clauses
+                    .iter()
+                    .map(|clause| (clause.body.as_slice(), false)),
+            )
+            .collect(),
         Stmt::With(node) => vec![(node.body.as_slice(), false)],
-        Stmt::AsyncWith(node) => vec![(node.body.as_slice(), false)],
         Stmt::Match(node) => node
             .cases
             .iter()
             .map(|case| (case.body.as_slice(), false))
             .collect(),
         Stmt::Try(node) => try_bodies(&node.body, &node.handlers, &node.orelse, &node.finalbody),
-        Stmt::TryStar(node) => {
-            try_bodies(&node.body, &node.handlers, &node.orelse, &node.finalbody)
-        }
         _ => Vec::new(),
     }
 }
 
 fn try_bodies<'a>(
     body: &'a [Stmt],
-    handlers: &'a [rustpython_parser::ast::ExceptHandler],
+    handlers: &'a [ruff_python_ast::ExceptHandler],
     orelse: &'a [Stmt],
     finalbody: &'a [Stmt],
 ) -> Vec<(&'a [Stmt], bool)> {
     let mut bodies = vec![(body, false), (orelse, false), (finalbody, false)];
     for handler in handlers {
-        let rustpython_parser::ast::ExceptHandler::ExceptHandler(handler) = handler;
+        let ruff_python_ast::ExceptHandler::ExceptHandler(handler) = handler;
         bodies.push((handler.body.as_slice(), false));
     }
     bodies
@@ -534,14 +603,67 @@ pub(crate) fn is_zero_literal(expr: &Expr) -> bool {
     integer_literal(expr).is_some_and(|value| value == 0)
 }
 
+/// The expression each decorator applies.
+///
+/// A decorator is its own node here rather than a bare expression, so a walk
+/// that wants the callables has to step through the wrapper.
+fn decorator_expressions(decorators: &[ruff_python_ast::Decorator]) -> impl Iterator<Item = &Expr> {
+    decorators.iter().map(|decorator| &decorator.expression)
+}
+
 /// The value of a non-negative integer literal, or `None` for anything else.
 pub(crate) fn integer_literal(expr: &Expr) -> Option<u128> {
     match expr {
-        Expr::Constant(node) => match &node.value {
-            rustpython_parser::ast::Constant::Int(value) => value.to_string().parse().ok(),
-            _ => None,
+        Expr::NumberLiteral(node) => match &node.value {
+            ruff_python_ast::Number::Int(value) => value.to_string().parse().ok(),
+            // A float or a complex is a number and not an integer literal;
+            // the fragment holds mathematical integers only.
+            ruff_python_ast::Number::Float(_) | ruff_python_ast::Number::Complex { .. } => None,
         },
         _ => None,
+    }
+}
+
+/// Every expression an f-string evaluates: each interpolation, and each
+/// interpolation inside a nested format spec.
+///
+/// `f"{a:{width}}"` evaluates both `a` and `width`, and a walk that missed the
+/// second would publish a bound omitting whatever `width` costs - the orphan
+/// failure `LAN-90` fixed, one level further in. The literal runs between
+/// interpolations are not expressions here and carry no cost.
+pub(crate) fn fstring_expressions(node: &ruff_python_ast::ExprFString) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    push_interpolations(node.value.elements(), &mut out);
+    out
+}
+
+/// The same, for a template string (PEP 750).
+///
+/// A `t"..."` is **refused** as a value - it evaluates to a `Template` whose
+/// interpolations a user-written function processes, not to a string - but its
+/// interpolations are still expressions the program evaluates, and a walk that
+/// skipped them would miss a call or a walrus written inside one. Refusing the
+/// container and scanning its interior is the same split `LAN-100` draws
+/// everywhere else.
+pub(crate) fn tstring_expressions(node: &ruff_python_ast::ExprTString) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    push_interpolations(node.value.elements(), &mut out);
+    out
+}
+
+fn push_interpolations<'a>(
+    elements: impl Iterator<Item = &'a ruff_python_ast::InterpolatedStringElement>,
+    out: &mut Vec<&'a Expr>,
+) {
+    for element in elements {
+        let ruff_python_ast::InterpolatedStringElement::Interpolation(interpolation) = element
+        else {
+            continue;
+        };
+        out.push(interpolation.expression.as_ref());
+        if let Some(spec) = interpolation.format_spec.as_deref() {
+            push_interpolations(spec.elements.iter(), out);
+        }
     }
 }
 
@@ -561,7 +683,7 @@ pub(crate) fn free_names(expr: &Expr) -> Vec<String> {
             Expr::ListComp(comp) => collect_generator_targets(&comp.generators, &mut bound),
             Expr::SetComp(comp) => collect_generator_targets(&comp.generators, &mut bound),
             Expr::DictComp(comp) => collect_generator_targets(&comp.generators, &mut bound),
-            Expr::GeneratorExp(comp) => collect_generator_targets(&comp.generators, &mut bound),
+            Expr::Generator(comp) => collect_generator_targets(&comp.generators, &mut bound),
             _ => {}
         }
     }
@@ -572,10 +694,7 @@ pub(crate) fn free_names(expr: &Expr) -> Vec<String> {
     used
 }
 
-fn collect_generator_targets(
-    generators: &[rustpython_parser::ast::Comprehension],
-    out: &mut Vec<String>,
-) {
+fn collect_generator_targets(generators: &[ruff_python_ast::Comprehension], out: &mut Vec<String>) {
     for generator in generators {
         target_names(&generator.target, out);
     }

@@ -96,20 +96,30 @@ pub const UNREADABLE_AS_PYTHON_PY: &str = r#"
 print "this module was written for Python 2"
 "#;
 
-/// Valid Python 3.12 that the pinned `rustpython-parser` predates: PEP 701
-/// allows the same quote character inside an f-string replacement field.
+/// Valid Python above `landav_python::SUPPORTED_PYTHON`: PEP 758 allows an
+/// unparenthesised tuple of exception types, which is 3.14 syntax while the
+/// declared level is 3.12.
 ///
 /// A different class from [`UNREADABLE_AS_PYTHON_PY`] and worth its own case —
 /// here the *file* is fine and the *frontend* is behind, which is the failure
-/// mode most likely to appear on a modern codebase.
+/// mode most likely to appear on a modern codebase. The parser reports this
+/// class separately from malformed source, and `analysis::parse_guarded` folds
+/// the two into one refusal on purpose: a file above the declared level is a
+/// file this build has not read.
 ///
-/// This fixture is expected to stop being unparsable when the parser is
-/// upgraded. When that happens this test fails, which is correct: somebody has
-/// to decide what replaces it rather than discovering later that the case
-/// silently became a clean run.
-pub const PEP701_FSTRING_PY: &str = r#"
+/// This fixture tracks the declared level and is **expected** to stop being
+/// unreadable when that level rises past 3.14 — at which point somebody picks
+/// a form above the new level, or, if the frontend has caught up with every
+/// released Python, records that this class is now empty. Discovering it had
+/// silently become a clean run would be the bad outcome; a failing test is the
+/// good one. Its predecessor was a PEP 701 f-string, retired by `LAN-130` in
+/// exactly this way.
+pub const ABOVE_SUPPORTED_LEVEL_PY: &str = r#"
 def show(row):
-    print(f"{row["name"]}")
+    try:
+        emit(row)
+    except ValueError, TypeError:
+        pass
 "#;
 
 /// A `pyproject.toml` that is valid TOML and says nothing about landav.

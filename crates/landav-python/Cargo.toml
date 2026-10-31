@@ -20,15 +20,27 @@ thiserror = { workspace = true }
 # is written by several live M0 lanes at once, and this is the only crate that
 # may know anything about Python (F-005's frontend boundary).
 #
-# `rustpython-parser` over `ruff_python_parser` because the latter is published
-# to crates.io only as a long-stale `0.0.8` placeholder of Ruff's internal
-# crate, so depending on it means depending on a git revision. This one is a
-# maintained, self-contained release with byte-offset ranges on every node,
-# which is exactly what `Location`'s byte-column contract needs.
+# `ruff_python_parser` is the parser, since `LAN-130`. It replaced
+# `rustpython-parser 0.4.0`, which was chosen here for a reason that has since
+# expired and then died: it was "a maintained, self-contained release" where
+# Ruff's crate was "a long-stale 0.0.8 placeholder". Today `rustpython-parser`
+# has not shipped since 2024-08-06, 0.4.0 is the last release it will ever
+# have, and it predates PEP 701 - so it cannot read three files of the 3.12
+# standard library, and nothing of 3.13, 3.14 or 3.15 at all.
 #
-# `all-nodes-with-ranges` is not default: without it some nodes carry no range
-# and a finding would have nowhere to point.
-rustpython-parser = { version = "0.4.0", features = ["all-nodes-with-ranges"] }
+# The trade is honest and worth stating: this crate is `0.0.x`, published from
+# Ruff's internals with no API-stability promise, so it will churn. A parser
+# that churns is worth more than one that cannot read the language. When it
+# breaks, it breaks at compile time in this crate and nowhere else - the
+# `F-005` frontend boundary is what makes that true, and `LAN-130` measured it
+# (6 files here, 3 test files, and no other crate in the workspace).
+#
+# No feature flag for ranges: every node carries a byte-offset `TextRange`,
+# which is what `Location`'s byte-column contract needs. `rustpython-parser`
+# needed `all-nodes-with-ranges` for the same guarantee.
+ruff_python_parser = "0.0.20"
+ruff_python_ast = "0.0.20"
+ruff_text_size = "0.0.20"
 
 [lints]
 workspace = true

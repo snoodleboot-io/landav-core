@@ -66,7 +66,8 @@ use landav_its::{
     ArithOp, CompareOp, Composed, CondId, Construct, DeclaredEffect, ExprId, Extent, InheritedHole,
     Locals, RangeSpec, SourceProgramBuilder, StmtId, VarName, Writes,
 };
-use rustpython_parser::ast::{self, Constant, Expr, Ranged, Stmt, text_size::TextRange};
+use ruff_python_ast::{self as ast, Expr, Stmt};
+use ruff_text_size::{Ranged, TextRange};
 
 use crate::{
     analysis::parse_guarded, location::Location, lowered_function::LoweredFunction,
@@ -237,7 +238,7 @@ fn overridden_in_module<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> B
             continue;
         };
         let bases: Vec<&str> = class
-            .bases
+            .bases()
             .iter()
             .filter_map(|base| match base {
                 Expr::Name(name) => Some(name.id.as_str()),
@@ -250,7 +251,6 @@ fn overridden_in_module<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> B
         for member in &class.body {
             let method = match member {
                 Stmt::FunctionDef(def) => def.name.as_str(),
-                Stmt::AsyncFunctionDef(def) => def.name.as_str(),
                 _ => continue,
             };
             for base in &bases {
@@ -335,22 +335,19 @@ fn store_facts<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> StoreFacts
             continue;
         };
         let bases = class
-            .bases
+            .bases()
             .iter()
             .filter_map(|base| match base {
                 Expr::Name(name) => Some(name.id.as_str()),
                 _ => None,
             })
             .collect();
-        let mut intercepts = !class.keywords.is_empty() || !class.decorator_list.is_empty();
+        let mut intercepts = !class.keywords().is_empty() || !class.decorator_list.is_empty();
         let mut names = BTreeSet::new();
         for member in &class.body {
             match member {
                 Stmt::FunctionDef(def) => {
                     intercepts |= def.name.as_str() == "__setattr__";
-                    names.insert(def.name.to_string());
-                }
-                Stmt::AsyncFunctionDef(def) => {
                     names.insert(def.name.to_string());
                 }
                 Stmt::ClassDef(def) => {
@@ -453,7 +450,6 @@ fn module_functions_of(statements: &[Stmt]) -> BTreeSet<String> {
         .iter()
         .filter_map(|statement| match statement {
             Stmt::FunctionDef(def) => Some(def.name.to_string()),
-            Stmt::AsyncFunctionDef(def) => Some(def.name.to_string()),
             _ => None,
         })
         .filter(|name| bound_times.get(name).copied() == Some(1))
@@ -493,7 +489,7 @@ fn imports_of(statements: &[Stmt]) -> BTreeMap<String, String> {
                 }
             }
             Stmt::ImportFrom(node) => {
-                if node.level.is_some_and(|level| level.to_u32() != 0) {
+                if node.level != 0 {
                     continue;
                 }
                 let Some(module) = node.module.as_ref() else {
@@ -554,7 +550,7 @@ pub fn lower_module_with(
     // empty set.
     let mut lowered = Vec::new();
     for statement in &module {
-        for definition in Definition::all_of(statement, &typing, trust) {
+        for definition in Definition::all_of(statement, source, &typing, trust) {
             lowered.push(lower_function(
                 path,
                 &index,
@@ -643,13 +639,13 @@ struct Definition<'a> {
     trust: AnnotationTrust,
     /// The parameter list, which is where `int` and collection annotations are
     /// read from.
-    args: &'a ast::Arguments,
+    args: &'a ast::Parameters,
     /// The statements to translate.
     body: &'a [Stmt],
     /// The decorators, as written. `@staticmethod` and `@classmethod` say the
     /// first parameter is not an instance, which a store on it depends on
     /// (`LAN-120`).
-    decorators: &'a [Expr],
+    decorators: &'a [ast::Decorator],
     /// The extent of the **whole statement**. For an `async def` that starts at
     /// the `async` keyword, not at the `def` five characters later, so a report
     /// points at the line as the reader sees it.
@@ -663,7 +659,12 @@ impl<'a> Definition<'a> {
     /// place that decides what counts as a top-level function, so a node type
     /// missing from it is missing from the denominator and says nothing about
     /// itself anywhere in the output. That silence is the whole of `LAN-93`.
-    fn of(statement: &'a Stmt, typing: &'a TypingNames, trust: AnnotationTrust) -> Option<Self> {
+    fn of(
+        statement: &'a Stmt,
+        source: &str,
+        typing: &'a TypingNames,
+        trust: AnnotationTrust,
+    ) -> Option<Self> {
         match statement {
             Stmt::FunctionDef(function) => Some(Self {
                 name: function.name.as_str(),
@@ -671,21 +672,16 @@ impl<'a> Definition<'a> {
                 class_body: None,
                 typing,
                 trust,
-                args: function.args.as_ref(),
+                args: function.parameters.as_ref(),
                 body: &function.body,
                 decorators: &function.decorator_list,
-                range: function.range,
-            }),
-            Stmt::AsyncFunctionDef(function) => Some(Self {
-                name: function.name.as_str(),
-                class: None,
-                class_body: None,
-                typing,
-                trust,
-                args: function.args.as_ref(),
-                body: &function.body,
-                decorators: &function.decorator_list,
-                range: function.range,
+                // Not `function.range`: that starts at the first decorator.
+                // See `syntax::definition_keyword`.
+                range: crate::syntax::definition_keyword(
+                    source,
+                    function.range,
+                    &function.decorator_list,
+                ),
             }),
             _ => None,
         }
@@ -693,8 +689,13 @@ impl<'a> Definition<'a> {
 
     /// Every definition a module-level `statement` holds: the function it is,
     /// or the methods of the class it is. See the type's doc for `LAN-104`.
-    fn all_of(statement: &'a Stmt, typing: &'a TypingNames, trust: AnnotationTrust) -> Vec<Self> {
-        if let Some(function) = Self::of(statement, typing, trust) {
+    fn all_of(
+        statement: &'a Stmt,
+        source: &str,
+        typing: &'a TypingNames,
+        trust: AnnotationTrust,
+    ) -> Vec<Self> {
+        if let Some(function) = Self::of(statement, source, typing, trust) {
             return vec![function];
         }
         let Stmt::ClassDef(class) = statement else {
@@ -703,7 +704,7 @@ impl<'a> Definition<'a> {
         class
             .body
             .iter()
-            .filter_map(|member| Self::of(member, typing, trust))
+            .filter_map(|member| Self::of(member, source, typing, trust))
             .map(|method| Self {
                 class: Some(class.name.as_str()),
                 class_body: Some(&class.body),
@@ -886,13 +887,13 @@ fn parameter_names(function: Definition<'_>) -> Vec<String> {
         .iter()
         .chain(arguments.args.iter())
         .chain(arguments.kwonlyargs.iter())
-        .map(|parameter| parameter.def.arg.to_string())
+        .map(|parameter| parameter.parameter.name.to_string())
         .chain(
             arguments
                 .vararg
                 .iter()
                 .chain(arguments.kwarg.iter())
-                .map(|parameter| parameter.arg.to_string()),
+                .map(|parameter| parameter.name.to_string()),
         )
         .collect()
 }
@@ -986,9 +987,6 @@ fn binding_sites(statements: &[Stmt], report: &mut dyn FnMut(String, Binding)) -
             Stmt::FunctionDef(node) => {
                 report(node.name.to_string(), Binding::Other);
             }
-            Stmt::AsyncFunctionDef(node) => {
-                report(node.name.to_string(), Binding::Other);
-            }
             Stmt::ClassDef(node) => {
                 report(node.name.to_string(), Binding::Other);
             }
@@ -1022,11 +1020,11 @@ fn binding_sites(statements: &[Stmt], report: &mut dyn FnMut(String, Binding)) -
                 // Only an absolute `from typing import ...`: a relative
                 // `from .typing import List` names a module of this package
                 // that happens to be called `typing`.
-                let absolute = node.level.is_none_or(|level| level.to_u32() == 0);
+                let absolute = node.level == 0;
                 let module = node
                     .module
                     .as_ref()
-                    .map(rustpython_parser::ast::Identifier::as_str);
+                    .map(ruff_python_ast::Identifier::as_str);
                 let from_typing = absolute && module == Some("typing");
                 // A sized protocol has two homes, and `collections.abc` is the
                 // one PEP 585 steers new code towards.
@@ -1050,6 +1048,9 @@ fn binding_sites(statements: &[Stmt], report: &mut dyn FnMut(String, Binding)) -
                     report(bound, how);
                 }
             }
+            // Jupyter magic binds nothing this pass can enumerate, and
+            // cannot reach a module parse anyway.
+            Stmt::IpyEscapeCommand(_) => {}
             Stmt::Global(node) => node
                 .names
                 .iter()
@@ -1062,12 +1063,14 @@ fn binding_sites(statements: &[Stmt], report: &mut dyn FnMut(String, Binding)) -
                 report_targets(&node.target, report);
                 work.extend(node.body.iter().chain(node.orelse.iter()));
             }
-            Stmt::AsyncFor(node) => {
-                report_targets(&node.target, report);
-                work.extend(node.body.iter().chain(node.orelse.iter()));
-            }
             Stmt::While(node) => work.extend(node.body.iter().chain(node.orelse.iter())),
-            Stmt::If(node) => work.extend(node.body.iter().chain(node.orelse.iter())),
+            Stmt::If(node) => work.extend(
+                node.body.iter().chain(
+                    node.elif_else_clauses
+                        .iter()
+                        .flat_map(|clause| clause.body.iter()),
+                ),
+            ),
             Stmt::With(node) => {
                 for item in &node.items {
                     if let Some(target) = &item.optional_vars {
@@ -1076,30 +1079,7 @@ fn binding_sites(statements: &[Stmt], report: &mut dyn FnMut(String, Binding)) -
                 }
                 work.extend(node.body.iter());
             }
-            Stmt::AsyncWith(node) => {
-                for item in &node.items {
-                    if let Some(target) = &item.optional_vars {
-                        report_targets(target, report);
-                    }
-                }
-                work.extend(node.body.iter());
-            }
             Stmt::Try(node) => {
-                for handler in &node.handlers {
-                    let ast::ExceptHandler::ExceptHandler(clause) = handler;
-                    if let Some(name) = &clause.name {
-                        report(name.to_string(), Binding::Other);
-                    }
-                    work.extend(clause.body.iter());
-                }
-                work.extend(
-                    node.body
-                        .iter()
-                        .chain(node.orelse.iter())
-                        .chain(node.finalbody.iter()),
-                );
-            }
-            Stmt::TryStar(node) => {
                 for handler in &node.handlers {
                     let ast::ExceptHandler::ExceptHandler(clause) = handler;
                     if let Some(name) = &clause.name {
@@ -1163,8 +1143,8 @@ fn integer_parameters(function: Definition<'_>) -> Vec<String> {
         .posonlyargs
         .iter()
         .chain(arguments.args.iter())
-        .filter(|parameter| annotation_is_int(parameter.def.annotation.as_deref()))
-        .map(|parameter| parameter.def.arg.to_string())
+        .filter(|parameter| annotation_is_int(parameter.parameter.annotation.as_deref()))
+        .map(|parameter| parameter.parameter.name.to_string())
         .collect()
 }
 
@@ -1521,7 +1501,7 @@ fn collection_parameters(function: Definition<'_>) -> Vec<(String, Trust)> {
         .chain(arguments.args.iter())
         .filter_map(|parameter| {
             let trust = annotation_collection_trust(
-                parameter.def.annotation.as_deref(),
+                parameter.parameter.annotation.as_deref(),
                 function.typing,
                 &class_bound,
             )?;
@@ -1531,7 +1511,7 @@ fn collection_parameters(function: Definition<'_>) -> Vec<(String, Trust)> {
             if trust == Trust::Protocol && function.trust == AnnotationTrust::ConcreteOnly {
                 return None;
             }
-            Some((parameter.def.arg.to_string(), trust))
+            Some((parameter.parameter.name.to_string(), trust))
         })
         .filter(|(name, _)| !rebound.as_ref().is_none_or(|names| names.contains(name)))
         .collect()
@@ -1570,10 +1550,6 @@ fn target_bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
                 collect_target_names(&node.target, &mut names);
                 work.extend(node.body.iter().chain(node.orelse.iter()));
             }
-            Stmt::AsyncFor(node) => {
-                collect_target_names(&node.target, &mut names);
-                work.extend(node.body.iter().chain(node.orelse.iter()));
-            }
             Stmt::With(node) => {
                 for item in &node.items {
                     if let Some(target) = &item.optional_vars {
@@ -1582,25 +1558,15 @@ fn target_bindings_of(statements: &[Stmt]) -> Option<BTreeSet<String>> {
                 }
                 work.extend(node.body.iter());
             }
-            Stmt::AsyncWith(node) => {
-                for item in &node.items {
-                    if let Some(target) = &item.optional_vars {
-                        collect_target_names(target, &mut names);
-                    }
-                }
-                work.extend(node.body.iter());
-            }
             Stmt::While(node) => work.extend(node.body.iter().chain(node.orelse.iter())),
-            Stmt::If(node) => work.extend(node.body.iter().chain(node.orelse.iter())),
+            Stmt::If(node) => work.extend(
+                node.body.iter().chain(
+                    node.elif_else_clauses
+                        .iter()
+                        .flat_map(|clause| clause.body.iter()),
+                ),
+            ),
             Stmt::Try(node) => {
-                work.extend(node.body.iter());
-                for handler in &node.handlers {
-                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                    work.extend(handler.body.iter());
-                }
-                work.extend(node.orelse.iter().chain(node.finalbody.iter()));
-            }
-            Stmt::TryStar(node) => {
                 work.extend(node.body.iter());
                 for handler in &node.handlers {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
@@ -1633,8 +1599,8 @@ fn integer_names(function: Definition<'_>) -> BTreeSet<String> {
         .iter()
         .chain(arguments.args.iter())
         .chain(arguments.kwonlyargs.iter())
-        .filter(|parameter| !annotation_is_int(parameter.def.annotation.as_deref()))
-        .map(|parameter| parameter.def.arg.to_string())
+        .filter(|parameter| !annotation_is_int(parameter.parameter.annotation.as_deref()))
+        .map(|parameter| parameter.parameter.name.to_string())
         .collect();
 
     let collections: BTreeSet<String> = collection_parameters(function)
@@ -1797,9 +1763,7 @@ fn is_integer_expr(
         // `len(items)` is a natural number, so a name bound from it is an
         // integer and a `range` over it has an integer counter. `LAN-89`.
         Expr::Call(call) => length_of_collection(call, collections).is_some(),
-        Expr::Constant(constant) => {
-            matches!(constant.value, Constant::Int(_) | Constant::Bool(_))
-        }
+        leaf if is_integral_literal(leaf) => true,
         Expr::Name(name) => candidates.contains(name.id.as_str()),
         Expr::BinOp(binary) => match binary.op {
             ast::Operator::Add | ast::Operator::Sub | ast::Operator::Mult => {
@@ -1837,7 +1801,7 @@ fn is_integer_expr(
         // It does not make the ternary's *value* available: nothing here claims
         // to know which arm ran, and `Translator::bind_expression` binds the
         // name inside a branch rather than to an expression.
-        Expr::IfExp(ternary) => {
+        Expr::If(ternary) => {
             is_integer_expr(&ternary.body, candidates, collections)
                 && is_integer_expr(&ternary.orelse, candidates, collections)
         }
@@ -1857,10 +1821,10 @@ fn length_of_collection(call: &ast::ExprCall, collections: &BTreeSet<String>) ->
     let Expr::Name(callee) = call.func.as_ref() else {
         return None;
     };
-    if callee.id.as_str() != "len" || !call.keywords.is_empty() {
+    if callee.id.as_str() != "len" || !call.arguments.keywords.is_empty() {
         return None;
     }
-    let [Expr::Name(argument)] = call.args.as_slice() else {
+    let [Expr::Name(argument)] = call.arguments.args.as_slice() else {
         return None;
     };
     collections
@@ -1899,18 +1863,19 @@ fn walked_display(expr: &Expr) -> Option<(u64, bool)> {
         Expr::Tuple(tuple) => counted(&tuple.elts, true),
         Expr::Set(set) => counted(&set.elts, false),
         // A `None` key is `**mapping`, which spreads an unknown number of them.
+        // A `None` key is `**mapping`, which spreads an unknown number of them.
         Expr::Dict(dict) => {
-            if dict.keys.iter().any(Option::is_none) {
+            if dict.items.iter().any(|item| item.key.is_none()) {
                 return None;
             }
-            Some((u64::try_from(dict.keys.len()).ok()?, false))
+            Some((u64::try_from(dict.items.len()).ok()?, false))
         }
-        Expr::Constant(constant) => match &constant.value {
-            Constant::Str(text) => Some((u64::try_from(text.chars().count()).ok()?, true)),
-            Constant::Bytes(bytes) => Some((u64::try_from(bytes.len()).ok()?, true)),
-            Constant::Tuple(elements) => Some((u64::try_from(elements.len()).ok()?, true)),
-            _ => None,
-        },
+        // A `str` is measured in characters, a `bytes` in bytes, because that
+        // is what Python iterates. A tuple literal is `Expr::Tuple` above:
+        // this parser does not fold one into a constant, so the arm that used
+        // to catch `Constant::Tuple` has nothing left to catch.
+        Expr::StringLiteral(text) => Some((u64::try_from(text.value.chars().count()).ok()?, true)),
+        Expr::BytesLiteral(bytes) => Some((u64::try_from(bytes.value.bytes().count()).ok()?, true)),
         _ => None,
     }
 }
@@ -1952,24 +1917,50 @@ fn range_arguments(expr: &Expr) -> Option<&[Expr]> {
         Expr::Name(name) => name.id.as_str(),
         _ => return None,
     };
-    if named != "range" || !call.keywords.is_empty() {
+    if named != "range" || !call.arguments.keywords.is_empty() {
         return None;
     }
-    match call.args.len() {
-        1..=3 => Some(&call.args),
+    match call.arguments.args.len() {
+        1..=3 => Some(&call.arguments.args),
+        _ => None,
+    }
+}
+
+/// Whether `expr` is a literal this fragment reads as an integer.
+///
+/// An integer literal, or a `bool` - `True` is `1` and `False` is `0`,
+/// exactly, in Python. A float and a complex are numbers and **not**
+/// integers, which is the distinction the previous parser spelled as
+/// `Constant::Int` against the rest of one `Constant` enum; here every
+/// literal kind is its own node, so the question is about the number's own
+/// kind rather than about the literal's.
+fn is_integral_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::NumberLiteral(number) => matches!(number.value, ast::Number::Int(_)),
+        Expr::BooleanLiteral(_) => true,
+        _ => false,
+    }
+}
+
+/// The value of an integer literal, or `None` when `expr` is not one.
+///
+/// `None` for a literal too large for `i64` as well, which is **not** the same
+/// answer as "not an integer": `build_expression` refuses an unrepresentable
+/// Python integer as `ArithmeticOverflow` rather than as a non-integer, so it
+/// asks about the kind itself rather than going through here.
+fn integer_value(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::NumberLiteral(number) => match &number.value {
+            ast::Number::Int(value) => value.as_i64(),
+            ast::Number::Float(_) | ast::Number::Complex { .. } => None,
+        },
         _ => None,
     }
 }
 
 /// A `**` exponent that keeps the expression polynomial.
 fn literal_exponent(expr: &Expr) -> Option<u32> {
-    let Expr::Constant(constant) = expr else {
-        return None;
-    };
-    let Constant::Int(value) = &constant.value else {
-        return None;
-    };
-    let exponent = u32::try_from(value.clone()).ok()?;
+    let exponent = u32::try_from(integer_value(expr)?).ok()?;
     (exponent <= MAX_EXPONENT).then_some(exponent)
 }
 
@@ -2074,13 +2065,7 @@ fn approximation_of(
 /// so it is not a literal this recognises; a symbolic one makes the result
 /// `n * 2^m`, which is not a polynomial and has no `SourceExpr`.
 fn literal_shift(expr: &Expr) -> Option<u32> {
-    let Expr::Constant(constant) = expr else {
-        return None;
-    };
-    let Constant::Int(value) = &constant.value else {
-        return None;
-    };
-    u32::try_from(value.clone()).ok()
+    u32::try_from(integer_value(expr)?).ok()
 }
 
 /// How the frontend spells an operator it approximates, for the report.
@@ -2280,7 +2265,7 @@ impl Translator<'_> {
             Stmt::If(branch) => {
                 let cond = self.condition(&branch.test);
                 let then_body = self.block(&branch.body);
-                let else_body = self.block(&branch.orelse);
+                let else_body = self.else_block(&branch.elif_else_clauses);
                 let origin = self.origin(branch);
                 vec![self.builder.if_else(cond, then_body, else_body, origin)]
             }
@@ -2296,6 +2281,16 @@ impl Translator<'_> {
                 let body = self.block(&loop_stmt.body);
                 let origin = self.origin(loop_stmt);
                 vec![self.builder.while_loop(cond, body, origin)]
+            }
+            // `async for` first, and the order is load-bearing. This parser
+            // carries it as `is_async` on the ordinary `For` node rather than
+            // as a variant of its own, so the counted-loop arm below would
+            // otherwise take it - and an `async for` iterates an `__anext__`
+            // that is user code, which a trip count must not be derived over.
+            // The compiler says so: with the arms the other way round this one
+            // is an unreachable pattern, which is the warning that caught it.
+            Stmt::For(loop_stmt) if loop_stmt.is_async => {
+                vec![self.refuse_stmt(Construct::Coroutine, loop_stmt)]
             }
             Stmt::For(loop_stmt) => self.for_loop(loop_stmt),
             Stmt::Return(ret) => {
@@ -2321,24 +2316,45 @@ impl Translator<'_> {
             Stmt::Break(node) => vec![self.refuse_stmt(Construct::LoopJump, node)],
             Stmt::Continue(node) => vec![self.refuse_stmt(Construct::LoopJump, node)],
             Stmt::Raise(node) => self.raise(node),
-            Stmt::Try(node) => self.try_statement(node),
             // `except*` runs **several** handlers for one exception group, so
             // the sum over its clauses is still the honest upper bound and the
             // shape is the same. It stays refused all the same: it is rare
             // enough that the corpus does not pay for it, and every construct
             // accepted here is soundness surface.
-            Stmt::TryStar(node) => {
+            //
+            // The guard is load-bearing. This parser carries `except*` as
+            // `is_star` on the ordinary `Try` node rather than as a variant of
+            // its own, so an arm matching `Stmt::Try` without asking would
+            // hand an `except*` to `try_statement` and derive a bound for
+            // control flow nobody modelled. Same for the three `is_async`
+            // guards here and above: an `async with` runs `__aenter__`, an
+            // `async def` is a coroutine, and each must refuse rather than be
+            // handled as its synchronous spelling. Guards come first,
+            // deliberately.
+            Stmt::Try(node) if node.is_star => {
                 vec![self.refuse_stmt(Construct::ExceptionalControlFlow, node)]
             }
+            Stmt::Try(node) => self.try_statement(node),
             Stmt::Assert(node) => vec![self.refuse_stmt(Construct::ExceptionalControlFlow, node)],
+            Stmt::With(node) if node.is_async => {
+                vec![self.refuse_stmt(Construct::Coroutine, node)]
+            }
             Stmt::With(node) => self.with_statement(node),
-            Stmt::AsyncWith(node) => vec![self.refuse_stmt(Construct::Coroutine, node)],
-            Stmt::AsyncFor(node) => vec![self.refuse_stmt(Construct::Coroutine, node)],
-            Stmt::AsyncFunctionDef(node) => vec![self.refuse_stmt(Construct::Coroutine, node)],
+            Stmt::FunctionDef(node) if node.is_async => {
+                vec![self.refuse_stmt(Construct::Coroutine, node)]
+            }
             Stmt::FunctionDef(node) => vec![self.refuse_stmt(Construct::Declaration, node)],
             Stmt::ClassDef(node) => vec![self.refuse_stmt(Construct::Declaration, node)],
             Stmt::Import(node) => vec![self.refuse_stmt(Construct::Declaration, node)],
             Stmt::ImportFrom(node) => vec![self.refuse_stmt(Construct::Declaration, node)],
+            // `!ls` and `%timeit` in a notebook cell. A `.py` file parsed as
+            // a module never produces one, so this arm is unreachable in this
+            // frontend today - and it is written out rather than left to a
+            // catch-all because this file has no catch-all by design: a node
+            // nobody thought about must refuse loudly, not vanish. A shell
+            // escape is a call to something this analysis cannot see, which is
+            // exactly what `Call` already says.
+            Stmt::IpyEscapeCommand(node) => vec![self.refuse_stmt(Construct::Call, node)],
             Stmt::Global(node) => vec![self.refuse_stmt(Construct::BindingForm, node)],
             Stmt::Nonlocal(node) => vec![self.refuse_stmt(Construct::BindingForm, node)],
             Stmt::Delete(node) => vec![self.refuse_stmt(Construct::BindingForm, node)],
@@ -2650,7 +2666,7 @@ impl Translator<'_> {
         node: &T,
         depth: u32,
     ) -> Vec<StmtId> {
-        if let Expr::IfExp(ternary) = value
+        if let Expr::If(ternary) = value
             && depth < MAX_TERNARY_DEPTH
         {
             let cond = self.condition(&ternary.test);
@@ -2702,6 +2718,34 @@ impl Translator<'_> {
             origin,
         ));
         statements
+    }
+
+    /// The `else` arm of an `if`, rebuilt from this parser's flat clause list.
+    ///
+    /// `if a: X elif b: Y else: Z` arrives as **one** `If` carrying two
+    /// clauses, where the previous parser nested a whole second `If` inside
+    /// the first one's `orelse`. [`landav_its::SourceStmt::If`] still takes
+    /// one test, one then-body and one else-body, so folding the clauses from
+    /// the right rebuilds exactly that nesting and an `elif` costs what it
+    /// always did: the engine maximises over two arms at a time, down the
+    /// chain.
+    ///
+    /// Concatenating the clauses instead would be the quiet bug - the engine
+    /// **sums** a statement list, so a three-way chain would be charged all
+    /// three branches where exactly one runs.
+    fn else_block(&mut self, clauses: &[ast::ElifElseClause]) -> Vec<StmtId> {
+        let Some((clause, rest)) = clauses.split_first() else {
+            return Vec::new();
+        };
+        // A clause with no test is the `else`, and it is always last.
+        let Some(test) = clause.test.as_ref() else {
+            return self.block(&clause.body);
+        };
+        let cond = self.condition(test);
+        let then_body = self.block(&clause.body);
+        let else_body = self.else_block(rest);
+        let origin = self.origin(clause);
+        vec![self.builder.if_else(cond, then_body, else_body, origin)]
     }
 
     fn aug_assign(&mut self, assign: &ast::StmtAugAssign) -> Vec<StmtId> {
@@ -3154,7 +3198,7 @@ impl Translator<'_> {
         let Expr::Name(callee) = call.func.as_ref() else {
             return None;
         };
-        if callee.id.as_str() != "len" || !call.keywords.is_empty() {
+        if callee.id.as_str() != "len" || !call.arguments.keywords.is_empty() {
             return None;
         }
         // A *call* whose length is known, and nothing else. `len(items)` for a
@@ -3162,7 +3206,7 @@ impl Translator<'_> {
         // it as a variable and charges nothing - translating it here instead
         // would refuse `items` as `non-integer-value` for its value, which is
         // not the question `len` asks.
-        let [measured @ Expr::Call(_)] = call.args.as_slice() else {
+        let [measured @ Expr::Call(_)] = call.arguments.args.as_slice() else {
             return None;
         };
         // `len` itself is matched by name, exactly as `length_of_collection`
@@ -3212,7 +3256,7 @@ impl Translator<'_> {
             };
             // A keyword argument means this is some other spelling of the call
             // than the one the row was written for.
-            if !call.keywords.is_empty() {
+            if !call.arguments.keywords.is_empty() {
                 return None;
             }
             let (callee, receiver) = match call.func.as_ref() {
@@ -3229,9 +3273,9 @@ impl Translator<'_> {
                 // A method row's argument 0 is its receiver, and the row was
                 // written for the no-argument spelling: `d.items()`, never
                 // `d.items(something)`.
-                Some(receiver) if call.args.is_empty() => receiver,
+                Some(receiver) if call.arguments.args.is_empty() => receiver,
                 Some(_) => return None,
-                None => match call.args.as_slice() {
+                None => match call.arguments.args.as_slice() {
                     [only] => only,
                     _ => return None,
                 },
@@ -3374,9 +3418,10 @@ impl Translator<'_> {
     fn bare_expression(&mut self, bare: &ast::StmtExpr) -> Vec<StmtId> {
         // A string constant on its own is a docstring, not a value. Treating it
         // as one would refuse every documented function in the corpus.
-        if let Expr::Constant(constant) = bare.value.as_ref()
-            && matches!(constant.value, Constant::Str(_) | Constant::Ellipsis)
-        {
+        if matches!(
+            bare.value.as_ref(),
+            Expr::StringLiteral(_) | Expr::EllipsisLiteral(_)
+        ) {
             return Vec::new();
         }
         // Anything else is translated; if it is pure arithmetic it is a no-op,
@@ -3401,7 +3446,7 @@ impl Translator<'_> {
     /// exists for the same reason: `f() if c else g()` runs one of two calls,
     /// and a refusal list would charge both. See that method for the argument.
     fn evaluate(&mut self, value: &Expr, depth: u32) -> Vec<StmtId> {
-        if let Expr::IfExp(ternary) = value
+        if let Expr::If(ternary) = value
             && depth < MAX_TERNARY_DEPTH
         {
             let cond = self.condition(&ternary.test);
@@ -3600,7 +3645,9 @@ impl Translator<'_> {
             return None;
         };
         let callee = callee.id.as_str();
-        if callee == "getattr" && (call.args.len() != 2 || !call.keywords.is_empty()) {
+        if callee == "getattr"
+            && (call.arguments.args.len() != 2 || !call.arguments.keywords.is_empty())
+        {
             return None;
         }
         let row = self.pack.signature(callee, |name| self.is_shadowed(name))?;
@@ -3746,7 +3793,7 @@ impl Translator<'_> {
         params: &[String],
         holes: &[InheritedHole],
     ) -> Option<landav_bound::Bound> {
-        if !call.keywords.is_empty() || call.args.len() != params.len() {
+        if !call.arguments.keywords.is_empty() || call.arguments.args.len() != params.len() {
             return None;
         }
         let rebound = self.rebound.as_ref()?;
@@ -3766,7 +3813,7 @@ impl Translator<'_> {
                     (params.iter().position(|p| p == inner)?, true)
                 }
             };
-            let replacement = match &call.args[position] {
+            let replacement = match &call.arguments.args[position] {
                 Expr::Name(argument) => {
                     let argument = argument.id.as_str();
                     if as_length {
@@ -3781,13 +3828,10 @@ impl Translator<'_> {
                         landav_bound::Bound::var(argument)
                     }
                 }
-                Expr::Constant(constant) if !as_length => match &constant.value {
-                    Constant::Int(value) => {
-                        let value = i64::try_from(value.clone()).ok()?;
-                        landav_bound::Bound::constant(u64::try_from(value).ok()?)
-                    }
-                    _ => return None,
-                },
+                literal if !as_length && is_integral_literal(literal) => {
+                    let value = integer_value(literal)?;
+                    landav_bound::Bound::constant(u64::try_from(value).ok()?)
+                }
                 _ => return None,
             };
             result = result.subst(&var, &replacement);
@@ -4071,10 +4115,18 @@ impl Translator<'_> {
             );
         }
 
-        let mut left = self.expression(&comparison.left);
+        // `a < b < c` is one node with three operands and two operators
+        // here, where the previous parser gave a `left` beside a list of
+        // `comparators`. Same chain, read off one list: operand `i` against
+        // operand `i + 1` under operator `i`.
+        let mut left = self.expression(comparison.first_operand());
         let mut combined: Option<CondId> = None;
 
-        for (op, right_expr) in comparison.ops.iter().zip(comparison.comparators.iter()) {
+        for (op, right_expr) in comparison
+            .ops
+            .iter()
+            .zip(comparison.operands.iter().skip(1))
+        {
             let right = self.expression(right_expr);
             let Some(operator) = compare_of(op) else {
                 // Unreachable: every operator was checked above. Kept as a
@@ -4169,10 +4221,7 @@ impl Translator<'_> {
     fn cost_only_leaf(&mut self, root: &Expr) -> Option<ExprId> {
         let leaf = match root {
             Expr::Name(name) => !self.integers.contains(name.id.as_str()),
-            Expr::Constant(constant) => {
-                !matches!(constant.value, Constant::Int(_) | Constant::Bool(_))
-            }
-            _ => false,
+            leaf => leaf.is_literal_expr() && !is_integral_literal(leaf),
         };
         leaf.then(|| {
             let origin = self.origin(root);
@@ -4185,27 +4234,35 @@ impl Translator<'_> {
         let recall = |expr: &Expr| built.get(&(std::ptr::from_ref(expr) as usize)).copied();
 
         match node {
-            Expr::Constant(constant) => match &constant.value {
-                Constant::Int(value) => match i64::try_from(value.clone()) {
-                    Ok(literal) => self.builder.int(literal, origin),
+            Expr::NumberLiteral(number) => match &number.value {
+                ast::Number::Int(value) => match value.as_i64() {
+                    Some(literal) => self.builder.int(literal, origin),
                     // Python integers are unbounded; the fragment's are not.
                     // Truncating would change the program, so it refuses.
-                    Err(_) => self.refuse_expr(Construct::ArithmeticOverflow, None, node, origin),
+                    None => self.refuse_expr(Construct::ArithmeticOverflow, None, node, origin),
                 },
-                // `True` is `1` and `False` is `0`, exactly, in Python.
-                Constant::Bool(flag) => self.builder.int(i64::from(*flag), origin),
-                // A string, a bytes or a tuple constant. Evaluated for its
-                // effect it has none - nothing is written and no name changes
-                // meaning - so in a discarded position it is not a refusal at
-                // all. See [`Translator::discarding`].
-                Constant::Str(_) | Constant::Bytes(_) | Constant::Tuple(_) => {
-                    if self.discarding {
-                        return self.builder.int(0, origin);
-                    }
-                    self.refuse_expr(Construct::Collection, None, node, origin)
+                // A float or a complex is a number this fragment cannot hold.
+                ast::Number::Float(_) | ast::Number::Complex { .. } => {
+                    self.refuse_expr(Construct::NonIntegerValue, None, node, origin)
                 }
-                _ => self.refuse_expr(Construct::NonIntegerValue, None, node, origin),
             },
+            // `True` is `1` and `False` is `0`, exactly, in Python.
+            Expr::BooleanLiteral(flag) => self.builder.int(i64::from(flag.value), origin),
+            // A string or a bytes literal. Evaluated for its effect it has
+            // none - nothing is written and no name changes meaning - so in a
+            // discarded position it is not a refusal at all. See
+            // [`Translator::discarding`]. The previous parser folded a literal
+            // tuple into this arm; this one gives it `Expr::Tuple`, which has
+            // an arm of its own below.
+            Expr::StringLiteral(_) | Expr::BytesLiteral(_) => {
+                if self.discarding {
+                    return self.builder.int(0, origin);
+                }
+                self.refuse_expr(Construct::Collection, None, node, origin)
+            }
+            Expr::NoneLiteral(_) | Expr::EllipsisLiteral(_) => {
+                self.refuse_expr(Construct::NonIntegerValue, None, node, origin)
+            }
 
             Expr::Name(name) => self.read(name.id.as_str(), node),
 
@@ -4375,25 +4432,36 @@ impl Translator<'_> {
             // its elements have been translated already (see
             // `expression_children`), so a call hidden inside one is named and
             // placed where it stands rather than vanishing with the container.
-            Expr::List(_)
-            | Expr::Tuple(_)
-            | Expr::Set(_)
-            | Expr::Dict(_)
-            | Expr::JoinedStr(_)
-            | Expr::FormattedValue(_) => {
+            Expr::List(_) | Expr::Tuple(_) | Expr::Set(_) | Expr::Dict(_) | Expr::FString(_) => {
                 if self.discarding {
                     return self.builder.int(0, origin);
                 }
                 self.refuse_expr(Construct::Collection, None, node, origin)
             }
-            Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::GeneratorExp(_) => {
+            // A template string (PEP 750) is a `Template` object, not a
+            // string: its interpolations are handed to a user-written
+            // processing function rather than formatted. So it is **not**
+            // freed the way `LAN-115` freed an f-string, and it is not walked
+            // like one either. `LAN-132` gives it a construct of its own; at
+            // the level this build claims it cannot appear at all.
+            Expr::TString(_) => {
+                if self.discarding {
+                    return self.builder.int(0, origin);
+                }
+                self.refuse_expr(Construct::Collection, None, node, origin)
+            }
+            // Jupyter magic. Unreachable from a `.py` file parsed as a
+            // module; refused rather than dropped, for the reason this file's
+            // documentation gives about every match ending in a refusal.
+            Expr::IpyEscapeCommand(_) => self.refuse_expr(Construct::Call, None, node, origin),
+            Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::Generator(_) => {
                 self.refuse_expr(Construct::Comprehension, None, node, origin)
             }
             Expr::Lambda(_) => self.refuse_expr(Construct::Declaration, None, node, origin),
             Expr::Await(_) | Expr::Yield(_) | Expr::YieldFrom(_) => {
                 self.refuse_expr(Construct::Coroutine, None, node, origin)
             }
-            Expr::NamedExpr(_) => self.refuse_expr(Construct::BindingForm, None, node, origin),
+            Expr::Named(_) => self.refuse_expr(Construct::BindingForm, None, node, origin),
             // A ternary and an `and`/`or` chain, in a position that reads no
             // value from them. Neither costs a source step of its own and
             // neither can bind anything, so what is left is their operands -
@@ -4410,7 +4478,7 @@ impl Translator<'_> {
             //
             // In value position all three stay refused; see
             // [`Translator::value_discarded`].
-            Expr::IfExp(_) | Expr::BoolOp(_) => {
+            Expr::If(_) | Expr::BoolOp(_) => {
                 if self.value_discarded {
                     return self.builder.int(0, origin);
                 }
@@ -4477,11 +4545,16 @@ impl Translator<'_> {
 /// costs and both must be named where they stand.
 /// Whether a decorator makes a method's first parameter not an instance.
 /// `LAN-120`.
-fn is_static_or_class(decorator: &Expr) -> bool {
+fn is_static_or_class(decorator: &ast::Decorator) -> bool {
+    decorator_names_a_binding(&decorator.expression)
+}
+
+/// The decorator's own expression, asked the same question.
+fn decorator_names_a_binding(decorator: &Expr) -> bool {
     let name = match decorator {
         Expr::Name(name) => name.id.as_str(),
         Expr::Attribute(attribute) => attribute.attr.as_str(),
-        Expr::Call(call) => return is_static_or_class(&call.func),
+        Expr::Call(call) => return decorator_names_a_binding(&call.func),
         _ => return true,
     };
     matches!(name, "staticmethod" | "classmethod")
@@ -4498,10 +4571,7 @@ fn is_name_lookup(expr: &Expr) -> bool {
 /// A `range` step that keeps the loop in the fragment.
 fn literal_step(expr: &Expr) -> Option<i64> {
     match expr {
-        Expr::Constant(constant) => match &constant.value {
-            Constant::Int(value) => i64::try_from(value.clone()).ok(),
-            _ => None,
-        },
+        literal if is_integral_literal(literal) => integer_value(literal),
         Expr::UnaryOp(unary) if matches!(unary.op, ast::UnaryOp::USub) => {
             literal_step(&unary.operand)?.checked_neg()
         }
@@ -4623,9 +4693,10 @@ fn expression_children<'e>(
 /// counts as blocked by a call, and this change is not the place to do that
 /// quietly.
 fn call_arguments(call: &ast::ExprCall) -> Vec<&Expr> {
-    call.args
+    call.arguments
+        .args
         .iter()
-        .chain(call.keywords.iter().map(|keyword| &keyword.value))
+        .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
         .collect()
 }
 
@@ -4659,16 +4730,17 @@ fn effect_of_untranslated<'e>(roots: impl IntoIterator<Item = &'e Expr>) -> Writ
     while let Some(node) = work.pop() {
         match node {
             Expr::Call(_)
-            | Expr::NamedExpr(_)
+            | Expr::Named(_)
             | Expr::Await(_)
             | Expr::Yield(_)
             | Expr::YieldFrom(_) => return Writes::frame(),
-            Expr::Name(_) | Expr::Constant(_) => {}
+            Expr::Name(_) => {}
+            leaf if leaf.is_literal_expr() => {}
             Expr::Tuple(tuple) => work.extend(tuple.elts.iter()),
             Expr::List(list) => work.extend(list.elts.iter()),
             Expr::Lambda(lambda) => {
                 pure = false;
-                work.extend(lambda_defaults(&lambda.args));
+                work.extend(lambda_defaults(lambda.parameters.as_deref()));
             }
             other => {
                 pure = false;
@@ -4691,19 +4763,23 @@ fn rebinds_the_frame<'e>(roots: impl IntoIterator<Item = &'e Expr>) -> bool {
 
 /// The operands a comparison evaluates, left to right.
 fn compare_operands(comparison: &ast::ExprCompare) -> Vec<&Expr> {
-    core::iter::once(comparison.left.as_ref())
-        .chain(comparison.comparators.iter())
-        .collect()
+    comparison.operands.iter().collect()
 }
 
 /// The default values a lambda evaluates when it is *defined*.
-fn lambda_defaults(args: &ast::Arguments) -> Vec<&Expr> {
-    args.posonlyargs
-        .iter()
-        .chain(args.args.iter())
-        .chain(args.kwonlyargs.iter())
-        .filter_map(|parameter| parameter.default.as_deref())
-        .collect()
+///
+/// A lambda's parameter list is optional here (`lambda: 1` has none), and a
+/// list with no parameters evaluates no defaults.
+fn lambda_defaults(args: Option<&ast::Parameters>) -> Vec<&Expr> {
+    args.map(|args| {
+        args.posonlyargs
+            .iter()
+            .chain(args.args.iter())
+            .chain(args.kwonlyargs.iter())
+            .filter_map(|parameter| parameter.default.as_deref())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Every direct sub-expression of `expr`, whatever its kind.
@@ -4714,20 +4790,19 @@ fn lambda_defaults(args: &ast::Arguments) -> Vec<&Expr> {
 fn interior_of(expr: &Expr) -> Vec<&Expr> {
     match expr {
         Expr::BoolOp(boolean) => boolean.values.iter().collect(),
-        Expr::NamedExpr(named) => vec![named.target.as_ref(), named.value.as_ref()],
+        Expr::Named(named) => vec![named.target.as_ref(), named.value.as_ref()],
         Expr::BinOp(binary) => vec![binary.left.as_ref(), binary.right.as_ref()],
         Expr::UnaryOp(unary) => vec![unary.operand.as_ref()],
-        Expr::Lambda(lambda) => lambda_defaults(&lambda.args),
-        Expr::IfExp(ternary) => vec![
+        Expr::Lambda(lambda) => lambda_defaults(lambda.parameters.as_deref()),
+        Expr::If(ternary) => vec![
             ternary.test.as_ref(),
             ternary.body.as_ref(),
             ternary.orelse.as_ref(),
         ],
         Expr::Dict(dict) => dict
-            .keys
+            .items
             .iter()
-            .flatten()
-            .chain(dict.values.iter())
+            .flat_map(|item| item.key.iter().chain(core::iter::once(&item.value)))
             .collect(),
         Expr::Set(set) => set.elts.iter().collect(),
         Expr::ListComp(comprehension) => core::iter::once(comprehension.elt.as_ref())
@@ -4736,11 +4811,17 @@ fn interior_of(expr: &Expr) -> Vec<&Expr> {
         Expr::SetComp(comprehension) => core::iter::once(comprehension.elt.as_ref())
             .chain(generator_parts(&comprehension.generators))
             .collect(),
-        Expr::GeneratorExp(comprehension) => core::iter::once(comprehension.elt.as_ref())
+        Expr::Generator(comprehension) => core::iter::once(comprehension.elt.as_ref())
             .chain(generator_parts(&comprehension.generators))
             .collect(),
-        Expr::DictComp(comprehension) => [comprehension.key.as_ref(), comprehension.value.as_ref()]
+        // The key is optional: `{**d for d in dicts}` (PEP 798) has a value
+        // and no key. The comprehension is refused whichever shape it is, so
+        // this only decides which sub-expressions a walk reaches.
+        Expr::DictComp(comprehension) => comprehension
+            .key
+            .as_deref()
             .into_iter()
+            .chain(core::iter::once(&*comprehension.value))
             .chain(generator_parts(&comprehension.generators))
             .collect(),
         Expr::Await(awaited) => vec![awaited.value.as_ref()],
@@ -4750,11 +4831,22 @@ fn interior_of(expr: &Expr) -> Vec<&Expr> {
         Expr::Call(call) => core::iter::once(call.func.as_ref())
             .chain(call_arguments(call))
             .collect(),
-        Expr::FormattedValue(formatted) => core::iter::once(formatted.value.as_ref())
-            .chain(formatted.format_spec.as_deref())
-            .collect(),
-        Expr::JoinedStr(joined) => joined.values.iter().collect(),
-        Expr::Constant(_) | Expr::Name(_) => Vec::new(),
+        Expr::FString(joined) => crate::syntax::fstring_expressions(joined),
+        // Refused as a value, scanned all the same: a call or a walrus inside
+        // `t"{...}"` is work this program does. See `tstring_expressions`.
+        Expr::TString(template) => crate::syntax::tstring_expressions(template),
+        Expr::IpyEscapeCommand(_) => Vec::new(),
+        // Spelled out rather than asked with `is_literal_expr`, because this
+        // match has no catch-all: a guard satisfies no exhaustiveness check,
+        // and a literal kind added to the parser must break this build rather
+        // than slip through unwalked.
+        Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_)
+        | Expr::Name(_) => Vec::new(),
         Expr::Attribute(attribute) => vec![attribute.value.as_ref()],
         Expr::Subscript(subscript) => vec![subscript.value.as_ref(), subscript.slice.as_ref()],
         Expr::Starred(starred) => vec![starred.value.as_ref()],
@@ -4870,7 +4962,8 @@ fn placeable_without_value_read(argument: &Expr, collections: &BTreeSet<String>)
     let mut work = vec![argument];
     while let Some(node) = work.pop() {
         match node {
-            Expr::Name(_) | Expr::Constant(_) => {}
+            Expr::Name(_) => {}
+            leaf if leaf.is_literal_expr() => {}
             Expr::Attribute(attribute) => work.push(attribute.value.as_ref()),
             Expr::Subscript(subscript) => {
                 work.push(subscript.value.as_ref());
@@ -4904,21 +4997,18 @@ fn placeable_without_value_read(argument: &Expr, collections: &BTreeSet<String>)
 /// not, so it is excluded rather than silently freed.
 fn format_is_constant(expr: &Expr) -> bool {
     match expr {
-        // The pieces of an f-string: literal `Constant` runs and
-        // `FormattedValue` holes. Every one must be constant.
-        Expr::JoinedStr(joined) => joined.values.iter().all(format_is_constant),
-        Expr::FormattedValue(formatted) => {
-            costs_nothing(&formatted.value)
-                && formatted
-                    .format_spec
-                    .as_deref()
-                    .is_none_or(format_is_constant)
-        }
-        // A string or bytes literal - the literal part of an f-string, or a
-        // plain `"..."`. Not an integer, so not something whose value is read.
-        Expr::Constant(constant) => {
-            matches!(constant.value, Constant::Str(_) | Constant::Bytes(_))
-        }
+        // Every interpolation of an f-string, including the ones inside a
+        // nested format spec, must cost nothing. The literal runs between
+        // them are not expressions at all here and cost nothing by
+        // construction - so the two mutually recursive arms the previous
+        // parser needed, a `JoinedStr` of `FormattedValue`s each recursing on
+        // its own spec, are exactly the walk `fstring_expressions` does.
+        Expr::FString(joined) => crate::syntax::fstring_expressions(joined)
+            .into_iter()
+            .all(costs_nothing),
+        // A plain `"..."` or `b"..."`. Not an integer, so not something whose
+        // value is read.
+        Expr::StringLiteral(_) | Expr::BytesLiteral(_) => true,
         // `"fmt" % args` - `%` formatting, distinguished from integer modulo by
         // a string literal on the left. The right is the interpolated values,
         // which must cost nothing; a tuple of names (`"%s %s" % (a, b)`) is
@@ -4927,7 +5017,7 @@ fn format_is_constant(expr: &Expr) -> bool {
             if matches!(binary.op, ast::Operator::Mod)
                 && matches!(
                     binary.left.as_ref(),
-                    Expr::Constant(c) if matches!(c.value, Constant::Str(_) | Constant::Bytes(_))
+                    Expr::StringLiteral(_) | Expr::BytesLiteral(_)
                 ) =>
         {
             costs_nothing(&binary.right)
@@ -4949,8 +5039,7 @@ fn format_is_constant(expr: &Expr) -> bool {
 fn is_cost_only_leaf(expr: &Expr, candidates: &BTreeSet<String>) -> bool {
     match expr {
         Expr::Name(name) => !candidates.contains(name.id.as_str()),
-        Expr::Constant(constant) => !matches!(constant.value, Constant::Int(_) | Constant::Bool(_)),
-        _ => false,
+        leaf => leaf.is_literal_expr() && !is_integral_literal(leaf),
     }
 }
 
@@ -4958,7 +5047,8 @@ fn costs_nothing(expr: &Expr) -> bool {
     let mut work = vec![expr];
     while let Some(node) = work.pop() {
         match node {
-            Expr::Name(_) | Expr::Constant(_) => {}
+            Expr::Name(_) => {}
+            leaf if leaf.is_literal_expr() => {}
             Expr::Tuple(tuple) => work.extend(tuple.elts.iter()),
             Expr::List(list) => work.extend(list.elts.iter()),
             _ => return false,
@@ -5033,7 +5123,7 @@ fn translated_children<'e>(
             // constant in one is a step the enclosing statement already pays,
             // so it is not yielded and never refused. The test is an operand -
             // `x if cond else y` reads `cond`'s truth - and is always yielded.
-            Expr::IfExp(ternary) => Some(
+            Expr::If(ternary) => Some(
                 core::iter::once(ternary.test.as_ref())
                     .chain(
                         [ternary.body.as_ref(), ternary.orelse.as_ref()]
@@ -5042,11 +5132,9 @@ fn translated_children<'e>(
                     )
                     .collect(),
             ),
-            Expr::Compare(comparison) if membership_or_identity(comparison).is_none() => Some(
-                core::iter::once(comparison.left.as_ref())
-                    .chain(comparison.comparators.iter())
-                    .collect(),
-            ),
+            Expr::Compare(comparison) if membership_or_identity(comparison).is_none() => {
+                Some(comparison.operands.iter().collect())
+            }
             // The operand of a negation, for the same reason and under the same
             // obligation: `build_expression` accepts `not` here, so `return not
             // f(n)` would publish a complete bound that omits a call unless the
@@ -5087,18 +5175,13 @@ fn translated_children<'e>(
             Expr::Tuple(tuple) => Some(tuple.elts.iter().collect()),
             Expr::Set(set) => Some(set.elts.iter().collect()),
             Expr::Dict(dict) => Some(
-                dict.keys
+                dict.items
                     .iter()
-                    .flatten()
-                    .chain(dict.values.iter())
+                    .filter_map(|item| item.key.as_ref())
+                    .chain(dict.items.iter().map(|item| &item.value))
                     .collect(),
             ),
-            Expr::JoinedStr(joined) => Some(joined.values.iter().collect()),
-            Expr::FormattedValue(formatted) => Some(
-                core::iter::once(formatted.value.as_ref())
-                    .chain(formatted.format_spec.as_deref())
-                    .collect(),
-            ),
+            Expr::FString(joined) => Some(crate::syntax::fstring_expressions(joined)),
             _ => None,
         };
         if let Some(elements) = elements {
