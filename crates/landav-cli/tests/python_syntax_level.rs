@@ -38,25 +38,27 @@
 //!
 //! # Seven of these are `#[ignore]`d, deliberately, and stay runnable
 //!
-//! The parser is **not** being swapped in this change, and the seven tests that
-//! need a newer one carry `#[ignore]` naming the syntax and this decision
-//! rather than being deleted or weakened. `cargo test -- --ignored` runs them,
-//! so the gap stays measurable: the day a parser reads them, they go green and
-//! the attribute comes off.
+//! # The swap this file was written to force
 //!
-//! The decision, on the record so it is not re-litigated by whoever next reads
-//! a red suite:
+//! `LAN-82` left seven tests `#[ignore]`d rather than deleted, each naming the
+//! syntax it needed and the reason it could not have it: `rustpython-parser
+//! 0.4.0` was already the newest release that would ever exist, the
+//! alternative was a `0.0.x` crate, and the measured cost of not swapping was
+//! three stdlib files and 51 top-level functions. A *priced* deferral.
 //!
-//! * `rustpython-parser 0.4.0` is already the newest published release, from
-//!   August 2024. The version bump this ticket imagines does not exist.
-//! * The alternative, `ruff_python_parser`, is a `0.0.x` crate. Swapping means
-//!   rewriting four files against a different AST, not changing a version.
-//! * The measured cost of *not* swapping is three stdlib files and 51
-//!   top-level functions, and zero on the other corpus.
+//! `LAN-130` paid it. `ruff_python_parser` reads all five PEP 701 forms, so
+//! those five tests are no longer ignored, [`UNREAD_AT_SUPPORTED_LEVEL`] is
+//! empty, and the standard library reads **570 of 570** files where it read
+//! 567. The two remaining `#[ignore]`s are PEP 696 (3.13), and they are
+//! deferred for a different reason now: the parser reads that syntax, and the
+//! *declared level* is still 3.12, so it is refused **by version** rather than
+//! by capability. `LAN-132` raises the claim and takes them off.
 //!
-//! An `#[ignore]` here is therefore a *priced* deferral, not a silenced test.
-//! The eight assertions around them are not ignored and must not become so:
-//! they are the regression guards that a parser swap has to survive.
+//! That distinction is the one this file now exists to keep honest. The parser
+//! reports syntax above the target separately from malformed source, and
+//! `analysis::parse_guarded` folds both into one refusal, so a form being
+//! "unread" can mean either "nothing can parse this" or "we do not claim this
+//! version yet" - and the second must never be mistaken for the first.
 //!
 //! # What "supported version" means here
 //!
@@ -165,7 +167,6 @@ fn assert_refuses(source: &str, why: &str) {
 /// the single highest-value case in the file: without it, a Python 3.12
 /// codebase loses files at a rate that grows every time somebody reformats.
 #[test]
-#[ignore = "LAN-82 open: PEP 701 same-quote replacement field (f\"{row[\"k\"]}\"). rustpython-parser 0.4.0 predates it and no newer release exists; run with --ignored to measure the gap"]
 fn an_f_string_may_reuse_the_enclosing_quote() {
     let source = r#"
 def label(row) -> int:
@@ -182,7 +183,6 @@ def label(row) -> int:
 /// artefact rather than a limit — the two programs mean the same thing and
 /// only one of them is accepted.
 #[test]
-#[ignore = "LAN-82 open: PEP 701 f-string nested inside an f-string in the same quotes. rustpython-parser 0.4.0 predates it and no newer release exists; run with --ignored to measure the gap"]
 fn an_f_string_may_nest_an_f_string_in_the_same_quotes() {
     let source = r#"
 def label(row) -> int:
@@ -199,7 +199,6 @@ def label(row) -> int:
 /// f-string is precisely the one a formatter will break, so this is not the
 /// rare case it looks like.
 #[test]
-#[ignore = "LAN-82 open: PEP 701 multi-line replacement field. rustpython-parser 0.4.0 predates it and no newer release exists; run with --ignored to measure the gap"]
 fn an_f_string_expression_may_span_lines() {
     let source = r#"
 def label(row) -> int:
@@ -219,7 +218,6 @@ def label(row) -> int:
 /// line-spanning fields and still choke on the comment, and that partial
 /// support would read as a fix.
 #[test]
-#[ignore = "LAN-82 open: PEP 701 comment inside a multi-line replacement field. rustpython-parser 0.4.0 predates it and no newer release exists; run with --ignored to measure the gap"]
 fn an_f_string_expression_may_carry_a_comment() {
     let source = r#"
 def label(row) -> int:
@@ -237,7 +235,6 @@ def label(row) -> int:
 /// format spec is lexed by a different path in every parser that has one, so a
 /// fix to the replacement field routinely leaves this behind.
 #[test]
-#[ignore = "LAN-82 open: PEP 701 same-quote nested field inside a format spec. rustpython-parser 0.4.0 predates it and no newer release exists; run with --ignored to measure the gap"]
 fn an_f_string_format_spec_may_reuse_the_enclosing_quote() {
     let source = r#"
 def label(row) -> int:
@@ -264,7 +261,7 @@ def label(row) -> int:
 /// `= int` after the parameter. The narrowness is the point: it is one token,
 /// and it is the entire syntactic difference between the two versions.
 #[test]
-#[ignore = "LAN-82 open: PEP 696 default on a type parameter (3.13). rustpython-parser 0.4.0 predates it and no newer release exists; run with --ignored to measure the gap"]
+#[ignore = "LAN-130 swapped the parser, which reads this; the declared level is still 3.12, so it is refused by version. LAN-132 raises the claim to 3.15 and un-ignores it; run with --ignored to see the parser is ready"]
 fn a_type_parameter_may_have_a_default() {
     let source = "\
 def make[T = int](value: T) -> T:
@@ -281,7 +278,7 @@ def make[T = int](value: T) -> T:
 /// the module. That is the file-scale failure this ticket is about, reproduced
 /// in five lines.
 #[test]
-#[ignore = "LAN-82 open: PEP 696 defaulted type parameter on a class or alias (3.13). rustpython-parser 0.4.0 predates it and no newer release exists; run with --ignored to measure the gap"]
+#[ignore = "LAN-130 swapped the parser, which reads this; the declared level is still 3.12, so it is refused by version. LAN-132 raises the claim to 3.15 and un-ignores it"]
 fn a_defaulted_type_parameter_on_a_class_or_alias_does_not_lose_the_module() {
     let source = "\
 type Pair[T = int] = tuple[T, T]
@@ -569,52 +566,18 @@ def label(row) -> int:
 /// The names are compared for equality with the published list, so an entry
 /// added there without a sample here — or a sample here naming nothing — is a
 /// failure rather than a silently untested claim.
-const UNREAD: &[(&str, &str)] = &[
-    (
-        "a replacement field reusing the enclosing quote",
-        r#"
-def label(row) -> int:
-    text = f"{row["name"]}"
-    return len(text)
-"#,
-    ),
-    (
-        "an f-string nested in an f-string in the same quotes",
-        r#"
-def label(row) -> int:
-    text = f"{f"{row}"}"
-    return len(text)
-"#,
-    ),
-    (
-        "a replacement field spanning lines",
-        r#"
-def label(row) -> int:
-    text = f"{
-        row.name
-    }"
-    return len(text)
-"#,
-    ),
-    (
-        "a comment inside a multi-line replacement field",
-        r#"
-def label(row) -> int:
-    text = f"{
-        row.name  # the display name
-    }"
-    return len(text)
-"#,
-    ),
-    (
-        "a format spec reusing the enclosing quote",
-        r#"
-def label(row) -> int:
-    text = f"{row:{row["width"]}}"
-    return len(text)
-"#,
-    ),
-];
+/// The samples behind [`UNREAD_AT_SUPPORTED_LEVEL`], which is **empty** since
+/// `LAN-130`.
+///
+/// It held the five PEP 701 f-string forms, each sampled here so the published
+/// claim could not drift from what the parser actually did. Every one now
+/// reads, so both this table and the constant are empty, and the five tests
+/// above that assert they read are no longer `#[ignore]`d - which is the same
+/// fact asserted from the other side.
+///
+/// A form goes back in here the moment one at the declared level turns out
+/// unreadable, paired with its entry in the constant.
+const UNREAD: &[(&str, &str)] = &[];
 
 /// `"3.12"` as `(3, 12)`, so releases order by number and not by string.
 ///
@@ -667,10 +630,12 @@ fn the_stated_level_is_the_highest_release_that_reads() {
 
 /// **Every published exception is still unread, and every one is sampled.**
 ///
-/// This is the test a parser swap is meant to break. The five forms are the
-/// whole measured loss, so the day one of them parses, the published list
-/// overstates the gap and has to shrink — and the matching `#[ignore]` above
-/// comes off. Names are compared as a set so neither side can drift alone.
+/// This is the test a parser swap was meant to break, and `LAN-130` broke it:
+/// the five PEP 701 forms all parse now, so both the published list and the
+/// samples are empty and the loop below runs zero times. That is not a dead
+/// test - it is the assertion that the list has not quietly refilled, and it
+/// fails the moment a published entry has no sample or an unread sample has no
+/// entry. Names are compared as a set so neither side can drift alone.
 #[test]
 fn every_unread_form_is_sampled_and_still_unread() {
     let mut published: Vec<&str> = UNREAD_AT_SUPPORTED_LEVEL.to_vec();

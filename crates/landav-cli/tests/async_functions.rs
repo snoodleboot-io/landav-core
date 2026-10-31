@@ -637,9 +637,9 @@ async def guarded(n: int) -> int:
 /// **Pinned today, as a regression guard: `async for` in a plain `def` is
 /// already a placed coroutine hole.**
 ///
-/// This passes on the unfixed branch and is expected to. `rustpython-parser`
-/// does not enforce that `async for` and `await` appear only inside an
-/// `async def`, so both arms are reachable from a plain `def` and both already
+/// This passes on the unfixed branch and is expected to. The parser does not
+/// enforce that `async for` and `await` appear only inside an `async def`, so
+/// both arms are reachable from a plain `def` and both already
 /// fire — which is the evidence behind the decision recorded on
 /// [`an_async_for_is_a_named_placed_coroutine`] that nothing about these
 /// constructs needs designing.

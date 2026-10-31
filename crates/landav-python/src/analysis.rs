@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-use rustpython_parser::{Parse, ast};
+use crate::target_version;
+use ruff_python_ast as ast;
+use ruff_python_parser::{Mode, ParseOptions, parse_unchecked};
 
 use crate::{
     context::analyse_program,
@@ -177,15 +179,64 @@ pub(crate) fn parse_guarded(
         });
     }
 
-    let module = ast::Suite::parse(source, &path.to_string_lossy()).map_err(|error| {
-        let (line, column) = index.position(error.offset.to_usize());
-        PythonError::Parse {
+    // The parser is told which Python to read, explicitly, from the one
+    // constant that publishes the claim. `PythonVersion::default()` is **not**
+    // that version, so letting it default would make the frontend read a
+    // different language from the one `SUPPORTED_PYTHON` advertises - and
+    // `python_syntax_level.rs` would be asserting against the wrong thing.
+    let options = ParseOptions::from(Mode::Module).with_target_version(target_version());
+    let parsed = parse_unchecked(source, options);
+
+    // Two lists, and both are failures here.
+    //
+    // `errors` is source that is not Python at any version.
+    // `unsupported_syntax_errors` is source that *is* Python, but newer than
+    // the version this build claims - `except A, B:` against a 3.12 target,
+    // say. The parser keeps them apart because a linter reports them
+    // differently; this frontend does not, because `SUPPORTED_PYTHON` is a
+    // claim about what it reads and a file above that level is one it has not
+    // read. The diagnostic is strictly better than the previous parser's,
+    // which could only call such a file malformed: an unsupported-syntax
+    // error names the version the form needs.
+    //
+    // Unlike the previous parser this one recovers and returns a tree beside
+    // its errors, which is tempting and refused - a partial tree means
+    // analysing a file the author has not finished writing, and reporting
+    // bounds for it. A file that does not parse is `PythonError::Parse`, as
+    // before, and costs the whole file (see `python_syntax_level.rs`).
+    //
+    // The earliest by position wins: a reader fixes the first break, and
+    // everything after it may be a consequence of it.
+    let malformed = parsed
+        .errors()
+        .iter()
+        .map(|error| (error.location.start(), error.error.to_string()));
+    let too_new = parsed
+        .unsupported_syntax_errors()
+        .iter()
+        .map(|error| (error.range.start(), error.to_string()));
+    if let Some((offset, detail)) = malformed.chain(too_new).min_by_key(|(offset, _)| *offset) {
+        let (line, column) = index.position(offset.to_usize());
+        return Err(PythonError::Parse {
             path: path.to_path_buf(),
             line,
             column,
-            detail: error.error.to_string(),
-        }
-    })?;
+            detail,
+        });
+    }
+
+    // `Mode::Module` above makes the other variant unreachable; it is matched
+    // rather than unwrapped because a library may not panic over its own
+    // call.
+    let ast::Mod::Module(module) = parsed.into_syntax() else {
+        return Err(PythonError::Parse {
+            path: path.to_path_buf(),
+            line: 1,
+            column: 1,
+            detail: "the parser returned an expression where a module was asked for".to_owned(),
+        });
+    };
+    let module: Vec<ast::Stmt> = module.body.into_iter().collect();
 
     Ok((module, index))
 }

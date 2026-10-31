@@ -15,10 +15,15 @@
 //! # Annotated, not withheld
 //!
 //! Withholding `coverage_percent` whenever a file is unreadable would erase the
-//! figure for every file that *was* read. The Python 3.12 standard library has
-//! three such files among 570, and would lose its coverage number entirely. So
-//! the number stays, its denominator is stated, and the count of unreadable
-//! files is published beside it, in the JSON and in the text.
+//! figure for every file that *was* read. So the number stays, its denominator
+//! is stated, and the count of unreadable files is published beside it, in the
+//! JSON and in the text.
+//!
+//! The 3.12 standard library had three such files among 570 when `LAN-82`
+//! measured it, every one a PEP 701 f-string; `LAN-130` took that to **zero**
+//! by changing the parser. What is tested here is the mechanism, not the
+//! count: a file above the declared level still makes the denominator smaller
+//! than the target, and still has to say so.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -30,9 +35,13 @@ use serde_json::Value;
 
 use common::{CLEAN_PY, Project};
 
-/// A PEP 701 f-string reusing its enclosing quote: valid Python 3.12 that the
-/// pinned parser rejects. The one shape that makes a real file unreadable.
-const UNREADABLE_PY: &str = "def uses_701(xs: list) -> str:\n    return f\"{\", \".join(xs)}\"\n";
+/// An unparenthesised multi-except (PEP 758): valid Python 3.14, above the
+/// 3.12 level this build declares, so the frontend refuses the file.
+///
+/// What this test needs is *a* file the parser will not read; which class it
+/// falls into is `outcome_space.rs`'s subject. Until `LAN-130` this was a PEP
+/// 701 f-string, which the parser now reads.
+const UNREADABLE_PY: &str = "def uses_758(xs: list) -> int:\n    try:\n        go(xs)\n    except ValueError, TypeError:\n        pass\n    return 1\n";
 
 fn json_of(run: &common::Run) -> Value {
     serde_json::from_str(&run.stdout)

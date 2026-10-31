@@ -21,7 +21,8 @@
 
 use std::collections::BTreeSet;
 
-use rustpython_parser::ast::{CmpOp, Expr, ExprContext, Operator, Ranged, Stmt};
+use ruff_python_ast::{CmpOp, Expr, ExprContext, Operator, Stmt};
+use ruff_text_size::Ranged;
 
 use crate::{
     context::{
@@ -177,7 +178,7 @@ fn lav001(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
         let Expr::Attribute(func) = call.func.as_ref() else {
             continue;
         };
-        if func.attr.as_str() != "index" || call.args.is_empty() {
+        if func.attr.as_str() != "index" || call.arguments.args.is_empty() {
             continue;
         }
         // `stripped.index("=")` on this line, or `cells.index(m)` on this row,
@@ -230,7 +231,7 @@ fn lav002(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
         let Some(position) = membership else {
             continue;
         };
-        let Some(container) = compare.comparators.get(position) else {
+        let Some(container) = compare.operands.get(position + 1) else {
             continue;
         };
         if info.varies_with(container) {
@@ -351,8 +352,11 @@ fn lav004(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
         };
 
         let front = match func.attr.as_str() {
-            "insert" => call.args.first().is_some_and(is_zero_literal),
-            "pop" => call.args.len() == 1 && call.args.first().is_some_and(is_zero_literal),
+            "insert" => call.arguments.args.first().is_some_and(is_zero_literal),
+            "pop" => {
+                call.arguments.args.len() == 1
+                    && call.arguments.args.first().is_some_and(is_zero_literal)
+            }
             _ => false,
         };
         if !front {
@@ -386,7 +390,7 @@ fn lav004(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
 fn drains_the_container(info: &LoopInfo<'_>, container: &Expr) -> bool {
     let test = match info.stmt {
         // An unbounded `for` performs one mutation per input element.
-        Stmt::For(_) | Stmt::AsyncFor(_) => return true,
+        Stmt::For(_) => return true,
         Stmt::While(node) => node.test.as_ref(),
         _ => return false,
     };
@@ -398,13 +402,13 @@ fn drains_the_container(info: &LoopInfo<'_>, container: &Expr) -> bool {
         Expr::Name(node) => node.id.as_str() == name,
         Expr::Call(call) => {
             name_of(call.func.as_ref()) == Some("len")
-                && call.args.first().and_then(name_of) == Some(name)
+                && call.arguments.args.first().and_then(name_of) == Some(name)
         }
         _ => false,
     };
 
     match test {
-        Expr::Compare(node) => is_emptiness_of(node.left.as_ref()),
+        Expr::Compare(node) => is_emptiness_of(node.first_operand()),
         other => is_emptiness_of(other),
     }
 }
@@ -413,7 +417,6 @@ fn drains_the_container(info: &LoopInfo<'_>, container: &Expr) -> bool {
 fn lav005(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
     let (iter, body) = match ctx.stmt {
         Stmt::For(node) => (node.iter.as_ref(), node.body.as_slice()),
-        Stmt::AsyncFor(node) => (node.iter.as_ref(), node.body.as_slice()),
         _ => return,
     };
     let Some(text) = slice_of(analysis.source, iter) else {
@@ -482,7 +485,9 @@ fn lav006(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
 
         let subject = match call.func.as_ref() {
             Expr::Attribute(func) if func.attr.as_str() == "sort" => name_of(func.value.as_ref()),
-            Expr::Name(func) if func.id.as_str() == "sorted" => call.args.first().and_then(name_of),
+            Expr::Name(func) if func.id.as_str() == "sorted" => {
+                call.arguments.args.first().and_then(name_of)
+            }
             _ => None,
         };
         let Some(name) = subject else { continue };
@@ -591,10 +596,10 @@ fn bounded_by_a_constant(
         stmt_own_exprs(stmt, &mut own);
         for expr in own.into_iter().flat_map(expr_tree) {
             if let Expr::Compare(node) = expr
-                && let Expr::Call(call) = node.left.as_ref()
+                && let Expr::Call(call) = node.first_operand()
                 && name_of(call.func.as_ref()) == Some("len")
-                && call.args.first().and_then(name_of) == Some(name)
-                && node.comparators.iter().any(&constant)
+                && call.arguments.args.first().and_then(name_of) == Some(name)
+                && node.operands.iter().skip(1).any(&constant)
             {
                 return true;
             }
@@ -685,7 +690,7 @@ fn is_eager_collection_build(expr: &Expr) -> bool {
         Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) => true,
         Expr::Call(call) => {
             name_of(call.func.as_ref()).is_some_and(|func| COLLECTION_BUILDERS.contains(&func))
-                && !call.args.is_empty()
+                && !call.arguments.args.is_empty()
         }
         _ => false,
     }
@@ -695,9 +700,10 @@ fn is_eager_collection_build(expr: &Expr) -> bool {
 fn build_is_side_effect_free(expr: &Expr) -> bool {
     let inner: Vec<&Expr> = match expr {
         Expr::Call(call) => call
+            .arguments
             .args
             .iter()
-            .chain(call.keywords.iter().map(|keyword| &keyword.value))
+            .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
             .collect(),
         other => vec![other],
     };
@@ -819,8 +825,8 @@ fn span_grows(
     analysis: &Analysis<'_>,
     ctx: &StmtCtx<'_>,
     info: &LoopInfo<'_>,
-    subscript: &rustpython_parser::ast::ExprSubscript,
-    slice: &rustpython_parser::ast::ExprSlice,
+    subscript: &ruff_python_ast::ExprSubscript,
+    slice: &ruff_python_ast::ExprSlice,
     varying: &BTreeSet<String>,
 ) -> bool {
     if consumes_by_reslicing(analysis, ctx, subscript) {
@@ -852,7 +858,7 @@ fn span_grows(
 /// how every binary-format parser is written, and missing it makes a slice rule
 /// unusable on the code that slices most.
 fn is_fixed_width(
-    slice: &rustpython_parser::ast::ExprSlice,
+    slice: &ruff_python_ast::ExprSlice,
     source: &str,
     varying: &BTreeSet<String>,
 ) -> bool {
@@ -893,7 +899,7 @@ fn is_fixed_width(
 fn consumes_by_reslicing(
     analysis: &Analysis<'_>,
     ctx: &StmtCtx<'_>,
-    subscript: &rustpython_parser::ast::ExprSubscript,
+    subscript: &ruff_python_ast::ExprSubscript,
 ) -> bool {
     let target = match ctx.stmt {
         Stmt::Assign(node) => match node.targets.as_slice() {
@@ -911,7 +917,7 @@ fn consumes_by_reslicing(
 fn is_negative_literal(expr: &Expr) -> bool {
     match expr {
         Expr::UnaryOp(node) => {
-            matches!(node.op, rustpython_parser::ast::UnaryOp::USub)
+            matches!(node.op, ruff_python_ast::UnaryOp::USub)
                 && integer_literal(node.operand.as_ref()).is_some()
         }
         _ => false,
@@ -979,8 +985,8 @@ fn built_by_pandas(analysis: &Analysis<'_>, info: &LoopInfo<'_>, scope: usize, n
 }
 
 /// `true` when the first argument of a concat is a sequence containing `name`.
-fn concat_reuses(call: &rustpython_parser::ast::ExprCall, name: &str) -> bool {
-    let Some(first) = call.args.first() else {
+fn concat_reuses(call: &ruff_python_ast::ExprCall, name: &str) -> bool {
+    let Some(first) = call.arguments.args.first() else {
         return false;
     };
     let elements = match first {
@@ -1020,9 +1026,10 @@ fn lav011(analysis: &Analysis<'_>, ctx: &StmtCtx<'_>, out: &mut Vec<Finding>) {
         }
 
         let arguments: Vec<&Expr> = call
+            .arguments
             .args
             .iter()
-            .chain(call.keywords.iter().map(|keyword| &keyword.value))
+            .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
             .collect();
 
         // A freshly sliced subject is a copy plus a rescan of the same tail —
