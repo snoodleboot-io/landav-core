@@ -561,8 +561,8 @@ fn bounded_by_a_constant(
             name_of(node.value.as_ref()) == Some(name)
                 && match node.slice.as_ref() {
                     Expr::Slice(slice) => {
-                        slice.lower.as_deref().is_some_and(&constant)
-                            || slice.upper.as_deref().is_some_and(&constant)
+                        slice.lower.as_deref().is_some_and(constant)
+                            || slice.upper.as_deref().is_some_and(constant)
                     }
                     _ => false,
                 }
