@@ -96,31 +96,25 @@ pub const UNREADABLE_AS_PYTHON_PY: &str = r#"
 print "this module was written for Python 2"
 "#;
 
-/// Valid Python above `landav_python::SUPPORTED_PYTHON`: PEP 758 allows an
-/// unparenthesised tuple of exception types, which is 3.14 syntax while the
-/// declared level is 3.12.
-///
-/// A different class from [`UNREADABLE_AS_PYTHON_PY`] and worth its own case —
-/// here the *file* is fine and the *frontend* is behind, which is the failure
-/// mode most likely to appear on a modern codebase. The parser reports this
-/// class separately from malformed source, and `analysis::parse_guarded` folds
-/// the two into one refusal on purpose: a file above the declared level is a
-/// file this build has not read.
-///
-/// This fixture tracks the declared level and is **expected** to stop being
-/// unreadable when that level rises past 3.14 — at which point somebody picks
-/// a form above the new level, or, if the frontend has caught up with every
-/// released Python, records that this class is now empty. Discovering it had
-/// silently become a clean run would be the bad outcome; a failing test is the
-/// good one. Its predecessor was a PEP 701 f-string, retired by `LAN-130` in
-/// exactly this way.
-pub const ABOVE_SUPPORTED_LEVEL_PY: &str = r#"
-def show(row):
-    try:
-        emit(row)
-    except ValueError, TypeError:
-        pass
-"#;
+// There was a second unreadable fixture here: `ABOVE_SUPPORTED_LEVEL_PY`,
+// valid Python above the declared level, which stood for the other class of
+// parse refusal - the *file* is fine and the *frontend* is behind.
+//
+// It said of itself that it tracked the declared level and was expected to
+// stop being unreadable when the level rose past 3.14, "at which point
+// somebody picks a form above the new level, or, if the frontend has caught up
+// with every released Python, records that this class is now empty".
+//
+// `LAN-132` is the second of those. The declared level is 3.15, which is the
+// newest released Python and the newest its parser knows, so no well-formed
+// Python file exists that this build is too old to read and there is no form
+// to pick. The fixture is retired rather than re-pointed at something merely
+// malformed, because a constant called `ABOVE_SUPPORTED_LEVEL_PY` holding
+// source that is not Python at all would be a lie in the one place a reader
+// trusts.
+//
+// `landav-python`'s `the_declared_level_is_the_newest_python_the_parser_knows`
+// fails when the parser learns 3.16. That is the signal to bring this back.
 
 /// A `pyproject.toml` that is valid TOML and says nothing about landav.
 pub const PYPROJECT_NO_LANDAV: &str = r#"

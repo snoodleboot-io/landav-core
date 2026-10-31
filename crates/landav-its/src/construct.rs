@@ -50,6 +50,28 @@ pub enum Construct {
     Subscript,
     /// A list, tuple, set, dictionary or string value.
     Collection,
+    /// A template string literal: `t"total {n}"` (PEP 750, Python 3.14).
+    ///
+    /// Named separately from [`Construct::Collection`] because that one
+    /// describes "list, tuple, set, dict or string value" and a t-string is
+    /// none of those. `t"..."` evaluates its interpolations, does **not**
+    /// call `__format__` on them, and yields a `Template` object that some
+    /// processing function turns into text later. Reporting that as a string
+    /// value - which is what this did before `LAN-132` named it - was wrong
+    /// about the program, not merely vague.
+    ///
+    /// The same distinction is why it gets no part of the f-string shortcut.
+    /// `LAN-115` lets a format over names and constants be accounted as free
+    /// where an enclosing call declares over it, on the grounds that building
+    /// the `str` is bounded by the length of the format literal. A `Template`
+    /// is not built into text at that point at all, and whatever consumes it
+    /// is user-written code, so the argument does not carry over;
+    /// `lowering::format_is_constant` refuses it in as many words.
+    ///
+    /// The interpolations stay visible to the interior walker, so the region
+    /// still gets its interior named. Freeing this is a follow-up with its
+    /// own reasoning, not a prohibition.
+    TemplateString,
     /// A comprehension or generator expression.
     Comprehension,
     /// `try`, `except`, `finally`, `raise`, or `with`: non-local control flow.
@@ -133,6 +155,7 @@ impl Construct {
             Self::Attribute => "attribute",
             Self::Subscript => "subscript",
             Self::Collection => "collection",
+            Self::TemplateString => "template-string",
             Self::Comprehension => "comprehension",
             Self::ExceptionalControlFlow => "exceptional-control-flow",
             Self::LoopJump => "loop-jump",
@@ -172,6 +195,7 @@ impl Construct {
             | Self::Attribute
             | Self::Subscript
             | Self::Collection
+            | Self::TemplateString
             | Self::Comprehension
             | Self::UnboundedIteration
             | Self::IntegerDivision
@@ -234,6 +258,7 @@ impl Construct {
             Self::NonIntegerValue
             | Self::Call
             | Self::Collection
+            | Self::TemplateString
             | Self::Comprehension
             | Self::ExceptionalControlFlow
             | Self::LoopJump
@@ -262,6 +287,7 @@ impl Construct {
             Self::Attribute => "attribute access",
             Self::Subscript => "index or slice",
             Self::Collection => "list, tuple, set, dict or string value",
+            Self::TemplateString => "template string literal",
             Self::Comprehension => "comprehension or generator expression",
             Self::ExceptionalControlFlow => "exception handling or context manager",
             Self::LoopJump => "break or continue",
@@ -294,6 +320,7 @@ impl Construct {
             Self::Attribute,
             Self::Subscript,
             Self::Collection,
+            Self::TemplateString,
             Self::Comprehension,
             Self::ExceptionalControlFlow,
             Self::LoopJump,

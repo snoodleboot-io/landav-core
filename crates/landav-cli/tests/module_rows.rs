@@ -6,6 +6,21 @@
 //! name an absolute import bound, once, and never rebound in the function. A
 //! name with any other meaning gets no row, exactly as a bare builtin name
 //! that the module shadows gets none (`LAN-94`).
+//!
+//! # `lazy import` is a fourth way the name can mean something else
+//!
+//! `LAN-132` raised the declared Python to 3.15, which brought PEP 810. A
+//! lazily bound name is not a module - it is a promise, and the *first read of
+//! it* runs the whole module import. So `os.getcwd()` under `lazy import os`
+//! is not the one step this pack's row claims; it is one step plus an
+//! unbounded import, which is precisely the cost a row must never hide.
+//!
+//! That makes it a soundness rule rather than a coverage one, and the only
+//! one of the three releases' new syntax that changes an answer. It is why
+//! `lowering::imports_of` skips a lazy import while `binding_sites` still
+//! counts it: a lazy import does bind the name, so it must still disqualify a
+//! row keyed by it; what `lazy` changes is the cost of the read, not the
+//! meaning of the name.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -137,6 +152,58 @@ def local_os() -> int:
     )?;
     let f = named(&fs, "local_os");
     assert!(holes(f).contains(&"call".to_owned()), "{f}");
+    Ok(())
+}
+
+/// **A lazily bound name resolves no row.** PEP 810, `LAN-132`.
+///
+/// The eager function is in the same file on purpose. Without it this test
+/// could pass because the rows stopped working altogether, which is the
+/// failure mode a negative assertion invites: `eager` proves the rows still
+/// resolve, and the two lazy ones prove they do not resolve through a promise.
+///
+/// Both spellings are covered because they bind through different code paths -
+/// `lazy import time` binds a module name, `lazy from codecs import CodecInfo`
+/// binds an attribute - and a fix to one would plausibly leave the other.
+#[test]
+fn a_lazy_import_does_not_resolve_a_module_attribute_row() -> io::Result<()> {
+    let fs = check(
+        "\
+import os
+lazy import time
+lazy from codecs import CodecInfo
+
+
+def eager() -> int:
+    os.getcwd()
+    return 1
+
+
+def lazily_imported() -> int:
+    time.time()
+    return 1
+
+
+def lazily_from_imported(name) -> int:
+    CodecInfo(name=name)
+    return 1
+",
+    )?;
+    let eager = named(&fs, "eager");
+    assert_eq!(
+        eager["bound_kind"], "exact",
+        "the eager control must still resolve, or this test proves nothing \
+         about `lazy`: {eager}"
+    );
+    for name in ["lazily_imported", "lazily_from_imported"] {
+        let f = named(&fs, name);
+        assert!(
+            holes(f).contains(&"call".to_owned()),
+            "{name}: a lazily bound name pays its module's import on first \
+             read, so the call must keep its hole rather than resolve to the \
+             row's one step: {f}"
+        );
+    }
     Ok(())
 }
 

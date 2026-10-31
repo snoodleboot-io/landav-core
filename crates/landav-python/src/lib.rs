@@ -142,7 +142,27 @@ pub const MINIMUM_RULE_COUNT: usize = 8;
 /// this one falsifiable is `python_syntax_level.rs`, which holds a sample per
 /// version and asserts that the highest one the frontend actually reads is
 /// this number. Raising it without teaching the frontend the syntax fails.
-pub const SUPPORTED_PYTHON: &str = "3.12";
+///
+/// # What 3.15 added over 3.12, and what each one does here
+///
+/// `LAN-132` raised this from 3.12 once `LAN-130` had put a parser underneath
+/// that reads the whole range. Nothing in the three releases changes a bound;
+/// each new form either lowers like the thing it resembles or becomes a named
+/// refusal, and `python_syntax_level.rs` pins which:
+///
+/// | Release | Form | Here |
+/// |---|---|---|
+/// | 3.13 | PEP 696 type-parameter defaults | read; a `type` statement and a generic `def` are declarations either way |
+/// | 3.14 | PEP 758 `except A, B:` without parentheses | read; the handler is `exceptional-control-flow` as always |
+/// | 3.14 | PEP 750 t-strings | read, then refused as [`landav_its::Construct::TemplateString`] |
+/// | 3.15 | PEP 810 `lazy import` | read; and it **removes** a cost row, see `lowering::imports_of` |
+/// | 3.15 | PEP 798 `[*a, *b]` in a comprehension | read; still `comprehension` |
+/// | 3.15 | `case +1:` | read; still `pattern-match` |
+///
+/// The one that is a soundness matter rather than a coverage one is `lazy
+/// import`: a name bound lazily pays its module's import on first read, so
+/// `LAN-128`'s module-attribute rows must not resolve through it.
+pub const SUPPORTED_PYTHON: &str = "3.15";
 
 /// [`SUPPORTED_PYTHON`] as the parser's own version, which is what
 /// `analysis::parse_guarded` hands it.
@@ -197,5 +217,32 @@ mod tests {
     #[test]
     fn rule_for_code_rejects_an_unknown_code() {
         assert!(rule_for_code("LAV999").is_none());
+    }
+
+    /// **The declared level is the newest Python the parser knows.**
+    ///
+    /// Not a vanity assertion. While this holds, *there is no valid Python
+    /// above [`SUPPORTED_PYTHON`]* - so the whole class of "a well-formed file
+    /// this build is too old to read" is empty, and the test fixtures that
+    /// used to stand for it are gone rather than re-pointed at something else.
+    /// `python_syntax_level.rs` records that, and this is the tripwire: when
+    /// the parser learns 3.16 this fails, and whoever sees it knows to pick a
+    /// 3.16-only form and put that class back.
+    ///
+    /// It is deliberately *not* an assertion that landav reads everything
+    /// forever. It fails on a dependency bump, which is the point - the next
+    /// release is a decision somebody records, exactly as `LAN-132` recorded
+    /// this one.
+    #[test]
+    fn the_declared_level_is_the_newest_python_the_parser_knows() {
+        assert_eq!(
+            target_version(),
+            ruff_python_ast::PythonVersion::latest(),
+            "`SUPPORTED_PYTHON` is {SUPPORTED_PYTHON}, but the parser now \
+             knows a newer release. Nothing is broken - but the \
+             above-the-declared-level fixtures are empty on the grounds that \
+             no such Python exists, and that is no longer true. See \
+             `python_syntax_level.rs`"
+        );
     }
 }

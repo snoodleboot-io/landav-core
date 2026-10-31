@@ -22,7 +22,7 @@ use landav_python::{PythonError, analyze_source};
 ///
 /// Every one of these is ordinary in a repository written against a supported
 /// Python, so a regression here silently removes files from analysis.
-const SUPPORTED: [(&str, &str); 12] = [
+const SUPPORTED: [(&str, &str); 17] = [
     (
         "match statement",
         "match command:\n    case {'op': op}:\n        pass\n    case [head, *tail]:\n        pass\n",
@@ -65,30 +65,53 @@ const SUPPORTED: [(&str, &str); 12] = [
         "nested f-string, pre-PEP-701 spelling",
         "label = f\"{f'{value}'}\"\n",
     ),
-];
-
-/// Source this frontend cannot read, in both of the classes there are.
-///
-/// Until `LAN-130` this list was two PEP 701 f-strings - valid Python 3.12 the
-/// parser predated - and they have moved into [`SUPPORTED`]. What is left is
-/// the distinction that replaced them:
-///
-/// * **not Python at any version.** Nothing will ever parse it.
-/// * **Python above the declared level.** `except A, B:` is PEP 758, valid
-///   3.14, and `landav_python::SUPPORTED_PYTHON` says 3.12. The parser reads
-///   the form and reports it as unsupported *for the target*, which
-///   `parse_guarded` folds into the same refusal - because a file above the
-///   level is a file this build has not read.
-///
-/// The second entry tracks the declared level and is expected to move into
-/// [`SUPPORTED`] when the level passes 3.14, exactly as the f-strings did.
-const UNREADABLE: [(&str, &str); 2] = [
-    ("not Python at any version", "def f(:\n    return 1\n"),
+    // `LAN-132`: 3.13, 3.14 and 3.15. Each was unreadable or unclaimed
+    // before it, and each is here because the *rule* path walks the tree with
+    // different code from the lowering path - `python_syntax_level.rs` pins
+    // the same forms on the other side.
     (
-        "PEP 758 multi-except, above the declared level",
-        "def f(xs):\n    try:\n        go(xs)\n    except ValueError, TypeError:\n        pass\n",
+        "PEP 696 type-parameter default (3.13)",
+        "def make[T = int](value: T) -> T:\n    return value\n",
+    ),
+    (
+        "PEP 758 unparenthesised except tuple (3.14)",
+        "try:\n    go()\nexcept ValueError, TypeError:\n    pass\n",
+    ),
+    (
+        "PEP 750 template string (3.14)",
+        "message = t\"hello {name}\"\n",
+    ),
+    (
+        "PEP 810 lazy import (3.15)",
+        "lazy import os\nlazy from threading import Lock\n",
+    ),
+    (
+        "PEP 798 starred element in a comprehension (3.15)",
+        "items = [*row for row in rows]\n",
     ),
 ];
+
+/// Source this frontend cannot read. **There is one class of it left.**
+///
+/// This list has shrunk twice, both times because the frontend caught up:
+///
+/// * `LAN-130` moved two PEP 701 f-strings into [`SUPPORTED`] - valid Python
+///   3.12 that the old parser predated;
+/// * `LAN-132` moved the PEP 758 multi-except there too. It was the
+///   *above-the-declared-level* case: the parser read the form and reported it
+///   as unsupported for the target, which `parse_guarded` folds into the same
+///   refusal, because a file above the level is a file this build has not
+///   read.
+///
+/// Nothing replaced the second entry, and nothing can while
+/// `landav_python::SUPPORTED_PYTHON` is both the newest released Python and
+/// the newest its parser knows. `landav-python`'s
+/// `the_declared_level_is_the_newest_python_the_parser_knows` fails when that
+/// stops holding, and whoever sees it puts a 3.16-only form back here.
+///
+/// What remains is the class no version claim can empty: source that is not
+/// Python at any version, where nothing will ever parse it.
+const UNREADABLE: [(&str, &str); 1] = [("not Python at any version", "def f(:\n    return 1\n")];
 
 #[test]
 fn supported_syntax_is_analysed_rather_than_rejected() {
