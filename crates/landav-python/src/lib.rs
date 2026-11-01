@@ -130,6 +130,18 @@ pub use crate::{
 /// not merely a build with a failing test.
 pub const MINIMUM_RULE_COUNT: usize = 8;
 
+/// The signature pack the lowering uses when a caller supplies none.
+///
+/// Published so that a driver reading a bound back can ask the **same** table
+/// the lowering asked. `LAN-134` needs it: whether a declared call rests on an
+/// amortised row is a fact about the row that priced it, and a driver that
+/// guessed from the callee's name would be describing a different pack from
+/// the one that ran. Parsed once and cached.
+#[must_use]
+pub fn builtin_signature_pack() -> &'static landav_fdk::SignaturePack {
+    crate::lowering::builtin_pack()
+}
+
 /// The Python version this frontend reads, bar the forms in
 /// [`UNREAD_AT_SUPPORTED_LEVEL`].
 ///

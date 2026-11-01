@@ -773,7 +773,18 @@ fn lower_function(
     let location = position(path, index, &function);
     let origin = origin_of(path, index, &function);
 
-    let collections: BTreeSet<String> = collection_parameters(function)
+    let collection_params = collection_parameters(function);
+    // `LAN-134`: the receivers a *resolvable* method row may match, which is a
+    // strictly narrower set than the one below. A protocol annotation is good
+    // enough to trust a `__len__` (`LAN-106`) and not good enough to price a
+    // method: on `MutableSequence` the `append` is user code of unknown cost,
+    // and a row resolving there would publish a bound the program exceeds.
+    let concrete_collections: BTreeSet<String> = collection_params
+        .iter()
+        .filter(|(_, trust)| *trust == Trust::ConcreteType)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let collections: BTreeSet<String> = collection_params
         .into_iter()
         .map(|(name, _)| name)
         .collect();
@@ -831,6 +842,7 @@ fn lower_function(
         builder,
         integers,
         collections,
+        concrete_collections,
         lengths_read: BTreeSet::new(),
         shadowed,
         rebound,
@@ -887,7 +899,7 @@ fn lower_function(
 /// may not abort, and it is the right one - the cost of a broken pack is lost
 /// coverage, never an unsound bound. `landav-fdk`'s own tests keep the shipped
 /// file parsing.
-fn builtin_pack() -> &'static SignaturePack {
+pub(crate) fn builtin_pack() -> &'static SignaturePack {
     static PACK: OnceLock<SignaturePack> = OnceLock::new();
     PACK.get_or_init(|| SignaturePack::builtin().unwrap_or_default())
 }
@@ -2137,6 +2149,16 @@ struct Translator<'a> {
     /// Parameters only. A local holding a collection has no length the caller
     /// can supply, and one assigned from a region may have any length at all.
     collections: BTreeSet<String>,
+    /// Those of [`Self::collections`] annotated with a **concrete** builtin
+    /// rather than a protocol. `LAN-134`.
+    ///
+    /// The receiver set for a resolvable method row, and the reason it is a
+    /// second set rather than a flag read off the first: the two questions
+    /// have different answers. Trusting a protocol's `__len__` to equal its
+    /// iteration count is `LAN-106`'s premise and is published as one; pricing
+    /// a protocol's *method* is not a premise but a guess, because the method
+    /// is user code that may do anything.
+    concrete_collections: BTreeSet<String>,
     /// Lengths this translation read, whichever builder the node landed in.
     /// Kept on the translator rather than the builder because a value read
     /// inside a discarded expression is read by the *function*, and its node
@@ -3659,6 +3681,17 @@ impl Translator<'_> {
             }
             return Some(effect_of(row));
         }
+        // `LAN-134`: a method on a receiver this function knows is a concrete
+        // builtin collection - `xs.append(v)` for `xs: list`. Placed after the
+        // two branches above because neither can match an `xs.append`: a
+        // sibling call's receiver is `self`, and an imported callee's is a
+        // module name.
+        if let Some(row) = self.collection_method_row(call) {
+            if !self.arguments_are_accounted(call) {
+                return None;
+            }
+            return Some(effect_of(row));
+        }
         let Expr::Name(callee) = call.func.as_ref() else {
             return None;
         };
@@ -3908,6 +3941,53 @@ impl Translator<'_> {
         } else {
             Writes::only([])
         }
+    }
+
+    /// The **resolvable** pack row for a method on a concrete collection
+    /// receiver. `LAN-134`.
+    ///
+    /// # Why this is not [`Self::row_for`] with a different accessor
+    ///
+    /// Two differences, and both are about the row being *resolvable* rather
+    /// than merely present.
+    ///
+    /// The receiver must be annotated with a **concrete** builtin.
+    /// [`Self::row_for`] accepts a protocol annotation too, and is right to:
+    /// its caller narrows the writes of a call that stays a hole, and on that
+    /// question a `MutableSequence` behaves like a `list`. Here the row prices
+    /// the call, and on a protocol the method *is* user code - a
+    /// `MutableSequence.append` may do anything at all - so a row resolving
+    /// there would publish a bound the program exceeds. This is the first
+    /// admitted row matched on a receiver, so this distinction has never had
+    /// to be made before.
+    ///
+    /// And the lookup goes through [`SignaturePack::signature`], which applies
+    /// the admissibility gate, rather than `row`, which does not. The
+    /// shadowing predicate is `|_| false` on purpose: `xs.append` is an
+    /// attribute of whatever `xs` holds, so a module-level `def append` does
+    /// not make it something else, which is exactly the opposite of the rule a
+    /// bare `append(...)` would need.
+    fn collection_method_row(&self, call: &ast::ExprCall) -> Option<&Signature> {
+        let Expr::Attribute(method) = call.func.as_ref() else {
+            return None;
+        };
+        let Expr::Name(receiver) = method.value.as_ref() else {
+            return None;
+        };
+        let receiver = receiver.id.as_str();
+        if !self.concrete_collections.contains(receiver) {
+            return None;
+        }
+        // A rebound receiver holds something else by the time this line runs,
+        // and the annotation describes what the caller passed.
+        if self
+            .rebound
+            .as_ref()
+            .is_none_or(|names| names.contains(receiver))
+        {
+            return None;
+        }
+        self.pack.signature(method.attr.as_str(), |_| false)
     }
 
     /// The pack row for a call site, resolvable or not.

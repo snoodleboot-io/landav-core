@@ -221,7 +221,9 @@ pub struct Premise {
     /// outside the module does either), or `"same-module-function"`
     /// (`LAN-129`: a call to a function this module defines once, composed
     /// from that definition's own bound; the premise is that nothing rebinds
-    /// the module's name at run time).
+    /// the module's name at run time), or `"amortised-cost"` (`LAN-134`: the
+    /// callee was charged a cost that is bounded only when the calls are
+    /// summed, which this bound is; it is not a limit on one call).
     ///
     /// # Where a premise is *absent*, and why that is also a fact
     ///
@@ -302,6 +304,7 @@ fn premises_of(
         })
         .collect();
     premises.extend(supplied_premises(program, pack));
+    premises.extend(amortised_premises(program, pack));
     premises.extend(sibling_premises(program, class, siblings));
     premises.extend(store_premises(program, class));
     premises
@@ -463,6 +466,67 @@ fn supplied_premises(
                      of the code actually called"
                 ),
             })
+        })
+        .collect()
+}
+
+/// The callees this program's bound closes over on an **amortised** row.
+/// `LAN-134`.
+///
+/// One function rather than two so the rule exists once: the text line and the
+/// JSON both need it, and a premise published in one and not the other is
+/// worse than no premise at all.
+///
+/// `pack` is the *supplied* pack, and `None` means none was supplied rather
+/// than that no pack applied - the builtin is what priced the call, so it is
+/// what gets asked. This is the one premise the builtin pack publishes: a
+/// supplied row is announced because somebody outside the tool wrote it, and
+/// an amortised row because the number means something narrower than every
+/// other number in the report.
+pub(crate) fn amortised_callees(
+    program: &landav_its::SourceProgram,
+    pack: Option<&SignaturePack>,
+) -> BTreeSet<String> {
+    let builtin = landav_python::builtin_signature_pack();
+    let pack: &SignaturePack = pack.unwrap_or(builtin);
+    let mut callees = BTreeSet::new();
+    for node in program.unsupported_nodes() {
+        if node.construct() != Construct::Call || node.declared().is_none() {
+            continue;
+        }
+        let Some(detail) = node.detail() else {
+            continue;
+        };
+        let spelled = detail.as_str();
+        // `LAN-108` writes a method as `.append` so a report can tell a method
+        // from a function of the same name; the row is keyed `append`.
+        let key = spelled.strip_prefix('.').unwrap_or(spelled);
+        if pack
+            .row(key)
+            .is_some_and(|row| row.cost.rests_on_amortisation())
+        {
+            callees.insert(spelled.to_owned());
+        }
+    }
+    callees
+}
+
+/// One premise per callee the bound closes over on an amortised row.
+fn amortised_premises(
+    program: &landav_its::SourceProgram,
+    pack: Option<&SignaturePack>,
+) -> Vec<Premise> {
+    amortised_callees(program, pack)
+        .into_iter()
+        .map(|callee| Premise {
+            because: format!(
+                "`{callee}` was charged an amortised cost: a single call may reallocate and do \
+                 more work than the step charged for it, and the number holds because this bound \
+                 is a sum over the whole path rather than a limit on any one call - read as a \
+                 limit on one call it is wrong"
+            ),
+            subject: callee,
+            trust: "amortised-cost",
         })
         .collect()
 }

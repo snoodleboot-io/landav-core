@@ -596,10 +596,32 @@ fn an_exception_constructor_does_not_swallow_a_call_in_its_argument() {
 /// | `sorted` | `n log n` in its input. Same. |
 /// | `list` | copies its argument; 14 stdlib sole-blocked sites, and every one of them is linear. |
 /// | `print` | I/O. Unbounded by anything this analysis can see. |
-/// | `append` | mutates a collection, so it is not even *safe*: `collection_length.rs` relies on it forgetting the entry length. |
 /// | `decode` | allocates, and its cost is the input's length. |
 ///
 /// A bounded-cost claim about any of them would be a bound the program exceeds.
+///
+/// # `append` was in this table until `LAN-134`
+///
+/// Its row here read "mutates a collection, so it is not even *safe*:
+/// `collection_length.rs` relies on it forgetting the entry length". The
+/// safety requirement is real and is still met, by `mutates_arguments` on the
+/// row rather than by the refusal: the engine forgets every volatile name at
+/// any declared node that sets it, which is what makes a length read before an
+/// `append` not survive it.
+///
+/// The evidence is that
+/// `collection_length.rs::appending_to_a_collection_forgets_its_entry_length`
+/// **passes unchanged** across `LAN-134`. It was written when the call was a
+/// region and a region forgot everything; it still holds now the call is
+/// declared, because the row says the call mutates its arguments. A test that
+/// keeps passing for a different reason is usually a worry - here it is the
+/// measurement, and it is why the refusal was not load-bearing.
+///
+/// What was left once the two were untangled was the amortisation question
+/// alone, and that is a product decision rather than a soundness one. It was
+/// taken: an amortised per-call cost is admissible, marked as such and
+/// carrying its own premise. So `append` now resolves on a concrete receiver
+/// and the rest of this table stands.
 #[test]
 fn a_callee_whose_cost_depends_on_its_argument_stays_a_hole() {
     // A method is spelled with its dot (`LAN-108`): `.join` on a string,
@@ -610,7 +632,6 @@ fn a_callee_whose_cost_depends_on_its_argument_stays_a_hole() {
         ("sorted", "sorted(items)"),
         ("list", "list(items)"),
         ("print", "print(items)"),
-        (".append", "items.append(1)"),
         (".decode", "items.decode(\"utf-8\")"),
     ] {
         let source = format!("def g(items: list) -> int:\n    {statement}\n    return 0\n");
