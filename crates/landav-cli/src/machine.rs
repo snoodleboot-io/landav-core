@@ -222,6 +222,20 @@ pub struct Premise {
     /// (`LAN-129`: a call to a function this module defines once, composed
     /// from that definition's own bound; the premise is that nothing rebinds
     /// the module's name at run time).
+    ///
+    /// # Where a premise is *absent*, and why that is also a fact
+    ///
+    /// A name bound by `lazy import os` or `lazy from os import getcwd`
+    /// (PEP 810, Python 3.15) resolves **no** row, so a call through it
+    /// carries no premise and keeps its hole. The reason is not that the row
+    /// is missing but that it would be wrong: a lazily bound name runs its
+    /// module's whole import on the first read of it, so the one step a
+    /// `module.attr` row prices would be hiding an unbounded import behind it.
+    ///
+    /// Recorded here because this is where a reader looks. A call that plainly
+    /// resolves in the source next to one that does not, with nothing in the
+    /// report to tell them apart, reads as a defect in the tool rather than as
+    /// the refusal it is. `LAN-132` made the rule; `LAN-133` wrote it down.
     pub trust: &'static str,
     /// Why the number is believed, in one sentence.
     ///
