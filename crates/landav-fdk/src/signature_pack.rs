@@ -329,10 +329,44 @@ mod tests {
         }
     }
 
+    /// **The amortised row is resolvable, and says it is amortised.**
+    ///
+    /// `append` sat in the list below until `LAN-134`, which is the whole of
+    /// that ticket in one assertion: the cost is admissible, and it is
+    /// admissible under a class that a bound has to declare it rests on. A
+    /// future edit that quietly re-labelled it `Constant` would keep the first
+    /// half and lose the second, so both are pinned here.
+    #[test]
+    fn the_amortised_row_is_resolvable_and_declares_its_amortisation() {
+        let pack = SignaturePack::builtin().expect("the shipped pack must parse");
+        let row = pack
+            .row("append")
+            .expect("`append` must be recorded, not omitted");
+        assert_eq!(
+            row.cost,
+            CostClass::AmortisedConstant,
+            "`append` is bounded only when the calls are summed"
+        );
+        assert!(
+            row.cost.rests_on_amortisation(),
+            "a bound closing over `append` has to publish a premise saying so, \
+             and this is the flag that makes it"
+        );
+        assert!(
+            pack.signature("append", |_| false).is_some(),
+            "`append` must be resolvable, or `LAN-134` bought nothing"
+        );
+        assert!(
+            row.mutates_arguments,
+            "`append` changes its receiver, so a length read before it must not \
+             survive it - this is what the old refusal was really protecting"
+        );
+    }
+
     #[test]
     fn a_row_that_is_not_constant_is_not_resolvable() {
         let pack = SignaturePack::builtin().expect("the shipped pack must parse");
-        for callee in ["join", "sorted", "list", "print", "append", "decode"] {
+        for callee in ["join", "sorted", "list", "print", "decode"] {
             let row = pack
                 .row(callee)
                 .unwrap_or_else(|| panic!("`{callee}` must be recorded as a refusal, not omitted"));

@@ -1143,10 +1143,11 @@ fn describe_bound(
         );
     };
     let line = format!(
-        "{}{}{}{}{}",
+        "{}{}{}{}{}{}",
         describe_cost(&where_, function, derived, records),
         protocol_premise(function, derived),
         supplied_premise(function, derived, pack),
+        amortised_premise(function, derived, pack),
         sibling_premise(function, derived, siblings),
         store_premise(function, derived)
     );
@@ -1382,6 +1383,35 @@ fn supplied_premise(
         .collect();
     format!(
         "; believed on {}: the cost was declared by a supplied row rather than derived",
+        said.join(", ")
+    )
+}
+
+/// The amortised-row clause of a bound line. `LAN-134`.
+///
+/// Said in the text and not only in the JSON, which is a departure from the
+/// supplied-signature clause above it: that one needs a pack to have been
+/// supplied, so it is silent on an ordinary run, while this one fires on the
+/// **builtin** pack and so would be silent nowhere else. A reader looking at
+/// an `exact` bound for a loop full of `append` calls has to be able to see
+/// that the number is a sum and not a per-call limit, and the text line is
+/// where most readers look.
+fn amortised_premise(
+    function: &landav_python::LoweredFunction,
+    derived: &landav_engine::TripCount,
+    pack: Option<&SignaturePack>,
+) -> String {
+    if derived.bound().is_none() {
+        return String::new();
+    }
+    let callees = crate::machine::amortised_callees(function.program(), pack);
+    if callees.is_empty() {
+        return String::new();
+    }
+    let said: Vec<String> = callees.iter().map(|callee| format!("`{callee}`")).collect();
+    format!(
+        "; amortised over {}: a single call may do more work than the step charged, and this \
+         number holds as a sum over the path rather than as a limit on one call",
         said.join(", ")
     )
 }

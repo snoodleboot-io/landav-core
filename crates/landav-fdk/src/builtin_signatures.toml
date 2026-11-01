@@ -63,6 +63,37 @@ format = 1
 # ---------------------------------------------------------------------------
 
 [[signature]]
+callee = "append"
+cost = "amortised-constant"
+rebinds_locals = false
+mutates_arguments = true
+why = """
+The first amortised row, and the first admitted row matched on a receiver
+rather than on a bare name. One slot store, and a reallocation now and again
+that CPython over-allocates for; appending neither hashes nor compares, so no
+__hash__ and no __eq__ runs and there is no user code in the call at all.
+
+A single call is NOT constant — a reallocation copies — and this row does not
+claim it is. CostClass::AmortisedConstant says the number is only bounded when
+the calls are summed, which is the only quantity landav reports, and a bound
+closing over it publishes an amortised-cost premise so no reader has to infer
+that. LAN-134.
+
+This row read `cost = "unbounded"` until LAN-134, with a why that said it was
+"not merely unbounded — not SAFE", because it mutates the collection and a
+length read before it is not the length a loop after it walks. That is true and
+it is carried by mutates_arguments, which makes the engine forget every volatile
+name at this node; collection_length.rs is protected by that, not by the
+refusal. Two objections had been stacked into one, and only the amortisation
+half was ever about the cost.
+
+Matched only on a receiver annotated with a CONCRETE builtin collection. On a
+protocol — MutableSequence — `append` is user code of unknown cost, and the
+frontend declines the row there rather than this file trying to say so. 31 of
+the 62 sole-blocked `self.attr.m()` sites LAN-127 counted are this method.
+"""
+
+[[signature]]
 callee = "isinstance"
 cost = "constant"
 rebinds_locals = false
@@ -645,6 +676,18 @@ why = "Builtin exception construction: stores the already-evaluated arguments on
 
 # ---------------------------------------------------------------------------
 # refused — written down so a later contributor argues rather than appends
+#
+# Three methods LAN-127's counts make look like near misses have NO row here,
+# deliberately, and adding one is not a no-op: a row is consulted even when it
+# is refused, to narrow the writes of the hole that remains, so a row added
+# here changes bounds and must be measured. Left out of LAN-134 to keep that
+# ticket's measurement attributable.
+#
+#   list.pop     amortised O(1) with no argument, linear with an index, and the
+#                receiver's KIND is not tracked — so `dict.pop(k)`, which
+#                hashes a user key, is indistinguishable. 6 sites.
+#   list.remove  scans for the element, so linear, and runs its __eq__. 5 sites.
+#   dict.update  linear in its argument's size, which is LAN-11. 3 sites.
 # ---------------------------------------------------------------------------
 
 [[signature]]
@@ -703,18 +746,6 @@ why = """
 I/O. Formats every argument — which runs their `__str__`, arbitrary user code —
 and then writes to a stream that may block. Unbounded by anything this analysis
 can see. 12 stdlib sole-blocked sites.
-"""
-
-[[signature]]
-callee = "append"
-cost = "unbounded"
-rebinds_locals = false
-mutates_arguments = true
-why = """
-Not merely unbounded — not SAFE. It mutates the collection, so a length read
-before it is not the length a loop after it walks, and collection_length.rs
-depends on that entry length being forgotten. Amortised O(1) is the right answer
-to a different question.
 """
 
 [[signature]]
@@ -990,7 +1021,16 @@ callee = "get"
 cost = "unbounded"
 rebinds_locals = false
 mutates_arguments = true
-why = "A hash lookup on the receiver, and hashing the key is user code. Matched only on a receiver annotated dict."
+why = """
+A hash lookup on the receiver, and hashing the key is user code. Matched only on
+a receiver annotated dict.
+
+Not rescued by LAN-134's amortised class, and the distinction is the point: a
+dict lookup is O(1) on AVERAGE, over an assumption about the keys' hash
+distribution, which is a weaker claim than O(1) AMORTISED and not one a bound
+may rest on. `__hash__` and `__eq__` are user code besides, so the worst case is
+not even linear in anything this analysis can see.
+"""
 
 # ---------------------------------------------------------------------------
 # Callees reached through an imported module name. `LAN-128`.

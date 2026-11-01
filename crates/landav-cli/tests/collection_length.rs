@@ -353,9 +353,23 @@ def local(n: int) -> int:
 
 /// **A mutated collection does not report the length it had on entry.**
 ///
-/// `items.append(...)` changes the length the loop will walk. The call is
-/// already a region, and a region may change anything - so the length must stop
-/// being readable across it, exactly as an integer does.
+/// `items.append(...)` changes the length the loop will walk, so the length
+/// must stop being readable across it, exactly as an integer does.
+///
+/// # The assertion is unchanged across `LAN-134` and the reason is not
+///
+/// This was written when `append` was a refused callee: the call was a region,
+/// and a region may change anything, so everything was forgotten and this held
+/// trivially. `LAN-134` admitted `append` on an amortised row, so the call is
+/// now a *declared* node that forgets almost nothing - and this still passes,
+/// because the row declares `mutates_arguments` and the engine forgets every
+/// **volatile** name at such a node. A collection parameter's length is
+/// volatile precisely so that this keeps working.
+///
+/// That is the whole safety argument of `LAN-134`, and this test is where it
+/// is checked. The old `append` refusal cited this file as the reason it could
+/// not be admitted; the citation was to a property that `mutates_arguments`
+/// carries on its own.
 #[test]
 fn appending_to_a_collection_forgets_its_entry_length() {
     let source = "\
