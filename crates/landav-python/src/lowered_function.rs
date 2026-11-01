@@ -33,6 +33,16 @@ pub struct LoweredFunction {
     /// redefines this method. `LAN-116`: such a method is never composed at a
     /// call site, because the call may reach the override.
     overridden_in_module: bool,
+    /// Fields of `self` whose method calls this bound priced, because the
+    /// enclosing class only ever stores one kind of builtin collection into
+    /// them. `LAN-127`.
+    ///
+    /// Carried on the function rather than read back off the program because
+    /// the node has nowhere to put it: a call's `detail` is the method
+    /// spelling and there is one of it. The driver pairs these with
+    /// [`Self::class`] to publish the `same-class-field` premise, which is
+    /// what says out loud that nothing outside the class stores anything else.
+    collection_fields: Vec<String>,
 }
 
 impl LoweredFunction {
@@ -45,6 +55,7 @@ impl LoweredFunction {
         program: SourceProgram,
         parameters: Vec<String>,
         overridden_in_module: bool,
+        collection_fields: Vec<String>,
     ) -> Self {
         Self {
             name,
@@ -53,7 +64,14 @@ impl LoweredFunction {
             program,
             parameters,
             overridden_in_module,
+            collection_fields,
         }
+    }
+
+    /// The fields this bound priced a collection method on. `LAN-127`.
+    #[must_use]
+    pub fn collection_fields(&self) -> &[String] {
+        &self.collection_fields
     }
 
     /// The parameters as written, in order, receiver first for a method.

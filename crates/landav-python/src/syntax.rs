@@ -607,7 +607,9 @@ pub(crate) fn is_zero_literal(expr: &Expr) -> bool {
 ///
 /// A decorator is its own node here rather than a bare expression, so a walk
 /// that wants the callables has to step through the wrapper.
-fn decorator_expressions(decorators: &[ruff_python_ast::Decorator]) -> impl Iterator<Item = &Expr> {
+pub(crate) fn decorator_expressions(
+    decorators: &[ruff_python_ast::Decorator],
+) -> impl Iterator<Item = &Expr> {
     decorators.iter().map(|decorator| &decorator.expression)
 }
 
