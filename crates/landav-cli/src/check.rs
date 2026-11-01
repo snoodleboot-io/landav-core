@@ -1143,13 +1143,14 @@ fn describe_bound(
         );
     };
     let line = format!(
-        "{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}",
         describe_cost(&where_, function, derived, records),
         protocol_premise(function, derived),
         supplied_premise(function, derived, pack),
         amortised_premise(function, derived, pack),
         sibling_premise(function, derived, siblings),
-        store_premise(function, derived)
+        store_premise(function, derived),
+        field_premise(function, derived)
     );
     match resource_clause(derived, function.program(), resource) {
         Some(clause) => format!("{line}; {clause}"),
@@ -1383,6 +1384,34 @@ fn supplied_premise(
         .collect();
     format!(
         "; believed on {}: the cost was declared by a supplied row rather than derived",
+        said.join(", ")
+    )
+}
+
+/// The collection-field clause of a bound line. `LAN-127`.
+///
+/// Said beside the store clause above rather than folded into it, because the
+/// two rest on different halves of the same scan: that one says a store to the
+/// field is one step, this one says what is *in* the field. A chain could
+/// honestly support either without the other.
+fn field_premise(
+    function: &landav_python::LoweredFunction,
+    derived: &landav_engine::TripCount,
+) -> String {
+    let Some(class) = function.class() else {
+        return String::new();
+    };
+    if derived.bound().is_none() || function.collection_fields().is_empty() {
+        return String::new();
+    }
+    let said: Vec<String> = function
+        .collection_fields()
+        .iter()
+        .map(|field| format!("`{class}.{field}`"))
+        .collect();
+    format!(
+        "; taking {} as a builtin collection, because every store the class's same-module chain \
+         makes to it is one, and assuming nothing outside that chain stores anything else",
         said.join(", ")
     )
 }

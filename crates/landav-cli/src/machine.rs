@@ -223,7 +223,11 @@ pub struct Premise {
     /// from that definition's own bound; the premise is that nothing rebinds
     /// the module's name at run time), or `"amortised-cost"` (`LAN-134`: the
     /// callee was charged a cost that is bounded only when the calls are
-    /// summed, which this bound is; it is not a limit on one call).
+    /// summed, which this bound is; it is not a limit on one call), or
+    /// `"same-class-field"` (`LAN-127`: a field of `self` is taken as a
+    /// builtin collection because every store the class's chain makes to it is
+    /// one; the premise is that nothing outside that chain stores anything
+    /// else).
     ///
     /// # Where a premise is *absent*, and why that is also a fact
     ///
@@ -275,6 +279,7 @@ fn premises_of(
     pack: Option<&SignaturePack>,
     class: Option<&str>,
     siblings: Option<&landav_python::Siblings>,
+    collection_fields: &[String],
 ) -> Vec<Premise> {
     let mut premises: Vec<Premise> = program
         .params()
@@ -307,6 +312,7 @@ fn premises_of(
     premises.extend(amortised_premises(program, pack));
     premises.extend(sibling_premises(program, class, siblings));
     premises.extend(store_premises(program, class));
+    premises.extend(field_premises(class, collection_fields));
     premises
 }
 
@@ -347,6 +353,40 @@ fn store_premises(program: &landav_its::SourceProgram, class: Option<&str>) -> V
                  that no base outside this module and no subclass elsewhere intercepts it with a \
                  `__setattr__` or a descriptor, which the analysis cannot see"
             ),
+        })
+        .collect()
+}
+
+/// One premise per field whose method calls this bound priced. `LAN-127`.
+///
+/// Built from the fields the lowering reports rather than from the program,
+/// because a call node's `detail` is the method spelling and has nowhere to
+/// name the receiver. See `LoweredFunction::collection_fields`.
+///
+/// The `kind` the premise names is not carried out of the frontend, so this
+/// says "builtin collection" rather than "list". That is a deliberate
+/// shortfall and a small one: the claim a reader has to weigh is *who else
+/// might store something different*, which is the same sentence whichever
+/// kind it is.
+fn field_premises(class: Option<&str>, fields: &[String]) -> Vec<Premise> {
+    let Some(class) = class else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .map(|field| {
+            let qualified = format!("{class}.{field}");
+            Premise {
+                because: format!(
+                    "`{qualified}` is taken as a builtin collection because every store the \
+                     class's same-module chain makes to it is one, so a method call on it \
+                     resolves against the pack as it would for an annotated parameter; the \
+                     premise is that nothing outside that chain - a subclass in another module, \
+                     a caller assigning the attribute, a `setattr` - ever stores anything else"
+                ),
+                subject: qualified,
+                trust: "same-class-field",
+            }
         })
         .collect()
 }
@@ -846,7 +886,13 @@ impl Collector {
         self.functions.push(Function {
             name: function.name().to_owned(),
             class: function.class().map(str::to_owned),
-            premises: premises_of(function.program(), pack, function.class(), siblings),
+            premises: premises_of(
+                function.program(),
+                pack,
+                function.class(),
+                siblings,
+                function.collection_fields(),
+            ),
             file: at.file().display().to_string(),
             line: at.line(),
             column: at.column(),

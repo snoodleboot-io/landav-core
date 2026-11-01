@@ -295,12 +295,69 @@ fn overridden_in_module<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> B
 /// What the chain cannot see - a base imported from elsewhere, a subclass in
 /// another module - is the `plain-attribute-store` premise the bound is
 /// published with, exactly as `same-class-method` says for a sibling call.
+/// Which builtin collection a class only ever stores into one of its fields.
+/// `LAN-127`.
+///
+/// The *kind* rather than merely "a collection", because a row keyed by method
+/// name needs it: `pop` means an amortised slot read on a list and a user-code
+/// hash on a dict. No row discriminates on it today, and recording it is what
+/// makes one possible without re-deriving this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FieldKind {
+    List,
+    Dict,
+    Set,
+}
+
+/// The kind a stored value is, when it is plainly a builtin collection.
+///
+/// A *display* says what it is with no help: `[]` is a list whatever the module
+/// has done to the name `list`. A constructor call does not, so `list()` counts
+/// only when the module has not rebound `list`, and a module whose bindings
+/// could not be enumerated gets nothing - the same fail-closed rule the
+/// signature pack uses for a bare callee name.
+///
+/// A comprehension is deliberately absent. `self.rows = [r for r in src]` is a
+/// list, and admitting it would be sound; it is left out because `LAN-127` was
+/// measured over displays and constructors, and widening the input to a
+/// measurement after taking it is how a number stops meaning anything.
+fn stored_field_kind(value: &Expr, module_bound: Option<&BTreeSet<String>>) -> Option<FieldKind> {
+    match value {
+        Expr::List(_) => Some(FieldKind::List),
+        Expr::Dict(_) => Some(FieldKind::Dict),
+        Expr::Set(_) => Some(FieldKind::Set),
+        Expr::Call(call) => {
+            let Expr::Name(name) = call.func.as_ref() else {
+                return None;
+            };
+            if module_bound?.contains(name.id.as_str()) {
+                return None;
+            }
+            match name.id.as_str() {
+                "list" => Some(FieldKind::List),
+                "dict" => Some(FieldKind::Dict),
+                "set" => Some(FieldKind::Set),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Default)]
 struct StoreFacts {
     /// Classes whose chain intercepts every store.
     intercepted: BTreeSet<String>,
     /// Per class, every name bound at class level anywhere in its chain.
     class_level: BTreeMap<String, BTreeSet<String>>,
+    /// Per class, per field, every kind the chain stores into it. `LAN-127`.
+    ///
+    /// `None` in the set stands for a store this pass cannot classify - an
+    /// augmented store, a loop target, a value that is not a display or a
+    /// builtin constructor - and its presence disqualifies the field however
+    /// many classifiable stores sit beside it. A field is a collection
+    /// receiver only when this set is exactly one `Some`.
+    field_kinds: BTreeMap<String, BTreeMap<String, BTreeSet<Option<FieldKind>>>>,
 }
 
 impl StoreFacts {
@@ -314,6 +371,120 @@ impl StoreFacts {
                 .get(class)
                 .is_some_and(|names| !names.contains(attr))
     }
+
+    /// The one builtin collection kind `class`'s chain stores into `attr`, or
+    /// `None` when the chain stores more than one, stores something this pass
+    /// cannot classify, stores nothing at all, or is a chain whose stores do
+    /// not mean what they say. `LAN-127`.
+    ///
+    /// # Why this is [`Self::plain`] plus a kind
+    ///
+    /// Every reason a `self.attr = v` is not a plain store is a reason the
+    /// *kind* of what is stored cannot be trusted either. A `__setattr__` in
+    /// the chain may store something else entirely; a class-level binding of
+    /// `attr` may be a `property` whose getter returns anything. So this
+    /// answers `None` wherever `plain` answers `false`, rather than restating
+    /// the conditions.
+    fn field_kind(&self, class: &str, attr: &str) -> Option<FieldKind> {
+        if !self.plain(class, attr) {
+            return None;
+        }
+        let kinds = self.field_kinds.get(class)?.get(attr)?;
+        let [Some(kind)] = kinds.iter().copied().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        Some(kind)
+    }
+}
+
+/// Record every store `body` makes to `receiver.attr`, by kind. `LAN-127`.
+///
+/// Anything that binds `receiver.attr` and is not a plain assignment of a
+/// classifiable value records `None`, which disqualifies the field. That is
+/// the whole design: this pass does not need to understand a loop target or an
+/// augmented store, it needs to **notice** one.
+///
+/// What it cannot notice is a store made some other way - `setattr(self, name,
+/// {})`, a `__dict__` update, a store from outside the class entirely. Those
+/// are not holes in the scan but the content of the premise this buys, which
+/// says in as many words that nothing outside the class stores anything else.
+fn collect_field_stores(
+    body: &[Stmt],
+    receiver: &str,
+    module_bound: Option<&BTreeSet<String>>,
+    into: &mut BTreeMap<String, BTreeSet<Option<FieldKind>>>,
+) {
+    let on_receiver = |target: &Expr| -> Option<String> {
+        let Expr::Attribute(attribute) = target else {
+            return None;
+        };
+        let Expr::Name(name) = attribute.value.as_ref() else {
+            return None;
+        };
+        (name.id.as_str() == receiver).then(|| attribute.attr.to_string())
+    };
+    for statement in crate::syntax::stmt_tree(body) {
+        match statement {
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    if let Some(attr) = on_receiver(target) {
+                        let kind = stored_field_kind(&assign.value, module_bound);
+                        into.entry(attr).or_default().insert(kind);
+                    }
+                }
+            }
+            Stmt::AnnAssign(assign) => {
+                if let Some(attr) = on_receiver(&assign.target) {
+                    let kind = assign
+                        .value
+                        .as_deref()
+                        .and_then(|value| stored_field_kind(value, module_bound));
+                    into.entry(attr).or_default().insert(kind);
+                }
+            }
+            // Reads the field before it writes it, and the operator is
+            // whatever is stored - so even though `self.rows += [x]` leaves a
+            // list, it is not this pass's business to say so.
+            Stmt::AugAssign(assign) => {
+                if let Some(attr) = on_receiver(&assign.target) {
+                    into.entry(attr).or_default().insert(None);
+                }
+            }
+            Stmt::For(loop_stmt) => {
+                if let Some(attr) = on_receiver(&loop_stmt.target) {
+                    into.entry(attr).or_default().insert(None);
+                }
+            }
+            Stmt::With(with) => {
+                for item in &with.items {
+                    if let Some(vars) = item.optional_vars.as_deref()
+                        && let Some(attr) = on_receiver(vars)
+                    {
+                        into.entry(attr).or_default().insert(None);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `decorators` make this a method with no instance receiver.
+///
+/// A `@staticmethod`'s first parameter is an ordinary argument, and a
+/// `@classmethod`'s is the class - so `first.attr = []` in either is not this
+/// class's instance field, and reading it as one would attribute a kind to a
+/// field the class never stores. Both are skipped; over-refusing a field costs
+/// coverage and never soundness.
+fn has_no_instance_receiver(decorators: &[ast::Decorator]) -> bool {
+    crate::syntax::decorator_expressions(decorators).any(|decorator| {
+        let named = match decorator {
+            Expr::Name(name) => name.id.as_str(),
+            Expr::Attribute(attribute) => attribute.attr.as_str(),
+            _ => return false,
+        };
+        matches!(named, "staticmethod" | "classmethod")
+    })
 }
 
 /// The [`StoreFacts`] of a module. `LAN-120`.
@@ -323,11 +494,16 @@ impl StoreFacts {
 /// a metaclass intercepts, and any class-level binding of `attr` - a method, a
 /// nested class, a plain class attribute, a `property` - refuses the store of
 /// `attr`. `__slots__` does not intercept; see the note in the scan.
-fn store_facts<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> StoreFacts {
+fn store_facts<'a>(
+    statements: impl IntoIterator<Item = &'a Stmt>,
+    module_bound: Option<&BTreeSet<String>>,
+) -> StoreFacts {
     struct Own<'a> {
         bases: Vec<&'a str>,
         intercepts: bool,
         names: BTreeSet<String>,
+        /// `LAN-127`: the kinds this class's own methods store per field.
+        stores: BTreeMap<String, BTreeSet<Option<FieldKind>>>,
     }
     let mut own: BTreeMap<&str, Own<'_>> = BTreeMap::new();
     for statement in statements {
@@ -344,11 +520,27 @@ fn store_facts<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> StoreFacts
             .collect();
         let mut intercepts = !class.keywords().is_empty() || !class.decorator_list.is_empty();
         let mut names = BTreeSet::new();
+        let mut stores: BTreeMap<String, BTreeSet<Option<FieldKind>>> = BTreeMap::new();
         for member in &class.body {
             match member {
                 Stmt::FunctionDef(def) => {
                     intercepts |= def.name.as_str() == "__setattr__";
                     names.insert(def.name.to_string());
+                    // `LAN-127`: what this method stores into `self.<field>`.
+                    if !has_no_instance_receiver(&def.decorator_list)
+                        && let Some(receiver) = def
+                            .parameters
+                            .posonlyargs
+                            .first()
+                            .or_else(|| def.parameters.args.first())
+                    {
+                        collect_field_stores(
+                            &def.body,
+                            receiver.parameter.name.as_str(),
+                            module_bound,
+                            &mut stores,
+                        );
+                    }
                 }
                 Stmt::ClassDef(def) => {
                     names.insert(def.name.to_string());
@@ -375,6 +567,7 @@ fn store_facts<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> StoreFacts
                 bases,
                 intercepts,
                 names,
+                stores,
             },
         );
     }
@@ -407,16 +600,26 @@ fn store_facts<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> StoreFacts
         }
         let mut names = BTreeSet::new();
         let mut intercepted = false;
+        // `LAN-127`: the kinds are unioned over the same chain, so a subclass
+        // storing `{}` where the base stores `[]` leaves the field with two
+        // kinds and no receiver. A chain is the right scope for exactly the
+        // reason it is for `class_level`: the method being lowered may be
+        // reached on any member of it.
+        let mut kinds: BTreeMap<String, BTreeSet<Option<FieldKind>>> = BTreeMap::new();
         for member in &chain {
             if let Some(facts) = own.get(member) {
                 intercepted |= facts.intercepts;
                 names.extend(facts.names.iter().cloned());
+                for (field, stored) in &facts.stores {
+                    kinds.entry(field.clone()).or_default().extend(stored);
+                }
             }
         }
         if intercepted {
             facts.intercepted.insert((*class).to_owned());
         }
         facts.class_level.insert((*class).to_owned(), names);
+        facts.field_kinds.insert((*class).to_owned(), kinds);
     }
     facts
 }
@@ -548,18 +751,22 @@ pub fn lower_module_with(
         None => builtin_pack(),
     };
     let (module, index) = parse_guarded(path, source)?;
-    // `LAN-116`: which methods a subclass in this module redefines.
-    let facts = ModuleFacts {
-        overridden: overridden_in_module(module.iter()),
-        stores: store_facts(module.iter()),
-        imports: imports_of(&module),
-        functions: module_functions_of(&module),
-    };
     // Which names this module binds for itself, computed once. A signature pack
     // is keyed by *name*, and a module that writes `def isinstance(...)` is not
     // calling the builtin - see `SignaturePack` for the whole caveat and for
     // what this does not cover.
+    //
+    // Computed before the facts below rather than after, because `LAN-127`'s
+    // field kinds need it: `self.rows = list()` is a list only if `list` still
+    // means the builtin.
     let module_bound = bindings_of(&module);
+    // `LAN-116`: which methods a subclass in this module redefines.
+    let facts = ModuleFacts {
+        overridden: overridden_in_module(module.iter()),
+        stores: store_facts(module.iter(), module_bound.as_ref()),
+        imports: imports_of(&module),
+        functions: module_functions_of(&module),
+    };
     // What an annotation may read as `typing`'s spelling of a builtin. Computed
     // once per module, from the same walk as `module_bound`. `LAN-106`.
     let typing = TypingNames::of(&module);
@@ -850,6 +1057,7 @@ fn lower_function(
         class: function.class,
         receiver,
         instance_method,
+        collection_fields: BTreeSet::new(),
         stores: &facts.stores,
         imports: &facts.imports,
         module_functions: &facts.functions,
@@ -873,6 +1081,7 @@ fn lower_function(
     let program = translator.builder.build(body);
 
     let overridden_in_module = facts.overridden.contains(&name);
+    let collection_fields = translator.collection_fields.into_iter().collect();
     LoweredFunction::new(
         name,
         class,
@@ -880,6 +1089,7 @@ fn lower_function(
         program,
         parameters,
         overridden_in_module,
+        collection_fields,
     )
 }
 
@@ -2187,6 +2397,15 @@ struct Translator<'a> {
     /// Whether [`Self::receiver`] is an instance of [`Self::class`], rather
     /// than the class itself or an ordinary first argument. `LAN-120`.
     instance_method: bool,
+    /// Fields of `self` this translation priced a method call on. `LAN-127`.
+    ///
+    /// Collected here rather than read back off the program by the driver
+    /// because the node cannot carry it: a call's `detail` is the method
+    /// spelling (`LAN-108`), there is one of them, and widening it to
+    /// `.field.method` would rename the detail of every field-receiver call
+    /// that stays a hole and so move the refusal tallies. The premise needs
+    /// the field, so the field travels separately.
+    collection_fields: BTreeSet<String>,
     /// What the module says about a store on the receiver. `LAN-120`.
     stores: &'a StoreFacts,
     /// What the module's once-bound import names stand for. `LAN-128`.
@@ -3686,11 +3905,17 @@ impl Translator<'_> {
         // two branches above because neither can match an `xs.append`: a
         // sibling call's receiver is `self`, and an imported callee's is a
         // module name.
-        if let Some(row) = self.collection_method_row(call) {
+        if let Some((row, field)) = self.collection_method_row(call) {
+            // The effect is taken first so the row's borrow of `self` ends
+            // before the field is recorded below.
+            let effect = effect_of(row);
             if !self.arguments_are_accounted(call) {
                 return None;
             }
-            return Some(effect_of(row));
+            if let Some(field) = field {
+                self.collection_fields.insert(field);
+            }
+            return Some(effect);
         }
         let Expr::Name(callee) = call.func.as_ref() else {
             return None;
@@ -3967,27 +4192,82 @@ impl Translator<'_> {
     /// attribute of whatever `xs` holds, so a module-level `def append` does
     /// not make it something else, which is exactly the opposite of the rule a
     /// bare `append(...)` would need.
-    fn collection_method_row(&self, call: &ast::ExprCall) -> Option<&Signature> {
+    fn collection_method_row(&self, call: &ast::ExprCall) -> Option<(&Signature, Option<String>)> {
         let Expr::Attribute(method) = call.func.as_ref() else {
             return None;
         };
-        let Expr::Name(receiver) = method.value.as_ref() else {
-            return None;
+        let field = match method.value.as_ref() {
+            // `xs.append(v)` for an annotated parameter. `LAN-134`.
+            Expr::Name(receiver) => {
+                let receiver = receiver.id.as_str();
+                if !self.concrete_collections.contains(receiver) {
+                    return None;
+                }
+                // A rebound receiver holds something else by the time this
+                // line runs, and the annotation describes what the caller
+                // passed.
+                if self
+                    .rebound
+                    .as_ref()
+                    .is_none_or(|names| names.contains(receiver))
+                {
+                    return None;
+                }
+                None
+            }
+            // `self.items.append(v)` for a field the class only ever stores a
+            // builtin collection into. `LAN-127`.
+            Expr::Attribute(_) => Some(self.collection_field(method.value.as_ref())?),
+            _ => return None,
         };
-        let receiver = receiver.id.as_str();
-        if !self.concrete_collections.contains(receiver) {
+        let row = self.pack.signature(method.attr.as_str(), |_| false)?;
+        Some((row, field))
+    }
+
+    /// The field name, when `receiver` is a `self.attr` this class only ever
+    /// stores one kind of builtin collection into. `LAN-127`.
+    ///
+    /// # Why a field can be trusted where a parameter has to be annotated
+    ///
+    /// The two paths reach the same conclusion from opposite directions. For a
+    /// parameter the kind is a *claim the caller makes*, so an annotation is
+    /// required and a protocol one is not enough. For a field the kind is
+    /// something this module can **read**: `self.rows = []` is a list, said by
+    /// the program rather than about it, and the only question is whether
+    /// anything else ever stores anything different.
+    ///
+    /// That question is what [`StoreFacts::field_kind`] answers over the
+    /// class's chain, and what it cannot answer is the premise: a subclass in
+    /// another module, or a caller assigning the attribute from outside, is
+    /// beyond any same-module scan. `LAN-120`'s `plain-attribute-store` draws
+    /// its line in exactly the same place.
+    fn collection_field(&self, receiver: &Expr) -> Option<String> {
+        if !self.instance_method {
             return None;
         }
-        // A rebound receiver holds something else by the time this line runs,
-        // and the annotation describes what the caller passed.
+        let class = self.class?;
+        let holder = self.receiver.as_deref()?;
+        let Expr::Attribute(field) = receiver else {
+            return None;
+        };
+        let Expr::Name(name) = field.value.as_ref() else {
+            return None;
+        };
+        if name.id.as_str() != holder {
+            return None;
+        }
+        // `self = other` makes the rest of the body some other object, whose
+        // class nothing here has read.
         if self
             .rebound
             .as_ref()
-            .is_none_or(|names| names.contains(receiver))
+            .is_none_or(|names| names.contains(holder))
         {
             return None;
         }
-        self.pack.signature(method.attr.as_str(), |_| false)
+        let attr = field.attr.as_str();
+        self.stores.field_kind(class, attr)?;
+        Some(attr.to_owned())
     }
 
     /// The pack row for a call site, resolvable or not.
